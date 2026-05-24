@@ -33,14 +33,14 @@ set([1,2,2])     # {1, 2}
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `type` | `type(val) -> string` | 返回类型名称 |
-| `isinstance` | `isinstance(val, type_name) -> bool` | 是否为指定类型 |
+| `isinstance` | `isinstance(val, type) -> bool` | 是否为指定类型 |
 
 ```ms
 type(42)              # "int"
 type("hello")         # "string"
 type([1,2])           # "list"
-isinstance(42, "int")      # true
-isinstance("x", "int")     # false
+isinstance(42, int)      # true
+isinstance("x", int)     # false
 ```
 
 ### I/O

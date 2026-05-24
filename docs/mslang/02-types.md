@@ -253,8 +253,8 @@ set([1,2,2])     # {1, 2}
 type(42)              # "int"
 type("hello")         # "string"
 type([1,2])           # "list"
-isinstance(42, "int")        # true
-isinstance("hello", "string") # true
+isinstance(42, int)            # true
+isinstance("hello", string)    # true
 ```
 
 ## 运算符类型规则
