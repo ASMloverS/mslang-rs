@@ -6,8 +6,8 @@
 fn_def = "fn" IDENTIFIER "(" param_list? ")" block
 param_list = param ("," param)*
 param = IDENTIFIER
-      | "*" IDENTIFIER        // 可变参数
-      | IDENTIFIER "=" expr   // 默认参数值
+      | "*" IDENTIFIER        # 可变参数
+      | IDENTIFIER "=" expr   # 默认参数值
 ```
 
 ```ms
@@ -37,8 +37,8 @@ fn greet(name, prefix = "Hello") {
     return prefix + ", " + name
 }
 
-greet("Alice")              // "Hello, Alice"
-greet("Alice", "Hi")        // "Hi, Alice"
+greet("Alice")              # "Hello, Alice"
+greet("Alice", "Hi")        # "Hi, Alice"
 ```
 
 默认参数值在**函数定义时**求值一次（与 Python 一致）。
@@ -54,8 +54,8 @@ fn sum(*numbers) {
     return total
 }
 
-sum(1, 2, 3)    // 6
-sum(1, 2, 3, 4, 5)  // 15
+sum(1, 2, 3)    # 6
+sum(1, 2, 3, 4, 5)  # 15
 ```
 
 `*numbers` 将多余的位置参数收集为一个 list。
@@ -64,9 +64,9 @@ sum(1, 2, 3, 4, 5)  // 15
 
 ```ms
 fn example(a, b, c = 10, *rest) {
-    // a, b: 必需参数
-    // c: 带默认值的参数
-    // rest: 可变参数（list）
+    # a, b: 必需参数
+    # c: 带默认值的参数
+    # rest: 可变参数（list）
 }
 ```
 
@@ -91,8 +91,8 @@ fn divmod(a, b) {
     return a // b, a % b
 }
 
-q, r = divmod(10, 3)    // q=3, r=1
-result = divmod(10, 3)  // result=(3, 1)
+q, r = divmod(10, 3)    # q=3, r=1
+result = divmod(10, 3)  # result=(3, 1)
 ```
 
 多返回值本质是返回元组，然后用元组解包。
@@ -110,12 +110,12 @@ fn add(a, b) { return a + b }
 fn mul(a, b) { return a * b }
 
 ops = {"add": add, "mul": mul}
-result = ops["add"](3, 4)  // 7
+result = ops["add"](3, 4)  # 7
 
 fn apply(f, x, y) {
     return f(x, y)
 }
-apply(add, 1, 2)  // 3
+apply(add, 1, 2)  # 3
 ```
 
 ## 匿名函数
@@ -151,9 +151,9 @@ fn make_counter() {
 }
 
 counter = make_counter()
-counter()   // 1
-counter()   // 2
-counter()   // 3
+counter()   # 1
+counter()   # 2
+counter()   # 3
 ```
 
 ### 闭包语义
@@ -171,9 +171,9 @@ fn make_pair() {
 }
 
 get, set = make_pair()
-get()       // 10
+get()       # 10
 set(42)
-get()       // 42
+get()       # 42
 ```
 
 ## 递归
@@ -188,7 +188,7 @@ fn factorial(n) {
     return n * factorial(n - 1)
 }
 
-factorial(10)  // 3628800
+factorial(10)  # 3628800
 ```
 
 尾调用优化暂不实现（后续版本考虑）。
@@ -198,12 +198,12 @@ factorial(10)  // 3628800
 以下函数全局可用（详见 [10-builtins](10-builtins.md)）：
 
 ```ms
-print(val)           // 打印到标准输出
-type(val)            // 返回类型名称字符串
-len(val)             // 返回长度
-range(start, end)    // 返回迭代器
-input(prompt)        // 读取用户输入
-// ... 更多见 builtins 文档
+print(val)           # 打印到标准输出
+type(val)            # 返回类型名称字符串
+len(val)             # 返回长度
+range(start, end)    # 返回迭代器
+input(prompt)        # 读取用户输入
+# ... 更多见 builtins 文档
 ```
 
 ## 方法调用
@@ -211,9 +211,9 @@ input(prompt)        // 读取用户输入
 方法调用通过 `.` 运算符：
 
 ```ms
-"hello".length()         // 5
-[1,2,3].push(4)          // 追加元素
-"abc".split("b")         // ["a", "c"]
+"hello".length()         # 5
+[1,2,3].push(4)          # 追加元素
+"abc".split("b")         # ["a", "c"]
 ```
 
 方法调用的语义：
@@ -237,5 +237,5 @@ class Dog {
 }
 
 d = Dog()
-d.bark()    // 调用 Dog.bark，self = d
+d.bark()    # 调用 Dog.bark，self = d
 ```

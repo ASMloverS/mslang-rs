@@ -59,8 +59,8 @@ async fn parallel_fetch(urls) {
 Future 表示一个异步操作的最终结果。
 
 ```ms
-f = fetch("http://example.com")    // 返回 Future
-body = await f                      // 等待结果
+f = fetch("http://example.com")    # 返回 Future
+body = await f                      # 等待结果
 ```
 
 Future 状态：
@@ -73,10 +73,12 @@ Future 状态：
 在脚本顶层可以直接使用 `await`（无需包裹在 async 函数中）：
 
 ```ms
-// top-level await
+# top-level await
 data = await fetch("http://api.example.com/data")
 print(data)
 ```
+
+> **实现注意**：顶层 await 意味着主脚本的执行环境必须支持协程暂停/恢复。这要求 Phase 2 的 VM 核心在初始设计时就预留协程基础设施（可暂停的执行帧），而非在 Phase 7 补丁式添加。
 
 ## go 关键字
 
@@ -92,7 +94,7 @@ go fn() {
     print(result)
 }
 
-// 也可以启动 async 函数
+# 也可以启动 async 函数
 go async_fetch("http://example.com")
 ```
 
@@ -106,17 +108,17 @@ go async_fetch("http://example.com")
 ### 创建 channel
 
 ```ms
-ch = channel()       // 无缓冲 channel
-ch = channel(10)     // 缓冲区大小为 10 的 channel
+ch = channel()       # 无缓冲 channel
+ch = channel(10)     # 缓冲区大小为 10 的 channel
 ```
 
 ### 发送与接收
 
 ```ms
-// 发送
+# 发送
 ch <- value
 
-// 接收
+# 接收
 value = <-ch
 ```
 
@@ -130,11 +132,11 @@ value = <-ch
 ch = channel()
 
 go fn() {
-    ch <- 42       // 发送方等待接收方
+    ch <- 42       # 发送方等待接收方
 }
 
-val = <-ch          // 接收方等待发送方
-print(val)          // 42
+val = <-ch          # 接收方等待发送方
+print(val)          # 42
 ```
 
 ### 有缓冲 channel
@@ -148,16 +150,16 @@ print(val)          // 42
 ```ms
 ch = channel(3)
 
-ch <- 1    // 不阻塞
-ch <- 2    // 不阻塞
-ch <- 3    // 不阻塞（缓冲区已满）
+ch <- 1    # 不阻塞
+ch <- 2    # 不阻塞
+ch <- 3    # 不阻塞（缓冲区已满）
 
 go fn() {
     time.sleep(100)
-    val = <-ch    // 消费一个，腾出空间
+    val = <-ch    # 消费一个，腾出空间
 }
 
-ch <- 4    // 阻塞，等待缓冲区有空位
+ch <- 4    # 阻塞，等待缓冲区有空位
 ```
 
 ### channel 操作
@@ -165,19 +167,19 @@ ch <- 4    // 阻塞，等待缓冲区有空位
 ```ms
 ch = channel(10)
 
-// 发送
+# 发送
 ch <- value
 
-// 接收
+# 接收
 value = <-ch
 
-// 关闭
+# 关闭
 ch.close()
 
-// 检查是否关闭
+# 检查是否关闭
 ch.closed()
 
-// 遍历（接收直到关闭）
+# 遍历（接收直到关闭）
 for val in ch {
     print(val)
 }
@@ -201,7 +203,7 @@ go fn() {
 }
 
 for val in ch {
-    print(val)    // 0, 1, 2
+    print(val)    # 0, 1, 2
 }
 ```
 
@@ -210,7 +212,7 @@ for val in ch {
 多 channel 复用的 `select` 语法保留给后续版本：
 
 ```ms
-// 保留语法（暂不实现）
+# 保留语法（暂不实现）
 select {
     case val = <-ch1 {
         print("from ch1: " + str(val))
@@ -223,6 +225,8 @@ select {
     }
 }
 ```
+
+> **注意**：`select`、`case`、`default` 为保留关键字（见 [01-lexical](01-lexical.md)），不可用作变量名。
 
 ## 事件循环
 
@@ -288,7 +292,7 @@ data = await fetch_all([
 ```ms
 ch = channel(5)
 
-// 生产者
+# 生产者
 go fn() {
     for i in range(20) {
         ch <- i
@@ -297,7 +301,7 @@ go fn() {
     ch.close()
 }()
 
-// 消费者
+# 消费者
 for item in ch {
     print("consumed: " + str(item))
 }

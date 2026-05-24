@@ -11,21 +11,21 @@ class_var = "var"? IDENTIFIER "=" expression
 
 ```ms
 class Animal {
-    // 类属性（所有实例共享）
+    # 类属性（所有实例共享）
     kingdom = "Animalia"
 
-    // 构造方法
+    # 构造方法
     fn __init__(self, name, sound) {
         self.name = name
         self.sound = sound
     }
 
-    // 实例方法
+    # 实例方法
     fn speak(self) {
         return self.name + " says " + self.sound
     }
 
-    // 字符串表示
+    # 字符串表示
     fn __repr__(self) {
         return "Animal(" + self.name + ")"
     }
@@ -36,8 +36,8 @@ class Animal {
 
 ```ms
 dog = Animal("Dog", "Woof")
-dog.speak()      // "Dog says Woof"
-print(dog)       // "Animal(Dog)"  调用 __repr__
+dog.speak()      # "Dog says Woof"
+print(dog)       # "Animal(Dog)"  调用 __repr__
 ```
 
 使用 `ClassName(args)` 语法创建实例。等价于：
@@ -69,7 +69,7 @@ class Point {
 
 p1 = Point(3, 4)
 p2 = Point(0, 0)
-p1.distance_to(p2)   // 5.0
+p1.distance_to(p2)   # 5.0
 ```
 
 ## 实例属性
@@ -85,14 +85,14 @@ class Person {
 }
 
 p = Person("Alice", 30)
-print(p.name)     // "Alice"
-p.age = 31        // 修改属性
+print(p.name)     # "Alice"
+p.age = 31        # 修改属性
 ```
 
 也可以在实例创建后动态添加属性：
 
 ```ms
-p.email = "alice@example.com"    // 动态添加新属性
+p.email = "alice@example.com"    # 动态添加新属性
 ```
 
 ## 类属性
@@ -108,11 +108,11 @@ class Counter {
     }
 }
 
-Counter.count      // 0
+Counter.count      # 0
 a = Counter()
-Counter.count      // 1
+Counter.count      # 1
 b = Counter()
-Counter.count      // 2
+Counter.count      # 2
 ```
 
 通过 `ClassName.attr` 或 `self.attr`（如果实例没有同名属性）访问类属性。
@@ -148,8 +148,8 @@ class Dog < Animal {
 }
 
 d = Dog("Rex", "Shepherd")
-d.speak()          // "Rex barks"   （方法覆盖）
-d.name             // "Rex"         （继承自 Animal）
+d.speak()          # "Rex barks"   （方法覆盖）
+d.name             # "Rex"         （继承自 Animal）
 ```
 
 ### 继承规则
@@ -171,7 +171,7 @@ class Child < Parent {
     }
 
     fn method(self) {
-        result = super.method()    // 调用父类的 method
+        result = super.method()    # 调用父类的 method
         return result + " enhanced"
     }
 }
@@ -263,7 +263,7 @@ class Multiplier {
 }
 
 double = Multiplier(2)
-double(5)     // 10
+double(5)     # 10
 ```
 
 ### 迭代器协议
@@ -291,11 +291,26 @@ class Countdown {
 }
 
 for i in Countdown(5) {
-    print(i)    // 5, 4, 3, 2, 1
+    print(i)    # 5, 4, 3, 2, 1
 }
 ```
 
 ## Object 基类
+
+### 类内置属性
+
+每个类对象自动拥有以下属性：
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `__name__` | string | 类名字符串 |
+
+```ms
+class Dog {
+    fn __init__(self) {}
+}
+Dog.__name__     # "Dog"
+```
 
 所有类的隐式基类，提供：
 
@@ -320,7 +335,7 @@ class Object {
 ### 动态属性
 
 ```ms
-obj.new_attr = "dynamic"     // 运行时添加属性
+obj.new_attr = "dynamic"     # 运行时添加属性
 ```
 
 ### 运算符重载
@@ -345,5 +360,5 @@ class Vector {
 
 v1 = Vector(1, 2)
 v2 = Vector(3, 4)
-v3 = v1 + v2     // Vector(4, 6)
+v3 = v1 + v2     # Vector(4, 6)
 ```

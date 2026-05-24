@@ -17,13 +17,13 @@ while      for        in         break      continue
 class      self       super
 true       false      nil
 and        or         not
-try        except     finally    defer      with
+try        except     finally    defer      with     throw
 async      await      go         channel
 import     from       as
 yield
 ```
 
-共 **31** 个关键字。
+共 **32** 个关键字。
 
 ### 标识符
 
@@ -219,13 +219,13 @@ in  is
 
 ### 注释
 
-仅支持 `//` 单行注释：
+仅支持 `#` 单行注释：
 
 ```
-comment = "//" [^\n]*
+comment = "#" [^\n]*
 ```
 
-注释从 `//` 开始到行尾结束，会被词法分析器跳过。
+注释从 `#` 开始到行尾结束，会被词法分析器跳过。
 
 不支持多行注释 `/* ... */`。
 
@@ -246,20 +246,18 @@ enum TokenKind {
     // 字面量
     Int(i64),
     Float(f64),
-    Bool(bool),
-    Nil,
     String(String),
 
     // 标识符与关键字
     Identifier(String),
-    // 31 个关键字
+    // 32 个关键字
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
     Class, Self, Super,
     True, False, Nil,
     And, Or, Not,
-    Try, Except, Finally, Defer, With,
+    Try, Except, Finally, Defer, With, Throw,
     Async, Await, Go, Channel,
     Import, From, As,
     Yield,
@@ -297,10 +295,11 @@ enum TokenKind {
 
 词法分析器采用最长匹配：
 
-- `//` 优先匹配为整除运算符，而非两个单斜杠
 - `**` 优先匹配为幂运算符
 - `<<` 优先匹配为左移运算符
 - `<=` 优先匹配为小于等于
+- `//` 优先匹配为整除运算符
+- `#` 开始到行尾为注释（不与整除冲突）
 
 ### 关键字 vs 标识符
 
@@ -317,3 +316,15 @@ enum TokenKind {
 ### 字符串不可跨行
 
 双引号字符串内不能包含未转义的换行符。跨行需使用 `\n` 转义。
+
+## 保留字
+
+以下标识符暂无语义，但保留给未来版本使用，不可用作变量名：
+
+| 保留字 | 用途 |
+|---|---|
+| `select` | 多 channel 复用（见 [08-concurrency](08-concurrency.md)） |
+| `default` | select 的默认分支 |
+| `case` | select 的 case 分支 |
+| `export` | 模块显式导出（见 [09-modules](09-modules.md)） |
+| `match` | 模式匹配（预留） |

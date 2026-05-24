@@ -177,10 +177,10 @@ mslang-rs/
 ```ms
 x = 10
 y = 20
-print(x + y)        // 30
+print(x + y)        # 30
 
 if x > 5 {
-    print("big")    // big
+    print("big")    # big
 }
 
 i = 0
@@ -189,6 +189,8 @@ while i < 5 {
     i += 1
 }
 ```
+
+> **注意**：由于 mslang 支持顶层 await（见 [08-concurrency](08-concurrency.md)），VM 核心需要在初始设计中就支持可暂停的执行帧。建议在 CallFrame 设计时预留帧快照/恢复能力，以便 Phase 7 无缝集成 async/await。
 
 ### 2.5 内置函数
 
@@ -429,6 +431,8 @@ while i < 5 {
 - [ ] 并发执行
 
 **验证**：go 启动的协程并发执行
+
+> **注意**：`select`（多 channel 复用）已保留语法但未列入任何 Phase，计划在并发模型稳定后作为 Phase 7 增量实现。
 
 ---
 

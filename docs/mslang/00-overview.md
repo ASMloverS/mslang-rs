@@ -13,7 +13,7 @@
 | 代码块风格 | 花括号 `{}` |
 | 分号 | 不需要，换行即语句结束 |
 | 入口点 | 脚本模式，从文件顶部顺序执行 |
-| 注释 | `//` 单行注释 |
+| 注释 | `#` 单行注释 |
 
 ## 设计哲学
 
@@ -28,7 +28,7 @@ mslang 是一门融合 Go 语法风格与 Python 动态特性的脚本语言：
 ## 快速示例
 
 ```ms
-// hello.ms
+# hello.ms
 const GREETING = "Hello, mslang!"
 
 fn main_thinking(names) {
@@ -54,7 +54,7 @@ for msg in main_thinking(names) {
 - [x] 变量声明：`x = val` / `var x = val` / `x := val`
 - [x] 常量声明：`const NAME = val`
 - [x] 花括号代码块，无分号
-- [x] `//` 行注释
+- [x] `#` 行注释
 
 ### 数据类型
 

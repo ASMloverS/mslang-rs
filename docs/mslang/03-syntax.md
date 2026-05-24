@@ -13,7 +13,7 @@
    - 字符串字面量内（已由引号界定）
 
 ```ms
-// 这些是合法的多行语句
+# 这些是合法的多行语句
 total = a +
         b +
         c
@@ -51,9 +51,9 @@ assign    = IDENTIFIER "=" expression
 三种变量声明方式等价：
 
 ```ms
-x = 10           // 直接赋值
-var x = 10       // var 关键字
-x := 10          // 短声明
+x = 10           # 直接赋值
+var x = 10       # var 关键字
+x := 10          # 短声明
 ```
 
 `var` 和 `:=` 总是创建新变量（在同一作用域）。`=` 赋值给已有变量，若不存在则在当前作用域创建。
@@ -84,7 +84,7 @@ target = IDENTIFIER
 
 ```ms
 x = 10
-x += 5         // x = 15
+x += 5         # x = 15
 arr[0] = 99
 obj.name = "Alice"
 ```
@@ -97,9 +97,9 @@ target_list = target ("," target)*
 ```
 
 ```ms
-a, b = 1, 2           // a=1, b=2
-a, b = b, a           // 交换
-a, b, c = fn()        // 元组解包
+a, b = 1, 2           # a=1, b=2
+a, b = b, a           # 交换
+a, b, c = fn()        # 元组解包
 ```
 
 ### 表达式语句
@@ -188,11 +188,11 @@ return_stmt   = "return" expression_list?
 ```
 
 ```ms
-break                   // 跳出当前循环
-continue                // 跳到下一次迭代
-return                  // 返回 nil
-return x                // 返回 x
-return a, b, c          // 返回元组 (a, b, c)
+break                   # 跳出当前循环
+continue                # 跳到下一次迭代
+return                  # 返回 nil
+return x                # 返回 x
+return a, b, c          # 返回元组 (a, b, c)
 ```
 
 ### defer 语句
@@ -205,7 +205,7 @@ defer_stmt = "defer" expression
 fn process(path) {
     f = open(path)
     defer f.close()
-    // ... 即使发生异常，f.close() 也会在函数返回前执行
+    # ... 即使发生异常，f.close() 也会在函数返回前执行
 }
 ```
 
@@ -220,7 +220,7 @@ fn example() {
     defer print("first")
     defer print("second")
     defer print("third")
-    // 输出: third, second, first
+    # 输出: third, second, first
 }
 ```
 
@@ -235,7 +235,7 @@ type_spec = IDENTIFIER ("." IDENTIFIER)*
 try {
     risky_operation()
 } except {
-    // 捕获所有异常
+    # 捕获所有异常
     print("something went wrong")
 }
 
@@ -346,7 +346,7 @@ comparison_expr = bit_or (( "==" | "!=" | "<" | ">" | "<=" | ">=" | "in" | "is" 
 支持链式比较：
 
 ```ms
-1 < x < 10     // 等价于 (1 < x) and (x < 10)
+1 < x < 10     # 等价于 (1 < x) and (x < 10)
 ```
 
 ### 7. 位运算 or
@@ -413,11 +413,11 @@ slice_part = expression?
 ```
 
 ```ms
-func(a, b)          // 函数调用
-arr[0]              // 下标
-obj.name            // 属性访问
-arr[1:3]            // 切片
-arr[::2]            // 步长切片
+func(a, b)          # 函数调用
+arr[0]              # 下标
+obj.name            # 属性访问
+arr[1:3]            # 切片
+arr[::2]            # 步长切片
 ```
 
 ### 16. 初等表达式
@@ -425,7 +425,8 @@ arr[::2]            // 步长切片
 ```
 primary = literal
         | IDENTIFIER
-        | "(" expression ("," expression)* ")"   // 分组或元组
+        | "super" "." IDENTIFIER                 // 父类方法访问
+        | "(" expression ("," expression)* ")"   # 分组或元组
         | "[" list_content? "]"                  // 列表
         | "{" dict_content? "}"                  // dict 或 set
         | fn_literal                             // 匿名函数
@@ -480,8 +481,8 @@ tuple = "(" expression ("," expression)+ ","? ")"
 
 ```ms
 (1, 2, 3)
-1, 2, 3           // 裸元组（在允许的上下文中）
-(42,)             // 单元素元组
+1, 2, 3           # 裸元组（在允许的上下文中）
+(42,)             # 单元素元组
 ()
 ```
 
@@ -514,19 +515,41 @@ mslang 使用**函数级作用域**（类似 Python）：
 - `if`/`while`/`for`/`with` 块**不创建**新作用域
 - 内层函数可以访问外层变量（闭包）
 - `var` 和 `:=` 在当前函数作用域创建新变量
-- `=` 赋值时：优先查找当前作用域，找不到则查找外层作用域
+- `=` 赋值时：仅在当前函数作用域内查找，找不到则在当前作用域创建新变量（不穿透外层）
 
 ```ms
-x = 10               // 全局
+x = 10               # 全局
 
 fn foo() {
-    print(x)          // 访问全局 x = 10
-    var y = 20        // foo 作用域的局部变量
-    z := 30           // foo 作用域的局部变量
+    print(x)          # 访问全局 x = 10
+    var y = 20        # foo 作用域的局部变量
+    z := 30           # foo 作用域的局部变量
 }
 
 fn bar() {
-    x = 99            // 修改全局 x
-    var x = 1         // 创建 bar 作用域的局部 x（遮蔽全局）
+    x = 99            # 在 bar 作用域创建新局部 x（不修改全局）
+    var x = 1         # 同上，创建局部变量
 }
+```
+
+### 闭包与循环变量陷阱
+
+`for` 循环不创建新作用域，循环变量在循环结束后保持最后一次的值。如果在循环内创建闭包捕获循环变量，所有闭包将共享同一个变量引用：
+
+```ms
+fns = []
+for i in range(3) {
+    fns.push(fn() { return i })
+}
+# 警告：所有 fns 调用都返回 2（循环结束值），不是 0, 1, 2
+```
+
+若需捕获每次迭代的值，使用默认参数技巧：
+
+```ms
+fns = []
+for i in range(3) {
+    fns.push(fn(captured = i) { return captured })
+}
+# 现在 fns[0]() 返回 0, fns[1]() 返回 1, fns[2]() 返回 2
 ```

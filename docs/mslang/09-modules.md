@@ -81,7 +81,7 @@ import os.path
 单个 `.ms` 文件即为一个模块：
 
 ```
-// math_utils.ms
+# math_utils.ms
 fn add(a, b) {
     return a + b
 }
@@ -99,15 +99,15 @@ fn multiply(a, b) {
 
 ```
 mylib/
-├── index.ms          // 包入口
-├── utils.ms          // 子模块
-└── helpers.ms        // 子模块
+├── index.ms          # 包入口
+├── utils.ms          # 子模块
+└── helpers.ms        # 子模块
 ```
 
 ```ms
-import mylib                  // 加载 mylib/index.ms
-import mylib.utils            // 加载 mylib/utils.ms
-from mylib.utils import tool  // 从子模块导入
+import mylib                  # 加载 mylib/index.ms
+import mylib.utils            # 加载 mylib/utils.ms
+from mylib.utils import tool  # 从子模块导入
 ```
 
 ## 模块执行
@@ -119,7 +119,7 @@ from mylib.utils import tool  // 从子模块导入
 后续再次 import 同一模块不会重新执行，直接使用缓存。
 
 ```ms
-// counter.ms
+# counter.ms
 print("counter module loaded")
 count = 0
 
@@ -130,11 +130,11 @@ fn increment() {
 ```
 
 ```ms
-import counter     // 打印 "counter module loaded"
-counter.increment()  // 1
+import counter     # 打印 "counter module loaded"
+counter.increment()  # 1
 
-import counter     // 不会再次打印（使用缓存）
-counter.increment()  // 2
+import counter     # 不会再次打印（使用缓存）
+counter.increment()  # 2
 ```
 
 ### 模块作用域
@@ -142,10 +142,10 @@ counter.increment()  // 2
 每个模块有独立的全局作用域。模块内的顶层变量是模块私有的，只有函数和 class 可以被外部访问。
 
 ```ms
-// config.ms
-internal_state = "private"    // 模块私有
+# config.ms
+internal_state = "private"    # 模块私有
 
-fn get_state() {              // 可被外部访问
+fn get_state() {              # 可被外部访问
     return internal_state
 }
 ```
@@ -157,16 +157,18 @@ fn get_state() {              // 可被外部访问
 - 如果模块 A 导入模块 B，模块 B 又导入模块 A
 - 先被导入的模块可能只部分初始化
 - 建议避免循环导入，或使用延迟导入（在函数内 import）
+- 访问未初始化的名称将抛出 `NameError`（而非静默返回 `nil`）
+- 使用 `ms check` 可在开发时检测潜在的循环导入问题
 
 ```ms
-// a.ms
+# a.ms
 import b
 
 fn hello() {
     return "from a"
 }
 
-// b.ms
+# b.ms
 import a
 
 fn world() {
@@ -178,19 +180,19 @@ fn world() {
 
 ### 默认导出
 
-模块中所有顶层 `fn` 和 `class` 定义默认可被外部访问。
+模块中所有顶层 `fn`、`class` 和 `const` 定义默认可被外部访问。
 
 顶层变量（`var`, `:=`, `=`）默认为模块私有。
 
 ```ms
-// utils.ms
-const VERSION = "1.0"      // 模块私有
+# utils.ms
+const VERSION = "1.0"      # 可导出
 
-fn helper() {              // 可导出
+fn helper() {              # 可导出
     return "help"
 }
 
-class Config {             // 可导出
+class Config {             # 可导出
     fn __init__(self) {
         self.data = {}
     }
@@ -202,31 +204,33 @@ class Config {             // 可导出
 如果需要更精细的控制，可以使用导出声明（后续版本考虑）：
 
 ```ms
-// 保留语法，暂不实现
+# 保留语法，暂不实现
 export fn public_fn() { ... }
 export class PublicClass { ... }
 ```
 
-MVP 阶段采用简单的规则：函数和 class 可访问，变量私有。
+`export` 为保留关键字（见 [01-lexical](01-lexical.md)），不可用作变量名。
+
+MVP 阶段采用简单的规则：函数、class、const 可访问，普通变量私有。
 
 ## 标准库结构
 
 ```
 stdlib/
-├── io.ms            // I/O 操作
-├── math.ms          // 数学函数
-├── os.ms            // 操作系统接口
-├── string.ms        // 字符串工具
-├── time.ms          // 时间相关
-├── json.ms          // JSON 编解码
-├── regex.ms         // 正则表达式
-├── collections.ms   // 高级数据结构
-├── http.ms          // HTTP 客户端
-├── net.ms           // 网络操作
-├── fs.ms            // 文件系统操作
-├── async.ms         // 异步工具
-├── path.ms          // 路径操作
-└── test.ms          // 测试框架
+├── io.ms            # I/O 操作
+├── math.ms          # 数学函数
+├── os.ms            # 操作系统接口
+├── string.ms        # 字符串工具
+├── time.ms          # 时间相关
+├── json.ms          # JSON 编解码
+├── regex.ms         # 正则表达式
+├── collections.ms   # 高级数据结构
+├── http.ms          # HTTP 客户端
+├── net.ms           # 网络操作
+├── fs.ms            # 文件系统操作
+├── async.ms         # 异步工具
+├── path.ms          # 路径操作
+└── test.ms          # 测试框架
 ```
 
 详见 [10-builtins](10-builtins.md)。

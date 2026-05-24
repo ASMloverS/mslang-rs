@@ -10,8 +10,7 @@ mslang 采用**纯动态类型**系统：
 - 每个**值**（而非变量）有明确的类型
 
 ```ms
-x = 10          // x 持有 int
-x = "hello"     // x 现在持有 string，这是合法的
+s2 = set()           # 空集合（{} 是空 dict）
 ```
 
 ## 内置类型
@@ -73,7 +72,7 @@ d = 0o755
 **整除规则**：向负无穷方向取整（与 Python 一致）。
 
 ```
--7 // 2 == -4    // 向负无穷取整
+-7 // 2 == -4    # 向负无穷取整
 7 // 2 == 3
 ```
 
@@ -93,9 +92,9 @@ speed = 1.5e8
 **注意**：int 和 float 混合运算结果为 float。
 
 ```
-1 + 2.0   // 3.0 (float)
-10 / 3    // 3.3333... (float)
-10 // 3   // 3 (int)
+1 + 2.0   # 3.0 (float)
+10 / 3    # 3.3333... (float)
+10 // 3   # 3 (int)
 ```
 
 ### String
@@ -113,10 +112,10 @@ type: string
 
 ```ms
 s = "hello"
-s2 = s + " world"    // "hello world"
-s3 = "ab" * 3        // "ababab"
-ch = s[0]            // "h"
-len = s.length()     // 5
+s2 = s + " world"    # "hello world"
+s3 = "ab" * 3        # "ababab"
+ch = s[0]            # "h"
+len = s.length()     # 5
 ```
 
 ### List
@@ -148,7 +147,7 @@ nested = [[1, 2], [3, 4]]
 
 ```ms
 lst = [1, 2, 3]
-lst[0] = 99     // lst 现在是 [99, 2, 3]
+lst[0] = 99     # lst 现在是 [99, 2, 3]
 ```
 
 ### Dict
@@ -158,7 +157,7 @@ type: dict
 值: 有序可变映射，键值对集合
 ```
 
-键必须为可哈希类型（int, float, bool, string, nil, tuple, frozenset）。
+键必须为可哈希类型（int, float, bool, string, nil, tuple）。
 
 ```ms
 person = {
@@ -189,7 +188,7 @@ type: tuple
 
 ```ms
 point = (1, 2)
-single = (42,)       // 单元素元组必须有逗号
+single = (42,)       # 单元素元组必须有逗号
 empty = ()
 ```
 
@@ -201,7 +200,7 @@ empty = ()
 
 ```ms
 a, b, c = (1, 2, 3)
-a, b = b, a          // 交换
+a, b = b, a          # 交换
 q, r = divmod(10, 3)
 ```
 
@@ -216,7 +215,7 @@ type: set
 
 ```ms
 s = {1, 2, 3}
-s2 = set()           // 空集合（{} 是空 dict）
+s2 = set()           # 空集合（{} 是空 dict）
 ```
 
 **操作**：
@@ -236,26 +235,26 @@ s2 = set()           // 空集合（{} 是空 dict）
 内置函数进行显式类型转换：
 
 ```ms
-int("42")        // 42
-int(3.7)         // 3
-float("3.14")    // 3.14
-float(42)        // 42.0
-str(42)          // "42"
-bool(0)          // false
-bool("")         // false
-list("abc")      // ["a", "b", "c"]
-tuple([1,2])     // (1, 2)
-set([1,2,2])     // {1, 2}
+int("42")        # 42
+int(3.7)         # 3
+float("3.14")    # 3.14
+float(42)        # 42.0
+str(42)          # "42"
+bool(0)          # false
+bool("")         # false
+list("abc")      # ["a", "b", "c"]
+tuple([1,2])     # (1, 2)
+set([1,2,2])     # {1, 2}
 ```
 
 ## 类型判断
 
 ```ms
-type(42)              // "int"
-type("hello")         // "string"
-type([1,2])           // "list"
-42 is int             // true
-"hello" is string     // true
+type(42)              # "int"
+type("hello")         # "string"
+type([1,2])           # "list"
+isinstance(42, "int")        # true
+isinstance("hello", "string") # true
 ```
 
 ## 运算符类型规则
@@ -288,9 +287,9 @@ type([1,2])           // "list"
 短路求值：
 
 ```ms
-a and b    // a 为 falsy 则返回 a，否则返回 b
-a or b     // a 为 truthy 则返回 a，否则返回 b
-not a      // 返回 bool
+a and b    # a 为 falsy 则返回 a，否则返回 b
+a or b     # a 为 truthy 则返回 a，否则返回 b
+not a      # 返回 bool
 ```
 
 注意：`and`/`or` 返回的是实际值（不一定是 bool），这与 Python 一致。

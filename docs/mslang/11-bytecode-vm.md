@@ -170,7 +170,6 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 
 | OpCode | 操作数 | 说明 |
 |---|---|---|
-| `PRINT` | — | 打印栈顶 |
 | `ASSERT` | — | 断言 |
 | `IMPORT` | `module_idx(2)` | 导入模块 |
 | `CHANNEL` | `buffer_size(1)` | 创建 channel |
@@ -386,6 +385,100 @@ Error: division by zero
     at <main> (main.ms:20)
 ```
 
+## 生成器执行模型
+
+### Generator 帧
+
+生成器需要保存完整的执行状态以便暂停和恢复。Generator 对象持有独立的栈帧副本：
+
+```
+Generator {
+    frame: CallFrame         # 独立的调用帧（含 IP、栈基址）
+    stack: Vec<Object>       # 独立的值栈副本
+    locals: Vec<Object>      # 局部变量快照
+    state: GeneratorState    # 状态
+}
+
+enum GeneratorState {
+    Suspended,
+    Running,
+    Exhausted,
+}
+```
+
+### yield 执行流程
+
+1. `YIELD` 指令执行时：
+   - 将当前栈顶值作为产出值保存
+   - 快照当前 CallFrame（IP、栈、局部变量）到 Generator 对象
+   - 将 Generator 状态设为 `Suspended`
+   - 将产出值压入调用者的栈中
+   - VM 从调用者的 `FOR_ITER` 继续执行
+
+2. `FOR_ITER` / `__next__()` 恢复时：
+   - 从 Generator 对象恢复 CallFrame（IP、栈、局部变量）
+   - 将 Generator 状态设为 `Running`
+   - VM 跳转到 Generator 的恢复点继续执行
+
+3. 生成器函数执行完毕（return 或函数结束）：
+   - 将 Generator 状态设为 `Exhausted`
+   - `FOR_ITER` 检测到 `Exhausted` 后跳出循环
+
+### yield from
+
+`YIELD_FROM` 将当前 Generator 的执行委托给另一个可迭代对象：
+- 内部创建子迭代器
+- 每次产出时直接传递子迭代器的值，不经过中间层
+- 子迭代器耗尽后，当前 Generator 继续
+
+## 异步执行模型
+
+### 协程与事件循环集成
+
+async/await 与 VM 的核心执行循环集成方式：
+
+```
+EventLoop {
+    ready_queue: Vec<Coroutine>      # 就绪协程队列
+    paused: Vec<PausedCoroutine>     # 等待 Future 的暂停协程
+}
+
+PausedCoroutine {
+    coroutine: Coroutine
+    waiting_on: Gc<Future>           # 等待的 Future
+    frame: CallFrame                 # 暂停时的执行帧快照
+}
+
+Coroutine {
+    frame: CallFrame                 # 当前执行帧
+    defer_stack: Vec<DeferEntry>     # 协程自己的 defer 栈
+}
+```
+
+### AWAIT 指令流程
+
+1. 求值 await 后的表达式，得到 Future 对象
+2. 检查 Future 状态：
+   - **Resolved**：直接将结果压栈，继续执行（不暂停）
+   - **Rejected**：抛出异常
+   - **Pending**：
+     a. 快照当前 CallFrame 到 `PausedCoroutine`
+     b. 将当前协程加入 `EventLoop.paused`
+     c. VM 从 `ready_queue` 取下一个协程继续执行
+3. 当 Future 完成（由 IO 回调或其他协程触发）：
+   - 将暂停的协程从 `paused` 移到 `ready_queue`
+   - 恢复时将 Future 结果压栈，继续执行
+
+### GO 指令流程
+
+1. 将表达式（通常为函数调用或闭包）包装为 `Coroutine`
+2. 加入 `EventLoop.ready_queue`
+3. 当前协程继续执行（不等待）
+
+### 顶层 await
+
+主脚本作为主协程在事件循环中执行。当遇到 `await` 时，主协程暂停，事件循环调度其他协程。主协程完成后程序退出。
+
 ### disassemble
 
 调试模式下可以反汇编字节码：
@@ -395,6 +488,5 @@ Error: division by zero
 0000 CONSTANT     0   "hello"
 0002 CONSTANT     1   "world"
 0004 ADD
-0005 PRINT
-0006 HALT
+0005 HALT
 ```

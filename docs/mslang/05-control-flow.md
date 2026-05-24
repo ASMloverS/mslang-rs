@@ -53,7 +53,7 @@ while i < 10 {
 }
 
 while true {
-    // 无限循环
+    # 无限循环
     if should_stop() {
         break
     }
@@ -68,32 +68,32 @@ for_stmt = "for" IDENTIFIER "in" expression block
 ```
 
 ```ms
-// 遍历列表
+# 遍历列表
 for item in [1, 2, 3] {
     print(item)
 }
 
-// 遍历 range
+# 遍历 range
 for i in range(10) {
     print(i)
 }
 
-// 遍历字典
+# 遍历字典
 for key in dict {
     print(key)
 }
 
-// 遍历键值对
+# 遍历键值对
 for key, value in dict.items() {
     print(key + ": " + str(value))
 }
 
-// 遍历字符串
+# 遍历字符串
 for ch in "hello" {
     print(ch)
 }
 
-// 遍历生成器
+# 遍历生成器
 for val in generator() {
     print(val)
 }
@@ -137,7 +137,7 @@ for i in range(10) {
     if i % 2 == 0 {
         continue
     }
-    print(i)    // 只打印奇数
+    print(i)    # 只打印奇数
 }
 ```
 
@@ -149,7 +149,7 @@ break/continue 只影响最内层循环。不支持带标签的 break/continue�
 for i in range(5) {
     for j in range(5) {
         if j == 3 {
-            break    // 只跳出内层循环
+            break    # 只跳出内层循环
         }
     }
 }
@@ -163,26 +163,26 @@ for i in range(5) {
 try_stmt = "try" block except_clause* finally_clause?
 
 except_clause = "except" type_spec? ("as" IDENTIFIER)? block
-type_spec     = IDENTIFIER
+type_spec     = IDENTIFIER ("." IDENTIFIER)*
 finally_clause = "finally" block
 ```
 
 ```ms
-// 基本用法
+# 基本用法
 try {
     result = risky()
 } except {
     print("caught an error")
 }
 
-// 捕获特定异常类型
+# 捕获特定异常类型
 try {
     val = int("abc")
 } except ValueError as e {
     print("not a number: " + e.message)
 }
 
-// 多个 except
+# 多个 except
 try {
     operation()
 } except ValueError as e {
@@ -212,26 +212,26 @@ try {
 
 ```
 Error
-├── message      // 错误消息（string）
-├── type         // 错误类型名（string）
-├── traceback    // 堆栈跟踪（string）
+├── message      # 错误消息（string）
+├── type         # 错误类型名（string）
+├── traceback    # 堆栈跟踪（string）
 ```
 
 ### 内置异常类型
 
 ```
-Error                      // 所有异常的基类
-├── ValueError             // 值错误
-├── TypeError              // 类型错误
-├── IndexError             // 下标越界
-├── KeyError               // 键不存在
-├── AttributeError         // 属性不存在
-├── NameError              // 变量未定义
-├── RuntimeError           // 运行时错误
-├── IOError                // IO 错误
-├── ZeroDivisionError      // 除零错误
-├── OverflowError          // 溢出错误
-└── StopIteration          // 迭代结束
+Error                      # 所有异常的基类
+├── ValueError             # 值错误
+├── TypeError              # 类型错误
+├── IndexError             # 下标越界
+├── KeyError               # 键不存在
+├── AttributeError         # 属性不存在
+├── NameError              # 变量未定义
+├── RuntimeError           # 运行时错误
+├── IOError                # IO 错误
+├── ZeroDivisionError      # 除零错误
+├── OverflowError          # 溢出错误
+└── StopIteration          # 迭代结束
 ```
 
 ### 抛出异常
@@ -288,7 +288,7 @@ fn example() {
     for i in range(3) {
         defer print(i)
     }
-    // 输出: 2, 1, 0（LIFO，且 i 在 defer 时求值）
+    # 输出: 2, 1, 0（LIFO，且 i 在 defer 时求值）
 }
 ```
 
@@ -298,12 +298,12 @@ defer 的行为等价于：
 
 ```ms
 fn example() {
-    // defer action1
-    // defer action2
+    # defer action1
+    # defer action2
     try {
-        // 函数体
+        # 函数体
     } finally {
-        action2()   // 后注册的先执行
+        action2()   # 后注册的先执行
         action1()
     }
 }
@@ -320,7 +320,7 @@ with open("data.txt") as f {
     content = f.read()
     print(content)
 }
-// f.__exit__() 在这里自动调用
+# f.__exit__() 在这里自动调用
 ```
 
 ### 上下文管理器协议
@@ -330,14 +330,14 @@ with open("data.txt") as f {
 ```ms
 class MyResource {
     fn __enter__(self) {
-        // 获取资源，返回 self 或其他对象
+        # 获取资源，返回 self 或其他对象
         return self
     }
 
     fn __exit__(self, error_type, error_msg, traceback) {
-        // 清理资源
-        // 如果返回 true，异常被吞掉
-        // 如果返回 false 或 nil，异常继续传播
+        # 清理资源
+        # 如果返回 true，异常被吞掉
+        # 如果返回 false 或 nil，异常继续传播
         return false
     }
 }

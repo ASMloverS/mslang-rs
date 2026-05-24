@@ -15,7 +15,7 @@ fn greet(name) {
     return "Hello, " + name
 }
 
-// 等价于：
+# 等价于：
 fn greet(name) {
     return "Hello, " + name
 }
@@ -37,7 +37,7 @@ fn timer(func) {
 
 @timer
 fn slow_function() {
-    // 耗时操作
+    # 耗时操作
 }
 ```
 
@@ -62,7 +62,7 @@ fn retry(times) {
 
 @retry(3)
 fn unreliable_request() {
-    // 可能失败的网络请求
+    # 可能失败的网络请求
 }
 ```
 
@@ -72,10 +72,10 @@ fn unreliable_request() {
 @decorator1
 @decorator2
 fn func() {
-    // ...
+    # ...
 }
 
-// 等价于：
+# 等价于：
 fn func() { ... }
 func = decorator1(decorator2(func))
 ```
@@ -96,7 +96,7 @@ fn add_repr(cls) {
 class Foo {
 }
 
-print(Foo())    // "Foo()"
+print(Foo())    # "Foo()"
 ```
 
 ## 生成器 (Generator)
@@ -114,7 +114,7 @@ fn countdown(n) {
 }
 
 for i in countdown(5) {
-    print(i)    // 5, 4, 3, 2, 1
+    print(i)    # 5, 4, 3, 2, 1
 }
 ```
 
@@ -136,10 +136,10 @@ fn fibonacci() {
 }
 
 fib = fibonacci()
-fib.__next__()    // 0
-fib.__next__()    // 1
-fib.__next__()    // 1
-fib.__next__()    // 2
+fib.__next__()    # 0
+fib.__next__()    # 1
+fib.__next__()    # 1
+fib.__next__()    # 2
 ```
 
 ### yield from
@@ -158,7 +158,7 @@ fn flatten(nested) {
 }
 
 for v in flatten([1, [2, 3], [4, [5, 6]]]) {
-    print(v)    // 1, 2, 3, 4, 5, 6
+    print(v)    # 1, 2, 3, 4, 5, 6
 }
 ```
 
@@ -192,10 +192,10 @@ list_comp = "[" expression "for" IDENTIFIER "in" expression ("if" expression)? "
 
 ```ms
 squares = [x * x for x in range(10)]
-// [0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
+# [0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
 
 evens = [x for x in range(20) if x % 2 == 0]
-// [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+# [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
 ```
 
 ### 带过滤条件
@@ -203,7 +203,7 @@ evens = [x for x in range(20) if x % 2 == 0]
 ```ms
 names = ["Alice", "Bob", "Charlie", "David"]
 long_names = [n for n in names if n.length() > 3]
-// ["Alice", "Charlie", "David"]
+# ["Alice", "Charlie", "David"]
 ```
 
 ### 嵌套推导式
@@ -211,24 +211,24 @@ long_names = [n for n in names if n.length() > 3]
 ```ms
 matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
 flat = [x for row in matrix for x in row]
-// [1, 2, 3, 4, 5, 6, 7, 8, 9]
+# [1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 pairs = [(x, y) for x in range(3) for y in range(3) if x != y]
-// [(0,1), (0,2), (1,0), (1,2), (2,0), (2,1)]
+# [(0,1), (0,2), (1,0), (1,2), (2,0), (2,1)]
 ```
 
 ### dict 推导式
 
 ```ms
 squares_dict = {x: x*x for x in range(5)}
-// {0:0, 1:1, 2:4, 3:9, 4:16}
+# {0:0, 1:1, 2:4, 3:9, 4:16}
 ```
 
 ### set 推导式
 
 ```ms
 unique_lengths = {w.length() for w in ["a", "bb", "ccc", "bb"]}
-// {1, 2, 3}
+# {1, 2, 3}
 ```
 
 ## 切片
@@ -255,21 +255,21 @@ slice_part = expression | (空)
 ```ms
 lst = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
-lst[2:5]       // [2, 3, 4]
-lst[:3]        // [0, 1, 2]
-lst[7:]        // [7, 8, 9]
-lst[::2]       // [0, 2, 4, 6, 8]
-lst[1::2]      // [1, 3, 5, 7, 9]
-lst[::-1]      // [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
-lst[8:2:-1]    // [8, 7, 6, 5, 4, 3]
+lst[2:5]       # [2, 3, 4]
+lst[:3]        # [0, 1, 2]
+lst[7:]        # [7, 8, 9]
+lst[::2]       # [0, 2, 4, 6, 8]
+lst[1::2]      # [1, 3, 5, 7, 9]
+lst[::-1]      # [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+lst[8:2:-1]    # [8, 7, 6, 5, 4, 3]
 ```
 
 ### 负索引
 
 ```ms
-lst[-1]        // 9（最后一个元素）
-lst[-3:]       // [7, 8, 9]
-lst[-5:-2]     // [5, 6, 7]
+lst[-1]        # 9（最后一个元素）
+lst[-3:]       # [7, 8, 9]
+lst[-5:-2]     # [5, 6, 7]
 ```
 
 负索引 `-n` 等价于 `length - n`。
@@ -292,9 +292,9 @@ lst[-5:-2]     // [5, 6, 7]
 
 ```ms
 lst = [0, 1, 2]
-lst[0:100]     // [0, 1, 2]
-lst[-100:100]  // [0, 1, 2]
-lst[100:200]   // []
+lst[0:100]     # [0, 1, 2]
+lst[-100:100]  # [0, 1, 2]
+lst[100:200]   # []
 ```
 
 ## with 语句（上下文管理器）
@@ -304,8 +304,8 @@ lst[100:200]   // []
 协议：
 
 ```ms
-fn __enter__(self) -> value     // 进入 with 块时调用，返回值绑定到 as 变量
-fn __exit__(self, err, msg, tb) -> bool  // 离开 with 块时调用
+fn __enter__(self) -> value     # 进入 with 块时调用，返回值绑定到 as 变量
+fn __exit__(self, err, msg, tb) -> bool  # 离开 with 块时调用
 ```
 
 ## defer 语句

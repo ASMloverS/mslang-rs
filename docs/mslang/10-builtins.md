@@ -18,14 +18,14 @@
 | `dict` | `dict(val) -> dict` | 转换为字典 |
 
 ```ms
-int("42")        // 42
-int(3.7)         // 3
-float("3.14")    // 3.14
-str(42)          // "42"
-bool(0)          // false
-list("abc")      // ["a", "b", "c"]
-tuple([1,2])     // (1, 2)
-set([1,2,2])     // {1, 2}
+int("42")        # 42
+int(3.7)         # 3
+float("3.14")    # 3.14
+str(42)          # "42"
+bool(0)          # false
+list("abc")      # ["a", "b", "c"]
+tuple([1,2])     # (1, 2)
+set([1,2,2])     # {1, 2}
 ```
 
 ### 类型检查
@@ -36,11 +36,11 @@ set([1,2,2])     // {1, 2}
 | `isinstance` | `isinstance(val, type_name) -> bool` | 是否为指定类型 |
 
 ```ms
-type(42)              // "int"
-type("hello")         // "string"
-type([1,2])           // "list"
-isinstance(42, "int")      // true
-isinstance("x", "int")     // false
+type(42)              # "int"
+type("hello")         # "string"
+type([1,2])           # "list"
+isinstance(42, "int")      # true
+isinstance("x", "int")     # false
 ```
 
 ### I/O
@@ -52,9 +52,9 @@ isinstance("x", "int")     // false
 | `input` | `input(prompt?) -> string` | 读取用户输入 |
 
 ```ms
-print("hello")                  // hello
-println("a", "b", "c")         // a b c（换行）
-name = input("Enter name: ")   // 带提示的输入
+print("hello")                  # hello
+println("a", "b", "c")         # a b c（换行）
+name = input("Enter name: ")   # 带提示的输入
 ```
 
 ### 数学
@@ -70,12 +70,12 @@ name = input("Enter name: ")   // 带提示的输入
 | `round` | `round(n, digits?) -> number` | 四舍五入 |
 
 ```ms
-abs(-5)          // 5
-max(1, 2, 3)    // 3
-sum([1,2,3])    // 6
-ceil(3.2)       // 4
-floor(3.8)      // 3
-round(3.14159, 2)  // 3.14
+abs(-5)          # 5
+max(1, 2, 3)    # 3
+sum([1,2,3])    # 6
+ceil(3.2)       # 4
+floor(3.8)      # 3
+round(3.14159, 2)  # 3.14
 ```
 
 ### 容器
@@ -96,28 +96,28 @@ round(3.14159, 2)  // 3.14
 | `all` | `all(iterable) -> bool` | 全部为 truthy |
 
 ```ms
-len("hello")          // 5
-len([1,2,3])          // 3
-range(5)              // 0,1,2,3,4
-range(2, 8)           // 2,3,4,5,6,7
-range(0, 10, 2)       // 0,2,4,6,8
+len("hello")          # 5
+len([1,2,3])          # 3
+range(5)              # 0,1,2,3,4
+range(2, 8)           # 2,3,4,5,6,7
+range(0, 10, 2)       # 0,2,4,6,8
 
-sorted([3,1,2])       // [1,2,3]
-reversed([1,2,3])     // [3,2,1]
+sorted([3,1,2])       # [1,2,3]
+reversed([1,2,3])     # [3,2,1]
 
 for i, v in enumerate(["a","b"]) {
-    print(i, v)       // 0 a, 1 b
+    print(i, v)       # 0 a, 1 b
 }
 
 for a, b in zip([1,2], ["x","y"]) {
-    print(a, b)       // 1 x, 2 y
+    print(a, b)       # 1 x, 2 y
 }
 
-map(fn(x) { return x*2 }, [1,2,3])   // [2,4,6]
-filter(fn(x) { return x > 2 }, [1,2,3,4])  // [3,4]
+map(fn(x) { return x*2 }, [1,2,3])   # [2,4,6]
+filter(fn(x) { return x > 2 }, [1,2,3,4])  # [3,4]
 
-any([false, false, true])    // true
-all([true, true, false])     // false
+any([false, false, true])    # true
+all([true, true, false])     # false
 ```
 
 ### 其他
@@ -128,7 +128,6 @@ all([true, true, false])     // false
 | `hash` | `hash(val) -> int` | 哈希值 |
 | `copy` | `copy(val) -> value` | 浅拷贝 |
 | `deepcopy` | `deepcopy(val) -> value` | 深拷贝 |
-| `throw` | `throw(val)` | 抛出异常 |
 | `assert` | `assert(cond, msg?)` | 断言 |
 
 ## 内置方法
@@ -151,13 +150,13 @@ all([true, true, false])     // false
 | `slice(start, end?)` | 切片 |
 
 ```ms
-"Hello World".lower()           // "hello world"
-"  trim  ".strip()              // "trim"
-"a,b,c".split(",")             // ["a", "b", "c"]
-"-".join(["a","b","c"])        // "a-b-c"
-"hello".replace("l", "r")      // "herro"
-"hello".contains("ell")        // true
-"hello".startswith("hel")      // true
+"Hello World".lower()           # "hello world"
+"  trim  ".strip()              # "trim"
+"a,b,c".split(",")             # ["a", "b", "c"]
+"-".join(["a","b","c"])        # "a-b-c"
+"hello".replace("l", "r")      # "herro"
+"hello".contains("ell")        # true
+"hello".startswith("hel")      # true
 ```
 
 ### list 方法
@@ -181,15 +180,15 @@ all([true, true, false])     // false
 
 ```ms
 lst = [3, 1, 4, 1, 5]
-lst.sort()                    // [1, 1, 3, 4, 5]
-lst.push(9)                   // [1, 1, 3, 4, 5, 9]
-lst.pop()                     // 9
-lst.insert(0, 0)              // [0, 1, 1, 3, 4, 5]
-lst.remove(1)                 // [0, 1, 3, 4, 5]
+lst.sort()                    # [1, 1, 3, 4, 5]
+lst.push(9)                   # [1, 1, 3, 4, 5, 9]
+lst.pop()                     # 9
+lst.insert(0, 0)              # [0, 1, 1, 3, 4, 5]
+lst.remove(1)                 # [0, 1, 3, 4, 5]
 
-[1,2,3].map(fn(x) { return x*2 })      // [2,4,6]
-[1,2,3,4].filter(fn(x) { return x>2 }) // [3,4]
-[1,2,3].reduce(fn(a,b) { return a+b }, 0) // 6
+[1,2,3].map(fn(x) { return x*2 })      # [2,4,6]
+[1,2,3,4].filter(fn(x) { return x>2 }) # [3,4]
+[1,2,3].reduce(fn(a,b) { return a+b }, 0) # 6
 ```
 
 ### dict 方法
@@ -208,11 +207,11 @@ lst.remove(1)                 // [0, 1, 3, 4, 5]
 
 ```ms
 d = {"a": 1, "b": 2}
-d.keys()               // ["a", "b"]
-d.values()             // [1, 2]
-d.items()              // [("a", 1), ("b", 2)]
-d.get("c", 0)          // 0（键不存在返回默认值）
-d.merge({"c": 3})      // {"a": 1, "b": 2, "c": 3}
+d.keys()               # ["a", "b"]
+d.values()             # [1, 2]
+d.items()              # [("a", 1), ("b", 2)]
+d.get("c", 0)          # 0（键不存在返回默认值）
+d.merge({"c": 3})      # {"a": 1, "b": 2, "c": 3}
 ```
 
 ### set 方法
@@ -234,24 +233,24 @@ d.merge({"c": 3})      // {"a": 1, "b": 2, "c": 3}
 ```ms
 import io
 
-// 文件操作
-f = io.open("file.txt", "r")    // 打开文件
-content = f.read()              // 读取全部
-lines = f.lines()               // 按行读取
-f.close()                       // 关闭
+# 文件操作
+f = io.open("file.txt", "r")    # 打开文件
+content = f.read()              # 读取全部
+lines = f.lines()               # 按行读取
+f.close()                       # 关闭
 
 f = io.open("file.txt", "w")
-f.write("hello\n")              // 写入
+f.write("hello\n")              # 写入
 f.close()
 
-// 更推荐 with 方式
+# 更推荐 with 方式
 with io.open("file.txt") as f {
     print(f.read())
 }
 
-io.read_file("file.txt")        // 一次性读取
-io.write_file("file.txt", content) // 一次性写入
-io.exists("file.txt")           // 文件是否存在
+io.read_file("file.txt")        # 一次性读取
+io.write_file("file.txt", content) # 一次性写入
+io.exists("file.txt")           # 文件是否存在
 ```
 
 ### math
@@ -259,17 +258,17 @@ io.exists("file.txt")           // 文件是否存在
 ```ms
 import math
 
-math.pi             // 3.141592653589793
-math.e              // 2.718281828459045
-math.sqrt(16)       // 4.0
-math.pow(2, 10)     // 1024.0
-math.sin(math.pi/2) // 1.0
-math.cos(0)         // 1.0
-math.tan(0)         // 0.0
-math.log(100)       // 4.605...
-math.log2(8)        // 3.0
-math.log10(100)     // 2.0
-math.exp(1)         // 2.718...
+math.pi             # 3.141592653589793
+math.e              # 2.718281828459045
+math.sqrt(16)       # 4.0
+math.pow(2, 10)     # 1024.0
+math.sin(math.pi/2) # 1.0
+math.cos(0)         # 1.0
+math.tan(0)         # 0.0
+math.log(100)       # 4.605...
+math.log2(8)        # 3.0
+math.log10(100)     # 2.0
+math.exp(1)         # 2.718...
 ```
 
 ### os
@@ -277,13 +276,13 @@ math.exp(1)         // 2.718...
 ```ms
 import os
 
-os.getenv("PATH")          // 环境变量
-os.setenv("KEY", "val")    // 设置环境变量
-os.getcwd()                // 当前工作目录
-os.chdir("/tmp")           // 改变目录
-os.exec("ls -la")          // 执行命令
-os.exit(0)                 // 退出程序
-os.args                    // 命令行参数列表
+os.getenv("PATH")          # 环境变量
+os.setenv("KEY", "val")    # 设置环境变量
+os.getcwd()                # 当前工作目录
+os.chdir("/tmp")           # 改变目录
+os.exec("ls -la")          # 执行命令
+os.exit(0)                 # 退出程序
+os.args                    # 命令行参数列表
 ```
 
 ### string
@@ -291,11 +290,11 @@ os.args                    // 命令行参数列表
 ```ms
 import string
 
-string.format("{} + {} = {}", 1, 2, 3)   // "1 + 2 = 3"
-string.repeat("ab", 3)                    // "ababab"
-string.reverse("hello")                   // "olleh"
-string.is_alpha("abc")                    // true
-string.is_digit("123")                    // true
+string.format("{} + {} = {}", 1, 2, 3)   # "1 + 2 = 3"
+string.repeat("ab", 3)                    # "ababab"
+string.reverse("hello")                   # "olleh"
+string.is_alpha("abc")                    # true
+string.is_digit("123")                    # true
 ```
 
 ### time
@@ -303,9 +302,9 @@ string.is_digit("123")                    // true
 ```ms
 import time
 
-time.now()               // 当前时间戳（秒）
-time.sleep(1)            // 休眠 1 秒
-time.format(timestamp)   // 格式化时间
+time.now()               # 当前时间戳（秒）
+time.sleep(1)            # 休眠 1 秒
+time.format(timestamp)   # 格式化时间
 ```
 
 ### json
@@ -313,8 +312,8 @@ time.format(timestamp)   // 格式化时间
 ```ms
 import json
 
-data = json.parse('{"name": "Alice"}')   // 解析 JSON
-text = json.stringify(data)              // 序列化为 JSON
+data = json.parse('{"name": "Alice"}')   # 解析 JSON
+text = json.stringify(data)              # 序列化为 JSON
 ```
 
 ### path
@@ -322,10 +321,10 @@ text = json.stringify(data)              // 序列化为 JSON
 ```ms
 import path
 
-path.join("a", "b", "c")     // "a/b/c"
-path.ext("file.txt")         // ".txt"
-path.base("a/b/c.txt")       // "c.txt"
-path.dir("a/b/c.txt")        // "a/b"
+path.join("a", "b", "c")     # "a/b/c"
+path.ext("file.txt")         # ".txt"
+path.base("a/b/c.txt")       # "c.txt"
+path.dir("a/b/c.txt")        # "a/b"
 ```
 
 ### async
@@ -333,6 +332,19 @@ path.dir("a/b/c.txt")        // "a/b"
 ```ms
 import async
 
-async.sleep(1000)            // 异步休眠（毫秒）
-async.timeout(fn, 5000)      // 带超时执行
+async.sleep(1000)            # 异步休眠（毫秒）
+async.timeout(fn, 5000)      # 带超时执行
 ```
+
+### 未文档化的标准库模块
+
+以下模块已列入标准库结构但尚未定义完整 API，将在后续版本中补充：
+
+| 模块 | 说明 |
+|---|---|
+| `regex` | 正则表达式匹配 |
+| `http` | HTTP 客户端/服务端 |
+| `net` | 网络操作（TCP/UDP） |
+| `collections` | 高级数据结构（deque, heap 等） |
+| `fs` | 文件系统操作（目录遍历、文件元数据等） |
+| `test` | 测试框架（assert 辅助、mock 等） |
