@@ -1,0 +1,13 @@
+[package]
+name = "mslang"
+version = "0.1.0"
+edition = "2021"
+description = "mslang scripting language implementation"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+
+[[bin]]
+name = "ms"
+path = "src/main.rs"
