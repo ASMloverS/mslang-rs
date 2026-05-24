@@ -175,7 +175,7 @@ Phase 2.1 - 字节码编译 + VM 核心
 |---|---|---|
 | `ASSERT` | — | 断言 |
 | `IMPORT` | `module_idx(2)` | 导入模块 |
-| `CHANNEL` | `buffer_size(1)` | 创建 channel |
+| `CHANNEL` | `buffer_size(1)` | 创建 channel（0 = 无缓冲） |
 | `SEND` | — | channel 发送 |
 | `RECEIVE` | — | channel 接收 |
 | `GO` | — | 启动协程 |

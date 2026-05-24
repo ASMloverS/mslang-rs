@@ -278,6 +278,8 @@ fn parse_yield_expr(&mut self) -> Result<Expr> {
 
 在 `parse_statement()` 分发中添加：
 
+> **Phase 1 范围**：`async fn` 在本阶段仅做语法识别和 AST 构建。编译器在 AST 节点上标记 `is_async`，但运行时语义（Future 创建、事件循环调度）推迟到 Phase 7（Task 53）实现。Phase 1 编译器遇到 `async fn` 时正常编译函数体字节码，仅在 Function 对象上设置 `is_async = true` 标记。
+
 ```rust
 // async fn ...
 if self.check(&TokenKind::Async) {

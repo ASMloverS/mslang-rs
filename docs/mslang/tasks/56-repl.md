@@ -74,8 +74,13 @@ impl Repl {
 fn is_complete(&self) -> bool {
     let source = &self.buffer;
 
-    // 尝试解析
-    match Parser::parse(source) {
+    // 先词法分析，再语法分析（Parser 接收 Vec<Token>，非原始字符串）
+    let tokens = match Lexer::new(source).tokenize_all() {
+        Ok(tokens) => tokens,
+        Err(_) => return true,
+    };
+
+    match Parser::new(tokens).parse() {
         Ok(_) => true,
         Err(e) if e.is_unexpected_eof() => false,  // 不完整，继续读
         Err(_) => true,  // 其他语法错误，交给执行阶段报告

@@ -123,6 +123,12 @@ pub struct HashSetWrapper {
 }
 ```
 
+> **`Hash` + `Eq` 约束**：`HashSet<Object>` 和 `HashMap<Object, Object>` 要求 `Object` 实现 `Hash` 和 `Eq`。
+> Task 20 已为基础类型实现 `Hash`，本任务需扩展至 `Tuple`（当所有元素可哈希时可哈希），
+> 并确保 `List`/`Dict`/`Set` 在 `hash()` 时 panic（运行时 TypeError）。
+> `Eq`（`PartialEq`）需扩展至集合类型的逐元素比较。
+> 对于包含 `Gc<T>` 的变体，`Hash` 实现需解引用 `Gc` 后对内部数据计算哈希。
+
 ### Display 扩展
 
 ```rust
@@ -260,7 +266,17 @@ impl Object {
 }
 ```
 
-### Set 操作
+### Tuple 构造辅助
+
+```rust
+impl Object {
+    pub fn make_tuple(elements: Vec<Object>) -> Object {
+        Object::Tuple(Gc::new(elements))
+    }
+}
+```
+
+`items()` 等方法使用 `Object::make_tuple(vec![key, value])` 构造二元组。
 
 ```rust
 impl Object {

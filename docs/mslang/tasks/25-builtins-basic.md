@@ -50,6 +50,32 @@ Phase 2.5a - 字节码编译 + VM 核心
 | `max` | `max(*args) -> number` | 最大值 |
 | `min` | `min(*args) -> number` | 最小值 |
 | `sum` | `sum(iterable) -> number` | 求和 |
+| `ceil` | `ceil(n) -> int` | 向上取整 |
+| `floor` | `floor(n) -> int` | 向下取整 |
+| `round` | `round(n, digits?) -> number` | 四舍五入 |
+
+### 类型检查函数
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `isinstance` | `isinstance(val, type) -> bool` | 检查是否为指定类型 |
+
+`isinstance` 第二参数为类型对象（如 `int`、`string`、`list`）。类型对象是内置全局常量，VM 初始化时注册。用法：`isinstance(42, int)` → `true`。
+
+VM 需在 `register_builtins` 中注册以下类型对象到全局变量表：
+
+```rust
+// 类型对象注册
+self.globals.insert("int".to_string(), Object::Type(TypeObj::Int));
+self.globals.insert("float".to_string(), Object::Type(TypeObj::Float));
+self.globals.insert("bool".to_string(), Object::Type(TypeObj::Bool));
+self.globals.insert("string".to_string(), Object::Type(TypeObj::String));
+self.globals.insert("nil".to_string(), Object::Type(TypeObj::Nil));
+self.globals.insert("list".to_string(), Object::Type(TypeObj::List));
+self.globals.insert("dict".to_string(), Object::Type(TypeObj::Dict));
+self.globals.insert("tuple".to_string(), Object::Type(TypeObj::Tuple));
+self.globals.insert("set".to_string(), Object::Type(TypeObj::Set));
+```
 
 ### 断言
 
@@ -93,6 +119,10 @@ impl VM {
             ("max", usize::MAX, builtin_max),
             ("min", usize::MAX, builtin_min),
             ("sum", 1, builtin_sum),
+            ("ceil", 1, builtin_ceil),
+            ("floor", 1, builtin_floor),
+            ("round", usize::MAX, builtin_round),
+            ("isinstance", 2, builtin_isinstance),
             ("assert", usize::MAX, builtin_assert),
         ];
 
@@ -244,6 +274,54 @@ fn builtin_assert(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     }
     Ok(Object::Nil)
 }
+
+fn builtin_ceil(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("ceil() requires 1 argument")?;
+    match arg {
+        Object::Int(_) => Ok(arg.clone()),
+        Object::Float(n) => Ok(Object::Int(n.ceil() as i64)),
+        _ => Err(format!("TypeError: bad operand type for ceil(): '{}'", arg.type_name())),
+    }
+}
+
+fn builtin_floor(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("floor() requires 1 argument")?;
+    match arg {
+        Object::Int(_) => Ok(arg.clone()),
+        Object::Float(n) => Ok(Object::Int(n.floor() as i64)),
+        _ => Err(format!("TypeError: bad operand type for floor(): '{}'", arg.type_name())),
+    }
+}
+
+fn builtin_round(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("round() requires at least 1 argument")?;
+    let digits = if args.len() > 1 {
+        match &args[1] {
+            Object::Int(d) => *d as i32,
+            _ => return Err("round(): digits must be int".to_string()),
+        }
+    } else {
+        0
+    };
+    match arg {
+        Object::Int(_) => Ok(arg.clone()),
+        Object::Float(n) => {
+            let factor = 10f64.powi(digits);
+            Ok(Object::Float((n * factor).round() / factor))
+        }
+        _ => Err(format!("TypeError: bad operand type for round(): '{}'", arg.type_name())),
+    }
+}
+
+fn builtin_isinstance(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let val = args.get(0).ok_or("isinstance() requires 2 arguments")?;
+    let type_obj = args.get(1).ok_or("isinstance() requires 2 arguments")?;
+    let expected_type = match type_obj {
+        Object::Type(t) => t.type_name(),
+        _ => return Err("isinstance(): second argument must be a type".to_string()),
+    };
+    Ok(Object::Bool(val.type_name() == expected_type))
+}
 ```
 
 ### Object 枚举扩展
@@ -293,6 +371,11 @@ OpCode::Call => {
 10. `float("3.14")` 返回 `3.14`
 11. `str(42)` 返回 `"42"`
 12. `bool(0)` 返回 `false`
+13. `ceil(3.7)` 返回 `4`
+14. `floor(3.7)` 返回 `3`
+15. `round(3.5)` 返回 `4.0`
+16. `isinstance(42, int)` 返回 `true`
+17. `isinstance("hi", int)` 返回 `false`
 
 ## 测试用例
 
@@ -311,6 +394,11 @@ print(int("42"))
 print(float("3.14"))
 print(str(42))
 print(bool(0))
+print(ceil(3.7))
+print(floor(3.7))
+print(round(3.5))
+print(isinstance(42, int))
+print(isinstance("hi", int))
 ```
 
 预期输出：
@@ -327,5 +415,10 @@ string
 42
 3.14
 42
+false
+4
+3
+4.0
+true
 false
 ```

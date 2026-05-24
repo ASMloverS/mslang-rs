@@ -4,7 +4,7 @@
 Phase 4.2b - 控制流 + 高级语法
 
 ## 前置任务
-33-list-comprehension
+33-list-comprehension, 22-object-system-collections
 
 ## 目标
 实现字典推导式 `{key: val for x in iter}` 和集合推导式 `{expr for x in iter}`，包括可选过滤条件。

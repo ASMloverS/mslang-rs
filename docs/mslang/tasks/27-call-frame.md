@@ -112,6 +112,7 @@ fn_def = "fn" IDENTIFIER "(" param_list? ")" block
 ```rust
 use crate::vm::object::{Object, Gc};
 
+#[derive(Clone)]
 pub struct CallFrame {
     pub function: Gc<Function>,
     pub ip: usize,
@@ -128,6 +129,10 @@ impl CallFrame {
             defer_stack_base: 0,
         }
     }
+
+    pub fn snapshot(&self) -> CallFrame {
+        self.clone()
+    }
 }
 ```
 
@@ -140,6 +145,7 @@ pub struct Function {
     pub code: Vec<u8>,
     pub constants: Vec<Object>,
     pub upvalue_count: usize,
+    pub source_file: Option<String>,
 }
 
 impl Function {
@@ -150,6 +156,7 @@ impl Function {
             code: Vec::new(),
             constants: Vec::new(),
             upvalue_count: 0,
+            source_file: None,
         }
     }
 }
@@ -188,6 +195,7 @@ fn compile_fn_decl(&mut self, node: &FnDecl) {
         code: func_unit.code,
         constants: func_unit.constants,
         upvalue_count: 0,
+        source_file: self.source_file.clone(),
     }));
     let idx = self.add_constant(function);
 
@@ -298,6 +306,7 @@ impl VM {
 7. 函数无显式 return 时返回 nil
 8. 递归调用正确工作
 9. `print` 等内置函数仍正常工作（通过 BuiltinFunc 分支）
+10. CallFrame 可被 clone 用于帧快照（Phase 4 生成器和 Phase 7 async/await 依赖此能力）
 
 ## 测试用例
 

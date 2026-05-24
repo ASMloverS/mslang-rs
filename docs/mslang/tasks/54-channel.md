@@ -87,6 +87,7 @@ struct Channel {
 ```rust
 OpCode::CHANNEL => {
     let buffer_size = self.read_byte() as usize;
+    // buffer_size == 0 → 无缓冲 channel（发送方和接收方同步）
     let channel = Channel::new(buffer_size);
     self.stack.push(Object::Channel(Gc::new(channel)));
 }

@@ -97,6 +97,8 @@ pub struct Upvalue {
 ```rust
 pub struct Compiler<'a> {
     unit: CompilationUnit<'a>,
+    source_file: Option<String>,
+    source_lines: Vec<String>,
 }
 
 impl<'a> Compiler<'a> {
@@ -112,7 +114,14 @@ impl<'a> Compiler<'a> {
             scope_depth: 0,
             parent: None,
         };
-        Compiler { unit }
+        Compiler { unit, source_file: None, source_lines: Vec::new() }
+    }
+
+    pub fn with_source(source: &str, file: Option<String>) -> Self {
+        let mut compiler = Self::new();
+        compiler.source_file = file;
+        compiler.source_lines = source.lines().map(|l| l.to_string()).collect();
+        compiler
     }
 }
 ```
@@ -223,12 +232,39 @@ impl Compiler<'_> {
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, String> {
         for stmt in &program.statements {
             self.compile_statement(stmt)?;
+
+            // 记录顶层导出名（供模块系统使用）
+            if self.unit.scope_depth == 0 {
+                match stmt {
+                    Stmt::FnDecl { name, .. } | Stmt::ClassDecl { name, .. } => {
+                        self.exports.push(name.clone());
+                    }
+                    Stmt::VarDecl { name, .. } => {} // var 声明私有，不导出
+                    Stmt::ConstDecl { name, .. } => {
+                        self.exports.push(name.clone());
+                    }
+                    _ => {}
+                }
+            }
         }
         self.emit_byte(OpCode::Halt as u8, 0);
         Ok(std::mem::replace(&mut self.unit.chunk, Chunk::new()))
     }
 }
 ```
+
+### 导出列表
+
+```rust
+pub struct Compiler<'a> {
+    unit: CompilationUnit<'a>,
+    source_file: Option<String>,
+    source_lines: Vec<String>,
+    exports: Vec<String>,
+}
+```
+
+`exports` 记录顶层 fn/class/const 声明的名称。模块系统（Task 45）通过此列表过滤导出内容。
 
 ## 验证标准
 

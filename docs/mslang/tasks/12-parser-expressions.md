@@ -182,6 +182,10 @@ fn parse_not(&mut self) -> Result<Expr> {
 }
 ```
 
+### `is` / `in` 双角色说明
+
+`TokenKind::Is` 和 `TokenKind::In` 既是关键字 token，又是比较运算符。词法分析器始终返回关键字形式的 token，表达式解析器在 `parse_comparison()` 中将其作为二元比较运算符处理。这与 Python 的处理方式一致。
+
 ### parse_comparison() — 优先级 6（支持链式比较）
 
 ```rust
@@ -453,6 +457,10 @@ fn parse_postfix(&mut self) -> Result<Expr> {
 ```
 
 ### parse_primary() — 初等表达式
+
+> **注意**：`yield` 和 `await` 作为一元前缀表达式，其优先级与后缀表达式同级（优先级 15）。
+> `yield expr` 在 `parse_yield_expr()` 中处理，`await expr` 在 `parse_primary()` 中处理。
+> `await` 的操作数调用 `parse_power()` 而非 `parse_postfix()`，确保 `await x.y()` 解析为 `await (x.y())` 而非 `(await x).y()`。
 
 ```rust
 fn parse_primary(&mut self) -> Result<Expr> {

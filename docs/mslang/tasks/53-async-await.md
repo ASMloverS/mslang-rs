@@ -55,9 +55,10 @@ struct Coroutine {
 struct PausedCoroutine {
     coroutine: Coroutine,
     waiting_on: Gc<Future>,
-    frame: CallFrame,
 }
 ```
+
+> `PausedCoroutine` 不单独存储 `frame` 字段——`Coroutine` 已包含 `frame`，无需重复。
 
 ### 顶层 await
 
@@ -152,7 +153,6 @@ OpCode::AWAIT => {
                     defer_stack: self.defer_stack.clone(),
                 },
                 waiting_on: future.clone(),
-                frame: frame_snapshot,
             };
             self.event_loop.paused.push(paused);
 

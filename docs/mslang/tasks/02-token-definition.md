@@ -44,7 +44,9 @@ pub enum TokenKind {
     EqualEqual, BangEqual, Less, Greater, LessEqual, GreaterEqual,
     // 位运算符 (& | ^ << >> ~)
     Ampersand, Pipe, Caret, LeftShift, RightShift, Tilde,
-    // 成员运算符 (in is) — 已在关键字中定义 In/Is
+    // 成员运算符 (in is) — In/Is 既作为关键字 token，也在表达式解析中作为比较运算符使用
+    // 词法分析器统一返回 TokenKind::In / TokenKind::Is（关键字身份）
+    // 表达式解析器在 parse_comparison() 中将其视为比较运算符（双重角色）
     // 赋值运算符 (= += -= *= /= //= %= **= &= |= ^= <<= >>=)
     Equal, PlusEqual, MinusEqual, StarEqual, SlashEqual,
     DoubleSlashEqual, PercentEqual, DoubleStarEqual,
