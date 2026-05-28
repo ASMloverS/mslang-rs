@@ -131,3 +131,5 @@ for msg in main_thinking(names) {
 | [10-builtins](10-builtins.md) | 内置函数与标准库 |
 | [11-bytecode-vm](11-bytecode-vm.md) | 字节码与虚拟机设计 |
 | [12-implementation-plan](12-implementation-plan.md) | 分阶段实现计划 |
+| [13-capi](13-capi.md) | C API 设计 — 嵌入与扩展 |
+| [14-gc](14-gc.md) | 垃圾回收系统 — 并发三色标记 + 分代回收 |

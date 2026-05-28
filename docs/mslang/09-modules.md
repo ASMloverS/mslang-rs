@@ -230,6 +230,7 @@ stdlib/
 ├── fs.ms            # 文件系统操作
 ├── async.ms         # 异步工具
 ├── path.ms          # 路径操作
+├── gc.ms            # GC 控制与调优
 └── test.ms          # 测试框架
 ```
 

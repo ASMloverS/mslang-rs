@@ -336,6 +336,48 @@ async.sleep(1000)            # 异步休眠（毫秒）
 async.timeout(fn, 5000)      # 带超时执行
 ```
 
+### gc
+
+```ms
+import gc
+
+gc.collect()                    # 触发 Full GC（Major + Minor）
+gc.collect_minor()              # 仅触发 Minor GC
+gc.enable()                     # 启用自动 GC
+gc.disable()                    # 禁用自动 GC
+gc.is_enabled()                 # 返回 bool
+
+gc.set_threshold("major", 2.0)  # Old GC 触发比率（allocated > live * ratio 时触发）
+gc.set_threshold("minor", 4)    # Young 代大小（MB）
+gc.set_promotion_age(3)         # Young→Old 晋升年龄
+gc.set_gc_threads(4)            # GC Worker 线程数
+
+gc.stats()                      # 返回统计信息 dict
+gc.count()                      # GC 总次数（minor + major）
+gc.mem_alloc()                  # 当前堆分配字节数
+gc.mem_live()                   # 当前存活字节数
+```
+
+`gc.stats()` 返回的 dict：
+
+```ms
+{
+    "minor_count": 42,
+    "major_count": 3,
+    "total_pause_ns": 1520000,
+    "last_pause_ns": 23000,
+    "young_size": 4194304,
+    "old_size": 1048576,
+    "los_size": 0,
+    "bytes_freed": 8388608,
+    "promotion_age": 2,
+    "gc_threads": 8,
+    "gc_enabled": true,
+}
+```
+
+GC 系统设计详见 [14-gc](14-gc.md)。
+
 ### 未文档化的标准库模块
 
 以下模块已列入标准库结构但尚未定义完整 API，将在后续版本中补充：

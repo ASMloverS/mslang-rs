@@ -215,7 +215,7 @@ Upvalue {
 
 ## 对象系统
 
-所有运行时值统一表示为 `Object`：
+所有运行时值统一表示为 `Object`。基本类型（Nil、Bool、Int、Float）直接内联存储，无需堆分配。引用类型通过 `MsObjHeader*` 指向堆上带统一对象头的分配块，由 GC 管理：
 
 ```rust
 enum Object {
@@ -223,32 +223,36 @@ enum Object {
     Bool(bool),
     Int(i64),
     Float(f64),
-    String(Gc<String>),
-    List(Gc<Vec<Object>>),
-    Dict(Gc<DictMap>),
-    Tuple(Gc<Vec<Object>>),
-    Set(Gc<HashSet<Object>>),
-    Function(Gc<Function>),
-    Closure(Gc<Closure>),
-    Class(Gc<Class>),
-    Instance(Gc<Instance>),
-    Module(Gc<Module>),
-    Iterator(Gc<Iterator>),
-    Generator(Gc<Generator>),
-    Future(Gc<Future>),
-    Channel(Gc<Channel>),
-    BoundMethod(Gc<BoundMethod>),
+    Ref(*mut MsObjHeader),   // 引用类型：String/List/Dict/...
 }
 ```
+
+`MsObjHeader` 统一对象头（16 bytes）：
+
+```
+字节:   0         1         2-3       4-7        8-15
+     ┌─────────┬─────────┬────────┬─────────┬──────────┐
+     │ gc_meta │type_tag │  size  │ padding │class_ptr │
+     │ 1 byte  │ 1 byte  │ 2 byte │ 2 byte  │ 8 byte   │
+     └─────────┴─────────┴────────┴─────────┴──────────┘
+```
+
+- `gc_meta`: GC 元数据（三色标记、代数、finalizer、pin 标志）
+- `type_tag`: 类型标签（快速判断类型）
+- `size`: 对象大小（字节，含头部）
+- `class_ptr`: 指向 Class 元数据或类型描述表
+
+详见 [14-gc](14-gc.md#对象内存布局)。
 
 ### Function
 
 ```
 Function {
+    header: MsObjHeader
     name: String
     arity: usize              // 必需参数数量
     code: Vec<u8>             // 字节码
-    constants: Vec<Value>     // 常量池
+    constants: Vec<Value>     // 常量池（内联值或 Ref 指针）
     upvalue_count: usize
 }
 ```
@@ -257,8 +261,9 @@ Function {
 
 ```
 Closure {
-    function: Gc<Function>
-    upvalues: Vec<Gc<Upvalue>>
+    header: MsObjHeader
+    function: *mut MsObjHeader       // 指向 Function
+    upvalues: Vec<*mut MsObjHeader>  // 指向 Upvalue
 }
 ```
 
@@ -266,9 +271,10 @@ Closure {
 
 ```
 Class {
+    header: MsObjHeader
     name: String
-    methods: HashMap<String, Gc<Closure>>
-    parent: Option<Gc<Class>>
+    methods: HashMap<String, *mut MsObjHeader>  // 指向 Closure
+    parent: Option<*mut MsObjHeader>             // 指向父 Class
 }
 ```
 
@@ -276,8 +282,9 @@ Class {
 
 ```
 Instance {
-    class: Gc<Class>
-    fields: HashMap<String, Object>
+    header: MsObjHeader
+    class: *mut MsObjHeader                        // 指向 Class
+    fields: HashMap<String, Object>                // 值可为内联或 Ref
 }
 ```
 
@@ -287,14 +294,18 @@ Instance {
 
 ```rust
 struct VM {
-    stack: Vec<Object>,                 // 值栈
+    stack: Vec<Object>,                 // 值栈（内联值 + Ref 指针）
     stack_base: usize,                  // 当前帧的栈基址
     call_stack: Vec<CallFrame>,         // 调用栈
     globals: HashMap<String, Object>,   // 全局变量
     defer_stack: Vec<DeferEntry>,       // defer 栈
-    open_upvalues: Vec<Gc<Upvalue>>,    // 开放的上值
+    open_upvalues: Vec<*mut MsObjHeader>, // 开放的上值
     event_loop: EventLoop,              // 事件循环（并发用）
-    gc: GarbageCollector,               // GC
+    heap: MsHeap,                       // 堆（含 Young/Old/Large Object Space）
+    gc_config: GcConfig,                // GC 配置
+    gc_phase: AtomicU8,                 // GC 状态机当前阶段
+    safepoint_requested: AtomicBool,    // 安全点请求标志
+    c_roots: HashSet<*mut MsObjHeader>, // C 侧注册的 GC 根
 }
 ```
 
@@ -328,41 +339,38 @@ fn run(&mut self) {
 
 ## 垃圾回收
 
-### 策略：引用计数 + 标记-清除
+mslang GC 系统采用**并发三色标记清扫 + 分代回收**策略，详见 [14-gc](14-gc.md)。
 
-#### 引用计数
+### 核心特性
 
-- 每个 `Gc<T>` 包含引用计数
-- `Gc::clone()` 增加计数
-- `Gc::drop()` 减少计数
-- 计数归零时立即释放
+| 特性 | 说明 |
+|---|---|
+| 算法 | 并发三色标记清扫 |
+| 分代 | 3 代（Young / Old / Immortal），动态阈值 |
+| 写屏障 | 混合写屏障（Go 1.8+ 风格） |
+| 分配 | per-协程 TLAB + Bump 分配 |
+| 安全点 | 字节码安全点 |
+| GC 线程 | 可配置（默认 CPU 核心数） |
 
-#### 标记-清除 GC
+### Minor GC（Young 代）
 
-- 引用计数无法处理循环引用
-- 定期运行标记-清除 GC 清理循环引用
-- 触发条件：分配次数超过阈值
+- 半空间复制（Cheney 算法）
+- 触发：Young From-Space 分配失败
+- STW 时间：与 Young 存活对象数量成正比
 
-#### 标记-清除流程
+### Major GC（Old 代）
 
-1. **标记阶段**：从根集（栈、全局变量、调用栈、开放上值）出发，递归标记所有可达对象
-2. **清除阶段**：遍历所有已分配对象，释放未标记的对象
-3. **重置**：清除所有对象的标记
-
-```rust
-struct GarbageCollector {
-    objects: Vec<GcBox>,           // 所有分配的对象
-    bytes_allocated: usize,
-    next_gc: usize,                // 下次 GC 触发阈值
-    gray_stack: Vec<GcBox>,       // 灰色对象栈（用于标记）
-}
-```
+- 并发三色标记清扫
+- 阶段：Init(STW) → Concurrent Mark → Mark Termination(STW) → Concurrent Sweep → Finalize
+- STW 时间：仅扫描根集和重扫栈，通常 < 1ms
 
 ### 写屏障
 
-当将一个对象引用写入另一个对象时（如 `list[i] = obj`），可能需要写屏障以确保 GC 正确性。
+并发标记期间，所有堆引用写入（`SET_ATTR`、`SET_INDEX`、`STORE_UPVALUE` 等）触发混合写屏障。栈变量修改不需要写屏障。
 
-MVP 阶段使用简单的 stop-the-world GC，写屏障暂不需要。
+### 详细设计
+
+完整设计文档见 [14-gc](14-gc.md)。
 
 ## 调试信息
 
@@ -445,13 +453,14 @@ EventLoop {
 
 PausedCoroutine {
     coroutine: Coroutine
-    waiting_on: Gc<Future>           # 等待的 Future
+    waiting_on: *mut MsObjHeader     # 指向 Future 对象
     frame: CallFrame                 # 暂停时的执行帧快照
 }
 
 Coroutine {
     frame: CallFrame                 # 当前执行帧
     defer_stack: Vec<DeferEntry>     # 协程自己的 defer 栈
+    tlab: TLAB                       # 协程私有分配缓冲区
 }
 ```
 

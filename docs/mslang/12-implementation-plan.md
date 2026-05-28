@@ -5,6 +5,16 @@
 ```
 mslang-rs/
 ├── Cargo.toml
+├── include/
+│   └── mslang/
+│       ├── mslang.h              # umbrella 头文件
+│       ├── types.h               # 核心类型定义
+│       ├── vm.h                  # VM 生命周期
+│       ├── value.h               # 值操作
+│       ├── call.h                # 函数调用
+│       ├── error.h               # 异常处理
+│       ├── module.h              # C 扩展模块
+│       └── class.h               # Class 操作
 ├── src/
 │   ├── main.rs                 # CLI 入口
 │   ├── lib.rs                  # 库入口
@@ -22,12 +32,31 @@ mslang-rs/
 │   │   ├── mod.rs
 │   │   └── opcode.rs           # 字节码定义
 │   ├── vm/
-│   │   ├── mod.rs              # VM 主循环
-│   │   ├── object.rs           # Object 系统
+│   │   ├── mod.rs              # VM 主循环（含安全点）
+│   │   ├── object.rs           # Object 系统 + MsObjHeader
 │   │   ├── frame.rs            # 调用帧
-│   │   ├── gc.rs               # GC
 │   │   ├── builtins.rs         # 内置函数
 │   │   └── stdlib.rs           # 内置类型方法
+│   ├── gc/
+│   │   ├── mod.rs              # GC 公共接口
+│   │   ├── heap.rs             # 堆管理（Young/Old/LOS）
+│   │   ├── tlab.rs             # TLAB 分配
+│   │   ├── minor.rs            # Minor GC（半空间复制）
+│   │   ├── major.rs            # Major GC（并发三色标记清扫）
+│   │   ├── barrier.rs          # 混合写屏障
+│   │   ├── safepoint.rs        # 安全点机制
+│   │   ├── remembered.rs       # Remembered Set (Card Table)
+│   │   ├── finalize.rs         # Finalizer 队列
+│   │   └── stats.rs            # GC 统计与调优
+│   ├── capi/
+│   │   ├── mod.rs              # C API 入口
+│   │   ├── vm.rs               # ms_vm_* 实现
+│   │   ├── value.rs            # ms_int/ms_string 等实现
+│   │   ├── call.rs             # ms_call/ms_await 等实现
+│   │   ├── error.rs            # ms_throw/ms_err_* 实现
+│   │   ├── module.rs           # ms_register_module 等实现
+│   │   ├── class.rs            # ms_class_* 实现
+│   │   └── gc.rs               # ms_root/ms_gc_* 实现
 │   ├── module/
 │   │   ├── mod.rs
 │   │   └── resolver.rs         # 模块解析
@@ -44,12 +73,15 @@ mslang-rs/
 │   ├── time.ms
 │   ├── json.ms
 │   ├── path.ms
+│   ├── gc.ms
 │   └── async.ms
 └── tests/
     ├── lexer_tests.rs
     ├── parser_tests.rs
     ├── compiler_tests.rs
     ├── vm_tests.rs
+    ├── gc_tests.rs
+    ├── capi_tests.rs
     └── integration/
         ├── basic.ms
         ├── functions.ms
@@ -154,7 +186,9 @@ mslang-rs/
 
 ### 2.3 Object 系统
 
-- [ ] `Object` 枚举定义
+- [ ] `Object` 枚举定义（内联值 + Ref 指针）
+- [ ] `MsObjHeader` 统一对象头（gc_meta、type_tag、size、class_ptr）
+- [ ] TypeDescriptor 类型描述表（trace、finalize 函数指针）
 - [ ] 基本类型：Nil, Bool, Int, Float, String
 - [ ] 集合类型：List, Dict, Tuple, Set
 - [ ] 类型转换方法
@@ -164,8 +198,8 @@ mslang-rs/
 
 ### 2.4 虚拟机核心
 
-- [ ] VM 框架（栈、全局变量表）
-- [ ] 指令执行循环
+- [ ] VM 框架（栈、全局变量表、堆）
+- [ ] 指令执行循环（含安全点检查）
 - [ ] 常量加载指令
 - [ ] 算术运算指令
 - [ ] 比较运算指令
@@ -200,6 +234,49 @@ while i < 5 {
 - [ ] abs / max / min / sum
 
 **验证**：内置函数正确调用
+
+---
+
+## Phase 2.5: GC 基础（Young 代 + TLAB）
+
+**目标**：可用的分代 GC，支持 Young 代回收
+
+> GC 系统完整设计见 [14-gc](14-gc.md)。
+
+### 2.5.1 堆与分配
+
+- [ ] MsHeap 结构（Young From/To-Space、Old 代、Large Object Space）
+- [ ] TLAB 结构与 per-协程分配
+- [ ] Bump 分配实现
+- [ ] 大对象分配（mmap）
+
+**验证**：大量对象分配不崩溃，TLAB 用完后自动 refill
+
+### 2.5.2 Young 代 GC（Minor GC）
+
+- [ ] 半空间复制（Cheney 算法）
+- [ ] 根集扫描（协程栈、全局变量）
+- [ ] 对象年龄计数与晋升到 Old
+- [ ] 安全点机制（safepoint_requested 原子变量）
+- [ ] TLAB 重置
+
+**验证**：Young 代对象正确回收，存活对象晋升
+
+### 2.5.3 Old 代 GC（简化版 Major GC）
+
+- [ ] STW 标记清扫（Phase 2.5 简化版，非并发）
+- [ ] Free-list 管理
+- [ ] Finalizer 队列（`__del__` 延迟执行）
+
+**验证**：Old 代不可达对象被回收，循环引用正确处理
+
+### 2.5.4 GC 调优基础
+
+- [ ] GcConfig 配置结构
+- [ ] 堆增长率触发
+- [ ] 手动 gc.collect() / gc.stats()
+
+**验证**：gc 模块可调用
 
 ---
 
@@ -436,6 +513,67 @@ while i < 5 {
 
 ---
 
+## Phase 7.5: 并发 GC 优化
+
+**目标**：将 Phase 2.5 的 STW GC 升级为并发三色标记清扫
+
+> GC 系统完整设计见 [14-gc](14-gc.md)。
+
+### 7.5.1 混合写屏障
+
+- [ ] 写屏障函数实现
+- [ ] 在 SET_ATTR、SET_INDEX、STORE_UPVALUE 等字节码中插入写屏障
+- [ ] 灰色队列（多生产者并发安全）
+
+**验证**：并发标记期间三色不变性不被破坏
+
+### 7.5.2 并发标记
+
+- [ ] GC Coordinator 线程
+- [ ] GC Worker 线程池（可配置数量）
+- [ ] Init 阶段（STW 扫描根集）
+- [ ] Concurrent Mark 阶段
+- [ ] Mark Termination 阶段（STW 重扫栈）
+- [ ] GC 状态机
+
+**验证**：并发标记正确，无对象漏标/误回收
+
+### 7.5.3 并发清扫
+
+- [ ] Concurrent Sweep 阶段
+- [ ] Sweep 期间新分配对象标黑
+- [ ] Old 代 free-list 并发安全
+
+**验证**：并发清扫期间 mutator 正常运行
+
+### 7.5.4 Remembered Set
+
+- [ ] Card Table 实现
+- [ ] Old→Young 写入时标记 dirty card
+- [ ] Minor GC 时扫描 dirty cards
+
+**验证**：跨代引用不导致 Young 代对象丢失
+
+### 7.5.5 C API GC 交互
+
+- [ ] ms_root / ms_unroot 实现
+- [ ] ms_write_barrier 实现
+- [ ] C finalizer 注册与延迟执行
+- [ ] GC 控制 API（ms_gc_collect 等）
+
+**验证**：C 扩展模块与 GC 正确协作
+
+### 7.5.6 动态阈值与自适应
+
+- [ ] Young 代大小自适应
+- [ ] 晋升年龄自适应
+- [ ] GC 线程数自适应
+- [ ] 完整 gc 调优 API
+
+**验证**：长时间运行脚本 GC 开销 < 10%
+
+---
+
 ## Phase 8: REPL + 工具链
 
 **目标**：完善开发体验
@@ -476,11 +614,16 @@ while i < 5 {
 |---|---|---|
 | Phase 1 | Lexer + Parser | 基础 |
 | Phase 2 | Compiler + VM 核心 | 核心 |
+| Phase 2.5 | GC 基础（Young 代 + TLAB） | 核心 |
 | Phase 3 | 函数 + 闭包 | 核心 |
 | Phase 4 | 控制流 + 高级语法 | 扩展 |
 | Phase 5 | Class + OOP | 扩展 |
 | Phase 6 | 模块 + 标准库 | 扩展 |
 | Phase 7 | 并发 | 高级 |
+| Phase 7.5 | 并发 GC 优化 | 高级 |
 | Phase 8 | REPL + 工具链 | 完善 |
 
-**MVP = Phase 1 + 2 + 3**：能执行包含函数和闭包的脚本。
+**MVP = Phase 1 + 2 + 2.5 + 3**：能执行包含函数和闭包的脚本，带基础分代 GC。
+
+GC 详细设计见 [14-gc](14-gc.md)。
+C API 详细设计见 [13-capi](13-capi.md)。
