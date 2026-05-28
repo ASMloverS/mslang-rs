@@ -145,6 +145,7 @@ fn(x) {
 fn make_counter() {
     count = 0
     return fn() {
+        nonlocal count
         count += 1
         return count
     }
@@ -161,12 +162,16 @@ counter()   # 3
 - 内层函数捕获外层变量的**引用**（不是值）
 - 多个闭包可以共享同一个外层变量
 - 外层函数返回后，被捕获的变量仍然存活（由 GC 管理）
+- 闭包内修改外层变量必须使用 `nonlocal` 声明（否则 `=` 赋值会在闭包内创建新的局部变量）
 
 ```ms
 fn make_pair() {
     x = 10
     getter = fn() { return x }
-    setter = fn(v) { x = v }
+    setter = fn(v) {
+        nonlocal x
+        x = v
+    }
     return getter, setter
 }
 

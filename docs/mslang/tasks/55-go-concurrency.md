@@ -76,6 +76,7 @@ OpCode::GO => {
     let coroutine = Coroutine {
         frame,
         defer_stack: Vec::new(),
+        tlab: TLAB::new(),
     };
 
     // 注册到事件循环就绪队列
@@ -167,6 +168,7 @@ impl EventLoop {
 struct Coroutine {
     frame: CallFrame,
     defer_stack: Vec<DeferEntry>,
+    tlab: TLAB,
 }
 ```
 

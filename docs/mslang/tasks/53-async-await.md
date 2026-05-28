@@ -46,6 +46,7 @@ struct EventLoop {
 struct Coroutine {
     frame: CallFrame,
     defer_stack: Vec<DeferEntry>,
+    tlab: TLAB,
 }
 ```
 

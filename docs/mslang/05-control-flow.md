@@ -206,6 +206,8 @@ try {
 3. 无论是否发生异常，`finally` 块总是执行
 4. `finally` 块中的异常会覆盖之前的异常
 
+5. `dict[key]` 访问不存在的键返回 `nil`（不抛 KeyError）；`dict.remove(key)` 删除不存在的键抛 KeyError
+
 ### 异常对象
 
 异常对象是特殊的 class 实例，包含以下属性：
@@ -234,6 +236,26 @@ Error                      # 所有异常的基类
 └── StopIteration          # 迭代结束
 ```
 
+### 自定义异常类
+
+用户可通过继承内置异常类创建自定义异常：
+
+```ms
+class MyError < ValueError {
+    fn __init__(self, message, code) {
+        super.__init__(message)
+        self.code = code
+    }
+}
+
+throw MyError("something went wrong", 42)
+```
+
+自定义异常类：
+- 必须继承自 `Error` 或其子类
+- 可在 `except` 中按类型匹配
+- 异常对象的 `message`、`type`、`traceback` 属性自动可用
+
 ### 抛出异常
 
 ```ms
@@ -247,10 +269,10 @@ fn assert_positive(n) {
 `throw` 关键字用于抛出异常：
 
 ```
-throw_stmt = "throw" expression
+throw_stmt = "throw" expression?
 ```
 
-表达式应为 Error 实例或子类实例。
+`throw` 后跟表达式时，表达式应为 Error 实例或子类实例。裸 `throw`（无表达式）用于 re-throw：在 `except` 块内重新抛出当前捕获的异常。在 `except` 块外使用裸 `throw` 抛出 `RuntimeError`。
 
 ### 异常传播
 

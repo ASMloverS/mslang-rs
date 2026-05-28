@@ -76,6 +76,8 @@ d = 0o755
 7 // 2 == 3
 ```
 
+**溢出行为**：int 为 64 位有符号整数（i64），溢出时抛出 `OverflowError`。算术运算结果超出 i64 范围时触发。
+
 ### Float
 
 ```
@@ -90,6 +92,11 @@ speed = 1.5e8
 ```
 
 **注意**：int 和 float 混合运算结果为 float。
+
+**特殊浮点值**：
+- `NaN`：`0.0 / 0.0` 产生 NaN。NaN 不等于任何值（包括自身）：`NaN == NaN` 为 `false`。使用 `x != x` 检测 NaN。
+- `Infinity`：`1.0 / 0.0` 产生正无穷，`-1.0 / 0.0` 产生负无穷。
+- `-0.0`：负零与 `0.0` 相等（`0.0 == -0.0` 为 `true`），但 `is` 判断为不同对象。
 
 ```
 1 + 2.0   # 3.0 (float)
@@ -177,6 +184,8 @@ person = {
 | 包含 | `"key" in d` | 键是否存在 |
 | 长度 | `d.length()` | 键值对数 |
 
+**访问语义**：`d["key"]` 访问不存在的键返回 `nil`（不抛异常）。`d.remove("key")` 删除不存在的键抛出 `KeyError`。需要区分"键不存在"和"值为 nil"时，使用 `d.contains("key")` 或 `d.get("key", sentinel)`。
+
 **Dict 保持插入顺序**（与 Python 3.7+ 一致）。
 
 ### Tuple
@@ -255,6 +264,15 @@ type("hello")         # "string"
 type([1,2])           # "list"
 isinstance(42, int)            # true
 isinstance("hello", string)    # true
+```
+
+**`isinstance` 类型参数**：`isinstance(val, type_obj)` 的第二个参数接受类型名称（如 `int`、`string`）。这些名称既是内置转换函数，也是类型对象。当用作 `isinstance` 的第二个参数时，按类型对象语义解释。用户自定义类的类名也可用于 `isinstance` 检查。
+
+```ms
+class Animal {}
+a = Animal()
+isinstance(a, Animal)    # true
+isinstance(a, Object)    # true（所有实例隐式继承 Object）
 ```
 
 ## 运算符类型规则

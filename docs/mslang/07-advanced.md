@@ -162,6 +162,8 @@ for v in flatten([1, [2, 3], [4, [5, 6]]]) {
 }
 ```
 
+> **消歧规则**：`yield from` 中的 `from` 作为关键字解析（委托生成器语义），仅在 `yield` 紧后跟 `from` 时触发。`yield from_module.import_name` 等场景中 `from` 后不跟表达式，仍解析为 `yield` 后跟标识符表达式 `from_module.import_name`。解析器通过检查 `from` 后是否跟随表达式来区分。
+
 ### 生成器表达式
 
 类似列表推导式但用圆括号，惰性求值：
@@ -169,6 +171,8 @@ for v in flatten([1, [2, 3], [4, [5, 6]]]) {
 ```ms
 total = sum(x * x for x in range(1000000))
 ```
+
+生成器表达式的形式文法见 [03-syntax](03-syntax.md) 推导式章节。圆括号内的推导式惰性求值，不在内存中构建完整列表。
 
 ### 生成器与 with
 

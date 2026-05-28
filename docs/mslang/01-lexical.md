@@ -18,12 +18,13 @@ class      self       super
 true       false      nil
 and        or         not
 try        except     finally    defer      with     throw
-async      await      go         channel
+async      await      go
 import     from       as
 yield
+nonlocal
 ```
 
-共 **32** 个关键字。
+共 **34** 个关键字。
 
 ### 标识符
 
@@ -185,8 +186,8 @@ in  is
 
 | 运算符 | 含义 |
 |---|---|
-| `..` | 范围运算符（保留） |
-| `...` | 切片省略（保留） |
+| `..` | 范围运算符（暂不使用，保留给未来版本） |
+| `...` | 可变参数标记（暂不使用，保留给未来版本） |
 
 ### 分隔符
 
@@ -214,7 +215,7 @@ in  is
 | 符号 | 含义 |
 |---|---|
 | `@` | 装饰器前缀 |
-| `<-` | channel 发送（在 channel 上下文中） |
+| `<-` | channel 接收（从 channel 读取值） |
 | `:=` | 短变量声明 |
 
 ### 注释
@@ -250,7 +251,7 @@ enum TokenKind {
 
     // 标识符与关键字
     Identifier(String),
-    // 32 个关键字
+    // 34 个关键字
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
@@ -258,9 +259,9 @@ enum TokenKind {
     True, False, Nil,
     And, Or, Not,
     Try, Except, Finally, Defer, With, Throw,
-    Async, Await, Go, Channel,
+    Async, Await, Go,
     Import, From, As,
-    Yield,
+    Yield, Nonlocal,
 
     // 算术
     Plus, Minus, Star, Slash, DoubleSlash, Percent, DoubleStar,
@@ -328,3 +329,4 @@ enum TokenKind {
 | `case` | select 的 case 分支 |
 | `export` | 模块显式导出（见 [09-modules](09-modules.md)） |
 | `match` | 模式匹配（预留） |
+| `nonlocal` | 声明闭包内外层变量绑定（见 [03-syntax](03-syntax.md)） |

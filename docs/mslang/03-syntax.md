@@ -71,6 +71,25 @@ const MAX_SIZE = 100
 
 常量必须在声明时初始化，之后不可修改。常量值必须是编译时可确定的字面量或常量表达式。
 
+### nonlocal 声明
+
+```
+nonlocal_stmt = "nonlocal" IDENTIFIER ("," IDENTIFIER)*
+```
+
+```ms
+fn make_counter() {
+    count = 0
+    return fn() {
+        nonlocal count
+        count += 1
+        return count
+    }
+}
+```
+
+`nonlocal` 声明当前函数内的变量名绑定到外层（非全局）函数作用域的同名变量。必须在变量使用前声明。未声明 `nonlocal` 时，`=` 赋值在当前函数作用域创建新局部变量。
+
 ### 赋值语句
 
 ```
@@ -158,7 +177,7 @@ while i < 10 {
 #### for..in
 
 ```
-for_stmt = "for" IDENTIFIER "in" expression block
+for_stmt = "for" IDENTIFIER ("," IDENTIFIER)? "in" expression block
 ```
 
 ```ms
@@ -388,8 +407,10 @@ multiplication = unary (("*" | "/" | "//" | "%") unary)*
 ### 13. 一元运算
 
 ```
-unary = ("-" | "not" | "~") unary | power_expr
+unary = ("-" | "not" | "~" | "<-") unary | power_expr
 ```
+
+`<-` 为 channel 接收前缀运算符：`<-ch` 从 channel 中接收一个值。
 
 ### 14. 幂运算
 
@@ -425,7 +446,7 @@ arr[::2]            # 步长切片
 ```
 primary = literal
         | IDENTIFIER
-        | "super" "." IDENTIFIER                 // 父类方法访问
+        | "super" "." IDENTIFIER                 // 父类属性/方法访问（可后接调用）
         | "(" expression ("," expression)* ")"   # 分组或元组
         | "[" list_content? "]"                  // 列表
         | "{" dict_content? "}"                  // dict 或 set
@@ -445,6 +466,27 @@ list_content = expression ("," expression)* ","?
 [1, 2, 3]
 ["a", "b"]
 []
+```
+
+#### 推导式
+
+```
+comprehension = list_comp | dict_comp | set_comp | gen_expr
+
+list_comp = "[" expression "for" IDENTIFIER ("," IDENTIFIER)? "in" expression ("if" expression)? "]"
+
+dict_comp = "{" expression ":" expression "for" IDENTIFIER ("," IDENTIFIER)? "in" expression ("if" expression)? "}"
+
+set_comp = "{" expression "for" IDENTIFIER ("," IDENTIFIER)? "in" expression ("if" expression)? "}"
+
+gen_expr = "(" expression "for" IDENTIFIER ("," IDENTIFIER)? "in" expression ("if" expression)? ")"
+```
+
+嵌套推导式：
+
+```
+list_comp = "[" expression for_clause+ ("if" expression)? "]"
+for_clause = "for" IDENTIFIER ("," IDENTIFIER)? "in" expression
 ```
 
 #### Dict 字面量
@@ -502,7 +544,7 @@ tuple = "(" expression ("," expression)+ ","? ")"
 | 10 | `<< >>` | 左 |
 | 11 | `+ -` | 左 |
 | 12 | `* / // %` | 左 |
-| 13 | `- ~`（一元） | 右 |
+| 13 | `- ~ <-`（一元） | 右 |
 | 14 | `**` | 右 |
 | 15（最高） | `() [] .`（后缀） | 左 |
 
@@ -515,7 +557,7 @@ mslang 使用**函数级作用域**（类似 Python）：
 - `if`/`while`/`for`/`with` 块**不创建**新作用域
 - 内层函数可以访问外层变量（闭包）
 - `var` 和 `:=` 在当前函数作用域创建新变量
-- `=` 赋值时：仅在当前函数作用域内查找，找不到则在当前作用域创建新变量（不穿透外层）
+- `=` 赋值时：仅在当前函数作用域内查找，找不到则在当前作用域创建新变量（不穿透外层）；使用 `nonlocal` 声明可绑定外层变量
 
 ```ms
 x = 10               # 全局

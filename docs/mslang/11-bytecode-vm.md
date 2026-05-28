@@ -90,7 +90,6 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | `NOT` | — | not a（逻辑取反） |
 | `JUMP_IF_FALSE` | `offset(2)` | 为 falsy 则跳转 |
 | `JUMP_IF_TRUE` | `offset(2)` | 为 truthy 则跳转 |
-| `JUMP` | `offset(2)` | 无条件跳转 |
 | `POP` | — | 弹出栈顶 |
 | `DUP` | — | 复制栈顶 |
 
@@ -98,13 +97,12 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 
 | OpCode | 操作数 | 说明 |
 |---|---|---|
-| `JUMP` | `offset(2)` | 无条件跳转 |
-| `JUMP_BACK` | `offset(2)` | 向后跳转（循环用） |
-| `LOOP` | `offset(2)` | 循环跳转 |
-| `BREAK` | `offset(2)` | 跳出循环 |
-| `CONTINUE` | `offset(2)` | 跳到循环开头 |
+| `JUMP` | `offset(2)` | 无条件前向跳转（正偏移量） |
+| `JUMP_BACK` | `offset(2)` | 无条件后向跳转（循环回边，负偏移量） |
+| `BREAK` | `offset(2)` | 跳出循环（前向跳转到循环结尾） |
+| `CONTINUE` | `offset(2)` | 跳到循环开头（后向跳转到循环条件/迭代） |
 
-跳转偏移量为有符号 16 位整数，相对于当前指令位置。
+跳转偏移量为有符号 16 位整数，相对于当前指令位置。`JUMP` 用于 if/else 等前向分支，`JUMP_BACK` 用于 while/for 循环回边。
 
 ### 函数调用
 

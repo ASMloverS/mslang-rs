@@ -47,13 +47,14 @@ isinstance("x", int)     # false
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
-| `print` | `print(*args)` | 打印到标准输出 |
-| `println` | `println(*args)` | 打印并换行 |
+| `print` | `print(*args)` | 打印参数（空格分隔），追加换行 |
+| `println` | `println(*args)` | 等价于 `print`，别名（两者行为完全一致） |
 | `input` | `input(prompt?) -> string` | 读取用户输入 |
 
 ```ms
-print("hello")                  # hello
-println("a", "b", "c")         # a b c（换行）
+print("hello")                  # hello（末尾换行）
+print("a", "b", "c")           # a b c（末尾换行）
+println("a", "b")              # a b（println 是 print 的别名）
 name = input("Enter name: ")   # 带提示的输入
 ```
 
@@ -83,6 +84,9 @@ round(3.14159, 2)  # 3.14
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `len` | `len(val) -> int` | 长度 |
+
+`len(val)` 与 `val.length()` 方法等价，返回值相同。推荐使用 `len()` 内置函数（更简洁），`.length()` 方法保持向后兼容。
+
 | `range` | `range(end) -> iterator` | 0 到 end-1 |
 | `range` | `range(start, end) -> iterator` | start 到 end-1 |
 | `range` | `range(start, end, step) -> iterator` | 带步长 |
@@ -129,6 +133,12 @@ all([true, true, false])     # false
 | `copy` | `copy(val) -> value` | 浅拷贝 |
 | `deepcopy` | `deepcopy(val) -> value` | 深拷贝 |
 | `assert` | `assert(cond, msg?)` | 断言 |
+| `channel` | `channel(buffer_size?) -> Channel` | 创建 channel（见 [08-concurrency](08-concurrency.md)） |
+
+```ms
+ch = channel()       # 无缓冲 channel
+ch = channel(10)     # 缓冲区大小为 10
+```
 
 ## 内置方法
 
@@ -225,6 +235,8 @@ d.merge({"c": 3})      # {"a": 1, "b": 2, "c": 3}
 | `union(other)` | 并集 |
 | `intersection(other)` | 交集 |
 | `difference(other)` | 差集 |
+
+`set.remove(val)` 在元素不存在时抛出 `KeyError`。
 
 ## 标准库
 

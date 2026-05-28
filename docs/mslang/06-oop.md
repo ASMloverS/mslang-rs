@@ -53,6 +53,8 @@ print(dog)       # "Animal(Dog)"  调用 __repr__
 - 在方法内部通过 `self.attr = val` 设置实例属性
 - `self` 不需要在调用时传入（编译器自动绑定）
 
+> **解析规则**：`self` 在词法层是关键字，但在方法定义的参数列表中有特殊豁免——方法第一个参数位置允许使用 `self` 标识符。编译器对此做特例处理。
+
 ```ms
 class Point {
     fn __init__(self, x, y) {
@@ -310,6 +312,21 @@ class Dog {
     fn __init__(self) {}
 }
 Dog.__name__     # "Dog"
+```
+
+### Function 对象属性
+
+函数对象（包括匿名函数）自动拥有以下属性：
+
+| 属性 | 类型 | 说明 |
+|---|---|---|
+| `name` | string | 函数名字符串 |
+
+```ms
+fn greet(name) { return "Hello, " + name }
+greet.name    # "greet"
+
+fn(x) { return x * 2 }.name    # "<anonymous>"
 ```
 
 所有类的隐式基类，提供：
