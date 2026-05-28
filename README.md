@@ -27,7 +27,7 @@ for msg in greet(["Alice", "Bob", "Charlie"]) {
 | 类型 | 动态类型 — int, float, bool, string, nil, list, dict, tuple, set |
 | 函数 | first-class 函数、闭包、匿名函数、默认/可变参数、多返回值 |
 | 控制流 | if/elif/else, while, for..in, break/continue, 三元表达式 |
-| 高级 | 列表推导式、切片、生成器/yield、装饰器、with、defer |
+| 高级 | 列表/dict/set 推导式、切片、生成器/yield、装饰器、with、defer |
 | OOP | Python 风格 class、单继承、魔术方法、运算符重载 |
 | 错误处理 | try/except/finally, throw, defer |
 | 并发 | async/await, go 协程, channel |
@@ -40,7 +40,7 @@ for msg in greet(["Alice", "Bob", "Charlie"]) {
 ```
 
 - 编译到字节码 + 栈式虚拟机
-- 引用计数 + 标记-清除 GC
+- 分代 GC（MVP: 标记-清除 → 目标: 并发三色标记清扫）
 - 花括号代码块，无分号，`#` 行注释
 - 脚本模式，从文件顶部顺序执行
 
@@ -78,7 +78,9 @@ cargo test
 | [10-builtins](docs/mslang/10-builtins.md) | 内置函数与标准库 |
 | [11-bytecode-vm](docs/mslang/11-bytecode-vm.md) | 字节码与虚拟机设计 |
 | [12-implementation-plan](docs/mslang/12-implementation-plan.md) | 分阶段实现计划 |
-| [任务索引](docs/mslang/tasks/README.md) | 58 项实现任务 |
+| [13-capi](docs/mslang/13-capi.md) | C API 设计 |
+| [14-gc](docs/mslang/14-gc.md) | 垃圾回收系统 |
+| [任务索引](docs/mslang/tasks/README.md) | 66 项实现任务 |
 
 ## License
 
