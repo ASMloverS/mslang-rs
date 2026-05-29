@@ -1,4 +1,4 @@
-# 标准库 - os/string/time 模块
+# 标准库 - os/string/time/path 模块
 
 ## 所属阶段
 Phase 6.2c - 标准库

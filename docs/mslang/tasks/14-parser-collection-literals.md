@@ -77,10 +77,14 @@ double = fn(x) { return x * 2 }
 ### 推导式
 
 ```
-list_comp = "[" expression "for" IDENTIFIER "in" expression ("if" expression)? "]"
-dict_comp = "{" expression ":" expression "for" IDENTIFIER "in" expression ("if" expression)? "}"
-set_comp  = "{" expression "for" IDENTIFIER "in" expression ("if" expression)? "}"
+list_comp = "[" expression for_clause+ ("if" expression)? "]"
+dict_comp = "{" expression ":" expression for_clause+ ("if" expression)? "}"
+set_comp  = "{" expression for_clause+ ("if" expression)? "}"
+gen_expr  = "(" expression for_clause+ ("if" expression)? ")"
+for_clause = "for" IDENTIFIER "in" expression
 ```
+
+> **注**：`for_clause+` 表示支持一个或多个 `for` 子句（嵌套推导式），与 [09-ast-expression-nodes](09-ast-expression-nodes.md) 中 `Vec<ForClause>` 的定义一致。生成器表达式 `(expr for x in iter)` 的解析复用同一 `for_clause` 循环，但构造 `GeneratorExpression` 节点（圆括号内 `for` 后跟表达式时判定）。
 
 ## 实现细节
 
@@ -123,10 +127,14 @@ fn parse_list_literal(&mut self) -> Result<Expr> {
 
 ```rust
 fn parse_list_comprehension(&mut self, expr: Expr) -> Result<Expr> {
-    self.advance(); // consume 'for'
-    let target = self.expect_identifier("expected variable name after 'for'")?;
-    self.expect(TokenKind::In, "expected 'in' in comprehension")?;
-    let iterable = self.parse_expression()?;
+    let mut for_clauses = Vec::new();
+
+    while self.match_token(&[TokenKind::For]) {
+        let target = self.expect_identifier("expected variable name after 'for'")?;
+        self.expect(TokenKind::In, "expected 'in' in comprehension")?;
+        let iterable = self.parse_expression()?;
+        for_clauses.push(ForClause { target, iterable });
+    }
 
     let condition = if self.match_token(&[TokenKind::If]) {
         Some(Box::new(self.parse_expression()?))
@@ -138,8 +146,7 @@ fn parse_list_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     self.expect(TokenKind::RightBracket, "expected ']'")?;
     Ok(Expr::ListComprehension {
         expr: Box::new(expr),
-        target,
-        iterable: Box::new(iterable),
+        for_clauses,
         condition,
     })
 }
@@ -208,10 +215,14 @@ fn parse_dict_or_set(&mut self) -> Result<Expr> {
 
 ```rust
 fn parse_dict_comprehension(&mut self, key_expr: Expr, value_expr: Expr) -> Result<Expr> {
-    self.advance(); // consume 'for'
-    let target = self.expect_identifier("expected variable name")?;
-    self.expect(TokenKind::In, "expected 'in'")?;
-    let iterable = self.parse_expression()?;
+    let mut for_clauses = Vec::new();
+
+    while self.match_token(&[TokenKind::For]) {
+        let target = self.expect_identifier("expected variable name")?;
+        self.expect(TokenKind::In, "expected 'in'")?;
+        let iterable = self.parse_expression()?;
+        for_clauses.push(ForClause { target, iterable });
+    }
 
     let condition = if self.match_token(&[TokenKind::If]) {
         Some(Box::new(self.parse_expression()?))
@@ -224,8 +235,7 @@ fn parse_dict_comprehension(&mut self, key_expr: Expr, value_expr: Expr) -> Resu
     Ok(Expr::DictComprehension {
         key_expr: Box::new(key_expr),
         value_expr: Box::new(value_expr),
-        target,
-        iterable: Box::new(iterable),
+        for_clauses,
         condition,
     })
 }
@@ -235,10 +245,14 @@ fn parse_dict_comprehension(&mut self, key_expr: Expr, value_expr: Expr) -> Resu
 
 ```rust
 fn parse_set_comprehension(&mut self, expr: Expr) -> Result<Expr> {
-    self.advance(); // consume 'for'
-    let target = self.expect_identifier("expected variable name")?;
-    self.expect(TokenKind::In, "expected 'in'")?;
-    let iterable = self.parse_expression()?;
+    let mut for_clauses = Vec::new();
+
+    while self.match_token(&[TokenKind::For]) {
+        let target = self.expect_identifier("expected variable name")?;
+        self.expect(TokenKind::In, "expected 'in'")?;
+        let iterable = self.parse_expression()?;
+        for_clauses.push(ForClause { target, iterable });
+    }
 
     let condition = if self.match_token(&[TokenKind::If]) {
         Some(Box::new(self.parse_expression()?))
@@ -250,8 +264,7 @@ fn parse_set_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     self.expect(TokenKind::RightBrace, "expected '}'")?;
     Ok(Expr::SetComprehension {
         expr: Box::new(expr),
-        target,
-        iterable: Box::new(iterable),
+        for_clauses,
         condition,
     })
 }
@@ -322,6 +335,8 @@ fn is_fn_literal(&self) -> bool {
 5. 匿名函数正确解析
 6. 列表推导式（含过滤条件）正确解析
 7. Dict 和 Set 推导式正确解析
+8. 嵌套推导式 `[x for row in matrix for x in row]` 正确解析（多个 `for` 子句）
+9. 生成器表达式 `(x*x for x in range(10))` 正确解析为 `GeneratorExpression` 节点
 
 ## 测试用例
 
@@ -436,8 +451,9 @@ mod tests {
     fn test_list_comprehension() {
         let expr = parse_expr("[x * x for x in nums if x > 2]").unwrap();
         match expr {
-            Expr::ListComprehension { target, condition, .. } => {
-                assert_eq!(target, "x");
+            Expr::ListComprehension { for_clauses, condition, .. } => {
+                assert_eq!(for_clauses.len(), 1);
+                assert_eq!(for_clauses[0].target, "x");
                 assert!(condition.is_some());
             }
             _ => panic!("expected list comprehension"),
@@ -450,6 +466,19 @@ mod tests {
         match expr {
             Expr::ListComprehension { condition, .. } => {
                 assert!(condition.is_none());
+            }
+            _ => panic!("expected list comprehension"),
+        }
+    }
+
+    #[test]
+    fn test_nested_list_comprehension() {
+        let expr = parse_expr("[x for row in matrix for x in row]").unwrap();
+        match expr {
+            Expr::ListComprehension { for_clauses, .. } => {
+                assert_eq!(for_clauses.len(), 2);
+                assert_eq!(for_clauses[0].target, "row");
+                assert_eq!(for_clauses[1].target, "x");
             }
             _ => panic!("expected list comprehension"),
         }

@@ -172,6 +172,8 @@ in  is
 | `in` | 是否在集合中 |
 | `is` | 是否为同一对象（身份比较） |
 
+> **注**：`in` 同时是 `for..in` 语法的关键字。在表达式解析时，`in` 和 `is` 作为比较运算符使用（优先级 6，见 [03-syntax](03-syntax.md) § 运算符优先级总表）。
+
 #### 赋值运算符
 
 ```
@@ -329,4 +331,3 @@ enum TokenKind {
 | `case` | select 的 case 分支 |
 | `export` | 模块显式导出（见 [09-modules](09-modules.md)） |
 | `match` | 模式匹配（预留） |
-| `nonlocal` | 声明闭包内外层变量绑定（见 [03-syntax](03-syntax.md)） |

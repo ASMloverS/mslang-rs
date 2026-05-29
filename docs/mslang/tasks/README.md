@@ -38,6 +38,12 @@
 | 25 | [基础内置函数](25-builtins-basic.md) | ⬜ |
 | 26 | [内置迭代器与容器函数](26-builtins-iterators.md) | ⬜ |
 
+## Phase 2.5 — GC 基础（Young 代半空间复制 + Old 代 STW 标记-清除）
+
+| # | 任务 | 状态 |
+|---|---|---|
+| 52 | [垃圾回收（MVP：Young 代半空间复制 + Old 代 STW 标记-清除）](52-gc.md) | ⬜ |
+
 ## Phase 3 — 函数 + 闭包（MVP 完成）
 
 | # | 任务 | 状态 |
@@ -47,12 +53,6 @@
 | 29 | [匿名函数](29-anonymous-functions.md) | ⬜ |
 | 30 | [多返回值与元组解包](30-multi-return-tuple-unpack.md) | ⬜ |
 | 31 | [默认参数与可变参数](31-default-variadic-params.md) | ⬜ |
-
-## Phase 2.5 — GC 基础（Young 代半空间复制 + Old 代 STW 标记-清除）
-
-| # | 任务 | 状态 |
-|---|---|---|
-| 52 | [垃圾回收（MVP：Young 代半空间复制 + Old 代 STW 标记-清除）](52-gc.md) | ⬜ |
 
 ## Phase 4 — 控制流 + 高级语法
 
@@ -88,9 +88,8 @@
 | 49 | [标准库 - json 模块](49-stdlib-json.md) | ⬜ |
 | 50 | [内置类型方法 - String](50-builtin-methods-string.md) | ⬜ |
 | 51 | [内置类型方法 - List/Dict/Set](51-builtin-methods-list-dict-set.md) | ⬜ |
-| 61 | [C API — VM 生命周期与值操作](61-capi-vm-value.md) | ⬜ |
-| 62 | [C API — 函数调用、异常处理、模块注册](62-capi-call-error-module.md) | ⬜ |
-| 63 | [C API — Class 操作与 GC 交互](63-capi-class-gc.md) | ⬜ |
+
+> **C API 任务（待创建）**：设计规格见 [13-capi](../13-capi.md)。计划拆分为 VM 生命周期与值操作、函数调用/异常/模块注册、Class 操作与 GC 交互三个任务。
 
 ## Phase 7 — 并发
 
@@ -100,13 +99,9 @@
 | 54 | [Channel 通信](54-channel.md) | ⬜ |
 | 55 | [go 关键字与并发执行](55-go-concurrency.md) | ⬜ |
 
-## Phase 7.5 — 并发 GC 优化
+## Phase 7.5 — 并发 GC 优化（待创建）
 
-| # | 任务 | 状态 |
-|---|---|---|
-| 64 | [混合写屏障实现](64-write-barrier.md) | ⬜ |
-| 65 | [并发标记清扫](65-concurrent-gc.md) | ⬜ |
-| 66 | [Remembered Set + Card Table](66-remembered-set.md) | ⬜ |
+> 任务文件待创建。设计规格见 [14-gc](../14-gc.md) Phase 7.5。
 
 ## Phase 8 — REPL + 工具链
 

@@ -7,7 +7,9 @@ Phase 4.7 - 控制流 + 高级语法
 28-closures
 
 ## 目标
-实现生成器函数与 yield/yield from，支持帧快照/恢复机制，生成器对象可作为迭代器在 for..in 中使用。
+实现生成器函数与 yield/yield from，支持帧快照/恢复机制，生成器对象可作为迭代器在 for..in 中使用。同时实现生成器表达式（圆括号推导式）的编译与执行。
+
+> **注**：生成器表达式的 AST 节点 `GeneratorExpression` 在 Task 09 中已定义（`expr` + `for_clauses: Vec<ForClause>` + `condition`），Task 14 中已解析为该节点。本任务负责其编译（编译为生成器函数 + yield）和 VM 执行。
 
 ## 设计规格
 
@@ -278,6 +280,32 @@ fn generator_return(&mut self, value: Object) {
 }
 ```
 
+### 8. 生成器表达式编译
+
+参照 [03-syntax](../03-syntax.md) § gen_expr、[07-advanced](../07-advanced.md) § 生成器表达式：
+
+生成器表达式 `(expr for x in iter if cond)` 在编译时被变换为一个匿名生成器函数：
+
+```rust
+fn compile_generator_expression(&mut self, gen_expr: &GeneratorExpression) -> Result<()> {
+    // 变换为:
+    // fn __gen_expr_0(iter) {
+    //     for x in iter {
+    //         if cond { yield expr }
+    //     }
+    // }
+    //
+    // 编译为等价的嵌套循环 + yield
+    self.begin_function("__gen_expr", 0);
+    self.compile_gen_expr_body(gen_expr)?;
+    self.end_function(true) // is_generator = true
+}
+```
+
+- 生成的函数标记为 `is_generator = true`
+- 多个 `for_clause` 编译为嵌套循环
+- `condition` 编译为 `if` 包裹的 `yield`
+
 ## 验证标准
 
 1. 调用生成器函数返回 Generator 对象，不执行函数体
@@ -287,6 +315,8 @@ fn generator_return(&mut self, value: Object) {
 5. yield from 正确委托给子可迭代对象
 6. 生成器帧快照/恢复正确保留所有局部变量
 7. 无限生成器（如 fibonacci）可惰性求值
+8. 生成器表达式 `(x*x for x in range(10))` 返回惰性 Generator 对象
+9. 带过滤的生成器表达式 `(x for x in nums if x > 0)` 正确过滤
 
 ## 测试用例
 
@@ -386,4 +416,34 @@ print(c.__next__())
 100
 101
 102
+```
+
+### test_generator_expression.ms
+
+```ms
+# 生成器表达式 — 惰性求值
+squares = (x * x for x in range(5))
+for s in squares {
+    print(s)
+}
+
+# 带过滤的生成器表达式
+nums = [1, -2, 3, -4, 5]
+positives = (x for x in nums if x > 0)
+for p in positives {
+    print(p)
+}
+```
+
+预期输出：
+
+```
+0
+1
+4
+9
+16
+1
+3
+5
 ```

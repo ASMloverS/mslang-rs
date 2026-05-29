@@ -36,9 +36,10 @@ mslang-rs/
 │   │   ├── mod.rs
 │   │   ├── object.rs
 │   │   ├── frame.rs
-│   │   ├── gc.rs
 │   │   ├── builtins.rs
 │   │   └── stdlib.rs
+│   ├── gc/
+│   │   └── mod.rs
 │   ├── module/
 │   │   ├── mod.rs
 │   │   └── resolver.rs
@@ -82,6 +83,7 @@ pub mod ast;
 pub mod parser;
 pub mod compiler;
 pub mod vm;
+pub mod gc;
 pub mod module;
 pub mod async_runtime;
 pub mod repl;

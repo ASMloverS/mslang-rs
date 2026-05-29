@@ -4,7 +4,7 @@
 Phase 7.1 - 并发
 
 ## 前置任务
-52-gc
+52-gc, 28-closures, 36-defer, 37-try-except-finally
 
 ## 目标
 实现 async/await 协程系统，包括 Future 对象、AWAIT 指令、EventLoop 事件循环和协程调度机制。
