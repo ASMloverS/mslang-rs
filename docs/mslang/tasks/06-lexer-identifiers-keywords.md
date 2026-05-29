@@ -7,7 +7,7 @@ Phase 1.3d - 基础设施
 03-lexer-core
 
 ## 目标
-实现标识符解析和关键字识别，覆盖 [01-lexical](../01-lexical.md) 中的 32 个关键字和 5 个保留字。
+实现标识符解析和关键字识别，覆盖 [01-lexical](../01-lexical.md) 中的 35 个关键字和 5 个保留字。
 
 ## 设计规格
 
@@ -22,7 +22,7 @@ identifier = [a-zA-Z_][a-zA-Z0-9_]*
 - 关键字不可用作标识符
 - 保留字（select, default, case, export, match）不可用作标识符
 
-### 32 个关键字
+### 35 个关键字
 
 ```
 var        const      fn         return
@@ -32,9 +32,9 @@ class      self       super
 true       false      nil
 and        or         not
 try        except     finally    defer      with     throw
-async      await      go         channel
+async      await      go
 import     from       as
-yield
+yield      nonlocal
 ```
 
 ### 5 个保留字
@@ -95,7 +95,7 @@ fn keywords() -> &'static HashMap<&'static str, TokenKind> {
         let mut m = HashMap::new();
         m.insert("var", TokenKind::Var);
         m.insert("const", TokenKind::Const);
-        // ... 全部 32 个
+        // ... 全部 35 个
         m
     })
 }
@@ -110,7 +110,7 @@ fn keywords() -> &'static HashMap<&'static str, TokenKind> {
 
 ## 验证标准
 
-1. 所有 32 个关键字正确识别为对应 TokenKind
+1. 所有 35 个关键字正确识别为对应 TokenKind
 2. 普通标识符正确识别为 `Identifier(name)`
 3. 保留字使用时报错
 4. 大小写敏感：`True` 是标识符，`true` 是关键字
@@ -182,16 +182,16 @@ mod tests {
     }
 
     #[test]
-    fn test_all_32_keywords() {
+    fn test_all_35_keywords() {
         let source = "var const fn return if elif else while for in break continue \
                       class self super true false nil and or not \
                       try except finally defer with throw \
-                      async await go channel import from as yield\n";
+                      async await go import from as yield nonlocal\n";
         let tokens = tokenize(source);
         let keyword_tokens: Vec<_> = tokens.iter()
             .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
             .collect();
-        assert_eq!(keyword_tokens.len(), 32);
+        assert_eq!(keyword_tokens.len(), 35);
     }
 }
 ```

@@ -18,8 +18,8 @@ Phase 2.5a - 字节码编译 + VM 核心
 
 | 函数 | 签名 | 说明 |
 |---|---|---|
-| `print` | `print(*args)` | 打印到标准输出（空格分隔，无换行） |
-| `println` | `println(*args)` | 打印并换行 |
+| `print` | `print(*args)` | 打印到标准输出（空格分隔，追加换行） |
+| `println` | `println(*args)` | 等价于 `print`，别名（两者行为完全一致） |
 
 ### 类型检查
 
@@ -144,14 +144,12 @@ impl VM {
 ```rust
 fn builtin_print(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let output: Vec<String> = args.iter().map(|a| format!("{}", a)).collect();
-    print!("{}", output.join(" "));
+    println!("{}", output.join(" "));
     Ok(Object::Nil)
 }
 
 fn builtin_println(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let output: Vec<String> = args.iter().map(|a| format!("{}", a)).collect();
-    println!("{}", output.join(" "));
-    Ok(Object::Nil)
+    builtin_print(_vm, args)
 }
 ```
 

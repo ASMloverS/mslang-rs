@@ -4,10 +4,11 @@
 Phase 4.4 - 控制流 + 高级语法
 
 ## 前置任务
-27-call-frame, 37-try-except-finally
+27-call-frame
 
-> defer 与 try/except 存在交互语义（异常时 defer 也执行）。Task 37 与本任务同属 Phase 4。
-> 实现 defer 时先基于 Task 27 完成核心逻辑，defer 与 try/except 的交互测试在 Task 37 完成后补充验证。
+> defer 核心逻辑（LIFO 顺序、参数声明时求值）不依赖 try/except。
+> defer 与 try/except 的交互语义（异常时 defer 也执行）在 Task 37 完成后补充集成测试验证。
+> Task 37 的前置任务包含本任务，形成单向依赖。
 
 ## 目标
 实现 defer 语句，支持在函数返回前按 LIFO 顺序执行延迟调用，参数在声明时求值，异常时也执行。

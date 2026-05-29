@@ -29,7 +29,7 @@ Phase 1.4a - 基础设施
 | 10 | `<< >>` | 左 |
 | 11 | `+ -` | 左 |
 | 12 | `* / // %` | 左 |
-| 13 | `- ~`（一元） | 右 |
+| 13 | `- ~ <-`（一元） | 右 |
 | 14 | `**` | 右 |
 | 15（最高） | `() [] .`（后缀） | 左 |
 
@@ -40,7 +40,7 @@ Phase 1.4a - 基础设施
 - 字面量：Int, Float, String, Bool, Nil
 - 标识符引用
 - 二元运算
-- 一元运算（前缀：`-`, `not`, `~`）
+- 一元运算（前缀：`-`, `not`, `~`, `<-`）
 - 赋值表达式
 - 函数调用
 - 下标访问
@@ -52,10 +52,12 @@ Phase 1.4a - 基础设施
 - Set 字面量
 - 元组字面量
 - 匿名函数
-- 推导式（列表、Dict、Set）
+- 推导式（列表、Dict、Set，支持嵌套 for 子句）
+- 生成器表达式
 - super 访问
 - yield / yield from
 - await
+- go 表达式
 
 ## 实现细节
 
@@ -125,21 +127,23 @@ pub enum Expr {
     },
     ListComprehension {
         expr: Box<Expr>,
-        target: String,
-        iterable: Box<Expr>,
+        for_clauses: Vec<ForClause>,
         condition: Option<Box<Expr>>,
     },
     DictComprehension {
         key_expr: Box<Expr>,
         value_expr: Box<Expr>,
-        target: String,
-        iterable: Box<Expr>,
+        for_clauses: Vec<ForClause>,
         condition: Option<Box<Expr>>,
     },
     SetComprehension {
         expr: Box<Expr>,
-        target: String,
-        iterable: Box<Expr>,
+        for_clauses: Vec<ForClause>,
+        condition: Option<Box<Expr>>,
+    },
+    GeneratorExpression {
+        expr: Box<Expr>,
+        for_clauses: Vec<ForClause>,
         condition: Option<Box<Expr>>,
     },
     SuperAccess {
@@ -152,6 +156,9 @@ pub enum Expr {
         iterable: Box<Expr>,
     },
     Await {
+        expr: Box<Expr>,
+    },
+    Go {
         expr: Box<Expr>,
     },
     Grouping {
@@ -194,6 +201,7 @@ pub enum UnaryOp {
     Negate,
     Not,
     BitNot,
+    ChannelReceive,
 }
 ```
 
@@ -218,6 +226,18 @@ pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
     pub is_variadic: bool,
+}
+```
+
+### ForClause 结构体
+
+推导式中支持嵌套 for 子句：
+
+```rust
+#[derive(Debug, Clone)]
+pub struct ForClause {
+    pub targets: Vec<String>,
+    pub iterable: Box<Expr>,
 }
 ```
 
@@ -269,6 +289,7 @@ impl std::fmt::Display for Expr {
                 }
             }
             Expr::YieldFrom { iterable } => write!(f, "yield from {}", iterable),
+            Expr::Go { expr } => write!(f, "go {}", expr),
             Expr::Grouping { expr } => write!(f, "({})", expr),
             // ... 其他变体
             _ => write!(f, "<expr>"),
@@ -311,6 +332,7 @@ impl std::fmt::Display for UnaryOp {
             UnaryOp::Negate => write!(f, "-"),
             UnaryOp::Not => write!(f, "not "),
             UnaryOp::BitNot => write!(f, "~"),
+            UnaryOp::ChannelReceive => write!(f, "<-"),
         }
     }
 }

@@ -48,12 +48,11 @@
 | 30 | [多返回值与元组解包](30-multi-return-tuple-unpack.md) | ⬜ |
 | 31 | [默认参数与可变参数](31-default-variadic-params.md) | ⬜ |
 
-## Phase 2.5 — GC 基础（Young 代 + TLAB）
+## Phase 2.5 — GC 基础（Young 代半空间复制 + Old 代 STW 标记-清除）
 
 | # | 任务 | 状态 |
 |---|---|---|
-| 59 | [GC 基础 — 堆、TLAB、Young 代半空间复制](59-gc-basic.md) | ⬜ |
-| 60 | [Old 代 STW 标记-清除 + Finalizer](60-gc-old-gen.md) | ⬜ |
+| 52 | [垃圾回收（MVP：Young 代半空间复制 + Old 代 STW 标记-清除）](52-gc.md) | ⬜ |
 
 ## Phase 4 — 控制流 + 高级语法
 
@@ -89,7 +88,6 @@
 | 49 | [标准库 - json 模块](49-stdlib-json.md) | ⬜ |
 | 50 | [内置类型方法 - String](50-builtin-methods-string.md) | ⬜ |
 | 51 | [内置类型方法 - List/Dict/Set](51-builtin-methods-list-dict-set.md) | ⬜ |
-| 52 | [垃圾回收（引用计数 + 标记-清除）](52-gc.md) | ⬜ |
 | 61 | [C API — VM 生命周期与值操作](61-capi-vm-value.md) | ⬜ |
 | 62 | [C API — 函数调用、异常处理、模块注册](62-capi-call-error-module.md) | ⬜ |
 | 63 | [C API — Class 操作与 GC 交互](63-capi-class-gc.md) | ⬜ |

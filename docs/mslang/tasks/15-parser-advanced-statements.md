@@ -105,7 +105,7 @@ fn parse_try(&mut self) -> Result<Stmt> {
 
     let mut except_clauses = Vec::new();
     while self.match_token(&[TokenKind::Except]) {
-        let type_name = if self.check(&TokenKind::Identifier(String::new())) {
+        let type_name = if self.peek().is_identifier() {
             match &self.peek().kind {
                 TokenKind::Identifier(name) => {
                     let mut path = name.clone();
@@ -164,14 +164,12 @@ fn parse_throw(&mut self) -> Result<Stmt> {
     // 支持 bare throw（重新抛出当前异常）
     if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) {
         self.consume_newline();
-        return Ok(Stmt::Throw {
-            expr: Expr::Literal(Literal::Nil), // bare throw 标记
-        });
+        return Ok(Stmt::Throw { expr: None });
     }
 
     let expr = self.parse_expression()?;
     self.consume_newline();
-    Ok(Stmt::Throw { expr })
+    Ok(Stmt::Throw { expr: Some(expr) })
 }
 ```
 
@@ -248,21 +246,38 @@ fn parse_class_method(&mut self) -> Result<Stmt> {
     let params = self.parse_param_list()?;
     self.expect(TokenKind::RightParen, "expected ')'")?;
     let body = self.parse_block()?;
-    Ok(Stmt::FnDecl { name, params, body })
+    Ok(Stmt::FnDecl { name, params, body, is_async: false })
 }
 ```
 
 ### parse_yield_expr()
 
+参照 [07-advanced](../07-advanced.md) § yield from 消歧规则：
+
+> `yield from` 中的 `from` 作为关键字解析，仅在 `yield` 紧后跟 `from` 时触发。`yield from_module.import_name` 等场景中 `from` 后不跟表达式，仍解析为 `yield` 后跟标识符表达式。解析器通过检查 `from` 后是否跟随表达式来区分。
+
 ```rust
 fn parse_yield_expr(&mut self) -> Result<Expr> {
     self.advance(); // consume 'yield'
 
+    // 消歧：yield from vs yield <identifier starting with "from">
+    // from 是关键字 token，词法分析器已将其识别为 TokenKind::From
+    // 需要检查 From 后面是否跟随表达式（而非 . 或换行）
     if self.match_token(&[TokenKind::From]) {
-        let iterable = self.parse_expression()?;
-        return Ok(Expr::YieldFrom {
-            iterable: Box::new(iterable),
-        });
+        // 检查 from 后是否跟随表达式开始符号
+        // 如果不是表达式开始，说明是 yield 后跟了 from 变量（理论上不可能，因为 from 是关键字）
+        // 但设计文档的消歧场景是：from 后的 token 决定语义
+        // 如果 from 后紧跟表达式 → yield from（委托生成器）
+        // 如果 from 后不跟表达式 → 回退，按 yield 处理
+        if self.is_expression_start() {
+            let iterable = self.parse_expression()?;
+            return Ok(Expr::YieldFrom {
+                iterable: Box::new(iterable),
+            });
+        } else {
+            // from 后不是表达式，回退 From token
+            self.backup();
+        }
     }
 
     if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) {
@@ -271,6 +286,18 @@ fn parse_yield_expr(&mut self) -> Result<Expr> {
 
     let value = self.parse_expression()?;
     Ok(Expr::Yield { value: Some(Box::new(value)) })
+}
+
+fn is_expression_start(&self) -> bool {
+    matches!(
+        self.peek().kind,
+        TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::String(_) |
+        TokenKind::Identifier(_) | TokenKind::True | TokenKind::False |
+        TokenKind::Nil | TokenKind::LeftParen | TokenKind::LeftBracket |
+        TokenKind::LeftBrace | TokenKind::Super | TokenKind::Await |
+        TokenKind::Fn | TokenKind::Minus | TokenKind::Tilde |
+        TokenKind::LeftArrow | TokenKind::Not
+    )
 }
 ```
 
@@ -290,9 +317,10 @@ if self.check(&TokenKind::Async) {
 ```rust
 fn parse_async_fn(&mut self) -> Result<Stmt> {
     self.advance(); // consume 'async'
-    let fn_decl = self.parse_fn_decl()?;
-    // fn_decl 已是 Stmt::FnDecl，async 标记可在 AST 中添加 is_async 字段
-    // 或保持 FnDecl 不变，在编译阶段根据上下文处理
+    let mut fn_decl = self.parse_fn_decl()?;
+    if let Stmt::FnDecl { is_async, .. } = &mut fn_decl {
+        *is_async = true;
+    }
     Ok(fn_decl)
 }
 ```
@@ -303,9 +331,7 @@ fn parse_async_fn(&mut self) -> Result<Stmt> {
 TokenKind::Go => {
     self.advance();
     let expr = self.parse_postfix()?;
-    // go 表达式包装为 Expr::Go（可在 Expr 枚举中添加 Go 变体）
-    // 或作为 ExprStmt(Call(...)) 处理
-    Ok(expr)
+    Ok(Expr::Go { expr: Box::new(expr) })
 }
 ```
 

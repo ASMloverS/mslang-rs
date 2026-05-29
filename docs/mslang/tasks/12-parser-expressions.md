@@ -27,7 +27,7 @@ Phase 1.5b - 基础设施
 | 10 | `<< >>` | 左 | `parse_shift()` |
 | 11 | `+ -` | 左 | `parse_addition()` |
 | 12 | `* / // %` | 左 | `parse_multiplication()` |
-| 13 | `- ~`（一元） | 右 | `parse_unary()` |
+| 13 | `- ~ <-`（一元） | 右 | `parse_unary()` |
 | 14 | `**` | 右 | `parse_power()` |
 | 15（最高） | `() [] .`（后缀） | 左 | `parse_postfix()` |
 
@@ -369,6 +369,13 @@ fn parse_unary(&mut self) -> Result<Expr> {
         let operand = self.parse_unary()?;
         return Ok(Expr::Unary {
             op: UnaryOp::BitNot,
+            operand: Box::new(operand),
+        });
+    }
+    if self.match_token(&[TokenKind::LeftArrow]) {
+        let operand = self.parse_unary()?;
+        return Ok(Expr::Unary {
+            op: UnaryOp::ChannelReceive,
             operand: Box::new(operand),
         });
     }

@@ -24,7 +24,7 @@ yield
 nonlocal
 ```
 
-共 **34** 个关键字。
+共 **35** 个关键字。
 
 ### 标识符
 
@@ -251,7 +251,7 @@ enum TokenKind {
 
     // 标识符与关键字
     Identifier(String),
-    // 34 个关键字
+    // 35 个关键字
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,

@@ -26,7 +26,7 @@ pub enum TokenKind {
     // 标识符
     Identifier(String),
 
-    // 32 个关键字
+    // 35 个关键字
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
@@ -34,9 +34,9 @@ pub enum TokenKind {
     True, False, Nil,
     And, Or, Not,
     Try, Except, Finally, Defer, With, Throw,
-    Async, Await, Go, Channel,
+    Async, Await, Go,
     Import, From, As,
-    Yield,
+    Yield, Nonlocal,
 
     // 算术运算符 (+ - * / // % **)
     Plus, Minus, Star, Slash, DoubleSlash, Percent, DoubleStar,
@@ -47,6 +47,7 @@ pub enum TokenKind {
     // 成员运算符 (in is) — In/Is 既作为关键字 token，也在表达式解析中作为比较运算符使用
     // 词法分析器统一返回 TokenKind::In / TokenKind::Is（关键字身份）
     // 表达式解析器在 parse_comparison() 中将其视为比较运算符（双重角色）
+    // In 同时也作为 for..in 语法的关键字使用
     // 赋值运算符 (= += -= *= /= //= %= **= &= |= ^= <<= >>=)
     Equal, PlusEqual, MinusEqual, StarEqual, SlashEqual,
     DoubleSlashEqual, PercentEqual, DoubleStarEqual,
@@ -77,6 +78,12 @@ pub struct Token {
     pub kind: TokenKind,
     pub lexeme: String,
     pub span: Span,
+}
+
+impl Token {
+    pub fn is_identifier(&self) -> bool {
+        matches!(self.kind, TokenKind::Identifier(_))
+    }
 }
 ```
 
@@ -180,11 +187,11 @@ pub fn keyword_table() -> HashMap<&'static str, TokenKind> {
     m.insert("async", TokenKind::Async);
     m.insert("await", TokenKind::Await);
     m.insert("go", TokenKind::Go);
-    m.insert("channel", TokenKind::Channel);
     m.insert("import", TokenKind::Import);
     m.insert("from", TokenKind::From);
     m.insert("as", TokenKind::As);
     m.insert("yield", TokenKind::Yield);
+    m.insert("nonlocal", TokenKind::Nonlocal);
     m
 }
 ```
@@ -203,13 +210,13 @@ pub fn reserved_words() -> &'static [&'static str] {
 
 - [ ] 3 种字面量类型：Int, Float, String
 - [ ] Identifier
-- [ ] 32 个关键字（Var, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue, Class, Self, Super, True, False, Nil, And, Or, Not, Try, Except, Finally, Defer, With, Throw, Async, Await, Go, Channel, Import, From, As, Yield）
+- [ ] 35 个关键字（Var, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue, Class, Self, Super, True, False, Nil, And, Or, Not, Try, Except, Finally, Defer, With, Throw, Async, Await, Go, Import, From, As, Yield, Nonlocal）
 - [ ] 7 个算术运算符
 - [ ] 6 个比较运算符
 - [ ] 6 个位运算符
 - [ ] 14 个赋值运算符（含 = 和 :=）
 - [ ] 12 个分隔符
-- [ ] 3 个特殊符号（@, <-, :=）
+- [ ] 3 个特殊符号（@, <-, :=）— 注意 := 已在赋值运算符中列为 ColonEqual
 - [ ] 2 个范围运算符（.., ...）
 - [ ] Newline（语句终止）
 - [ ] Eof
@@ -218,7 +225,7 @@ pub fn reserved_words() -> &'static [&'static str] {
 
 1. `cargo build` 编译通过
 2. TokenKind 变体数量覆盖 [01-lexical](../01-lexical.md) Token 完整列表中所有元素
-3. 关键字表包含 32 个条目
+3. 关键字表包含 35 个条目
 4. Display 实现正确输出
 
 ## 测试用例
@@ -247,7 +254,7 @@ mod tests {
     #[test]
     fn test_keyword_count() {
         let kw = keyword_table();
-        assert_eq!(kw.len(), 32);
+        assert_eq!(kw.len(), 35);
     }
 
     #[test]

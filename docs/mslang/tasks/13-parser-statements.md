@@ -253,7 +253,7 @@ fn parse_fn_decl(&mut self) -> Result<Stmt> {
     self.expect(TokenKind::RightParen, "expected ')' after parameters")?;
     let body = self.parse_block()?;
 
-    Ok(Stmt::FnDecl { name, params, body })
+    Ok(Stmt::FnDecl { name, params, body, is_async: false })
 }
 ```
 
@@ -394,6 +394,24 @@ fn is_fn_literal(&self) -> bool {
 }
 ```
 
+### parse_nonlocal()
+
+参照 [03-syntax](../03-syntax.md) § nonlocal 声明：
+
+```rust
+fn parse_nonlocal(&mut self) -> Result<Stmt> {
+    self.advance(); // consume 'nonlocal'
+    let mut names = vec![self.expect_identifier("expected identifier after 'nonlocal'")?];
+    while self.match_token(&[TokenKind::Comma]) {
+        names.push(self.expect_identifier("expected identifier after ','")?);
+    }
+    self.consume_newline();
+    Ok(Stmt::Nonlocal { names })
+}
+```
+
+在 `parse_statement()` 分发中添加 `TokenKind::Nonlocal` 分支调用 `parse_nonlocal()`。
+
 ## 验证标准
 
 1. `var`, `:=`, `=` 三种声明方式正确解析
@@ -404,6 +422,7 @@ fn is_fn_literal(&self) -> bool {
 6. `break`, `continue`, `return` 正确解析
 7. 函数声明（含默认参数和可变参数）正确解析
 8. `import` 和 `from...import` 正确解析
+9. `nonlocal` 声明正确解析（含多个变量名）
 
 ## 测试用例
 

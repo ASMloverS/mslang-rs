@@ -34,6 +34,7 @@ Phase 1.4b - 基础设施
 - with 语句
 - import 语句
 - throw 语句
+- nonlocal 声明
 
 ### 程序结构
 
@@ -106,6 +107,7 @@ pub enum Stmt {
         name: String,
         params: Vec<Param>,
         body: Vec<Stmt>,
+        is_async: bool,
     },
     ClassDecl {
         name: String,
@@ -135,7 +137,10 @@ pub enum Stmt {
         targets: Vec<(String, Option<String>)>,
     },
     Throw {
-        expr: Expr,
+        expr: Option<Expr>,
+    },
+    Nonlocal {
+        names: Vec<String>,
     },
 }
 ```
@@ -222,10 +227,11 @@ impl std::fmt::Display for Stmt {
                     write!(f, "return {}", vs.join(", "))
                 }
             }
-            Stmt::FnDecl { name, params, body } => {
+            Stmt::FnDecl { name, params, body, is_async } => {
+                let prefix = if *is_async { "async " } else { "" };
                 let ps: Vec<_> = params.iter().map(|p| p.name.clone()).collect();
                 let b: Vec<_> = body.iter().map(|s| format!("{}", s)).collect();
-                write!(f, "fn {}({}) {{\n{}\n}}", name, ps.join(", "), b.join("\n"))
+                write!(f, "{}fn {}({}) {{\n{}\n}}", prefix, name, ps.join(", "), b.join("\n"))
             }
             Stmt::ClassDecl { name, parent, methods, class_vars: _ } => {
                 let parent_str = match parent {
@@ -278,7 +284,13 @@ impl std::fmt::Display for Stmt {
                     .collect();
                 write!(f, "from {} import {}", path, ts.join(", "))
             }
-            Stmt::Throw { expr } => write!(f, "throw {}", expr),
+            Stmt::Throw { expr } => {
+                match expr {
+                    Some(e) => write!(f, "throw {}", e),
+                    None => write!(f, "throw"),
+                }
+            }
+            Stmt::Nonlocal { names } => write!(f, "nonlocal {}", names.join(", ")),
         }
     }
 }
@@ -368,6 +380,7 @@ mod tests {
                     right: Box::new(Expr::Identifier("b".into())),
                 }],
             }],
+            is_async: false,
         };
         let s = format!("{}", stmt);
         assert!(s.contains("fn add(a, b)"));
