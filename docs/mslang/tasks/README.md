@@ -7,7 +7,7 @@
 | # | 任务 | 状态 |
 |---|---|---|
 | 01 | [项目骨架搭建](01-project-skeleton.md) | ✅ |
-| 02 | [Token 类型定义](02-token-definition.md) | ✅ |
+| 02 | [Token 类型定义](02-token-definition.md) | ⬜ |
 | 03 | [词法分析器核心框架](03-lexer-core.md) | ⬜ |
 | 04 | [数值字面量解析](04-lexer-number-literals.md) | ⬜ |
 | 05 | [字符串字面量解析](05-lexer-string-literals.md) | ⬜ |
