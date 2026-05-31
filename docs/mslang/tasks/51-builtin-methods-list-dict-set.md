@@ -67,19 +67,19 @@ Phase 6.2f - 标准库
 ```rust
 fn call_list_method(
     method: &str,
-    receiver: &Gc<Vec<Object>>,
+    receiver_ptr: *mut MsObjHeader,  // 指向 MsList
     args: Vec<Object>,
     vm: &mut VM,
 ) -> Result<Object> {
+    let list = unsafe { read_list(receiver_ptr) };
     match method {
-        "length" => Ok(Object::Int(receiver.borrow().len() as i64)),
+        "length" => Ok(Object::Int(list.len() as i64)),
         "push" => {
             let val = args.into_iter().next().ok_or(...)?;
-            receiver.borrow_mut().push(val);
+            list.push(val);
             Ok(Object::Nil)
         }
         "pop" => {
-            let mut list = receiver.borrow_mut();
             if args.is_empty() {
                 list.pop().ok_or_else(|| MspError::RuntimeError("pop from empty list".into()))
             } else {
@@ -91,8 +91,8 @@ fn call_list_method(
                 }
             }
         }
-        "sort" => { receiver.borrow_mut().sort_by(|a, b| a.cmp(b)); Ok(Object::Nil) }
-        "reverse" => { receiver.borrow_mut().reverse(); Ok(Object::Nil) }
+        "sort" => { list.sort_by(|a, b| a.cmp(b)); Ok(Object::Nil) }
+        "reverse" => { list.reverse(); Ok(Object::Nil) }
         "map" => { ... }
         "filter" => { ... }
         "reduce" => { ... }
@@ -156,38 +156,37 @@ fn call_list_method(
 ```rust
 fn call_dict_method(
     method: &str,
-    receiver: &Gc<DictMap>,
+    receiver_ptr: *mut MsObjHeader,  // 指向 MsDict
     args: Vec<Object>,
 ) -> Result<Object> {
+    let dict = unsafe { read_dict(receiver_ptr) };
     match method {
-        "length" => Ok(Object::Int(receiver.borrow().len() as i64)),
+        "length" => Ok(Object::Int(dict.len() as i64)),
         "keys" => {
-            let keys: Vec<Object> = receiver.borrow().keys()
-                .map(|k| Object::String(Gc::new(k.clone())))
-                .collect();
-            Ok(Object::List(Gc::new(keys)))
+            let keys: Vec<Object> = dict.keys().cloned().collect();
+            Ok(alloc_list(keys))
         }
         "values" => {
-            let vals: Vec<Object> = receiver.borrow().values().cloned().collect();
-            Ok(Object::List(Gc::new(vals)))
+            let vals: Vec<Object> = dict.items().iter().map(|(_, v)| (*v).clone()).collect();
+            Ok(alloc_list(vals))
         }
         "items" => {
-            let items: Vec<Object> = receiver.borrow().iter()
-                .map(|(k, v)| Object::Tuple(Gc::new(vec![
-                    Object::String(Gc::new(k.clone())),
-                    v.clone(),
-                ])))
+            let items: Vec<Object> = dict.items().iter()
+                .map(|(k, v)| alloc_tuple(vec![(*k).clone(), (*v).clone()]))
                 .collect();
-            Ok(Object::List(Gc::new(items)))
+            Ok(alloc_list(items))
         }
         "get" => {
             let key = dict_key_from(&args[0])?;
             let default = if args.len() > 1 { args[1].clone() } else { Object::Nil };
-            Ok(receiver.borrow().get(&key).cloned().unwrap_or(default))
+            Ok(dict.get(&key).cloned().unwrap_or(default))
         }
         "merge" => {
-            let other = expect_dict(&args[0])?;
-            receiver.borrow_mut().extend(other.iter().map(|(k, v)| (k.clone(), v.clone())));
+            let other_ptr = expect_dict_ptr(&args[0])?;
+            let other = unsafe { read_dict(other_ptr) };
+            for (k, v) in other.items() {
+                dict.insert((*k).clone(), (*v).clone());
+            }
             Ok(Object::Nil)
         }
         // ...
@@ -200,28 +199,32 @@ fn call_dict_method(
 ```rust
 fn call_set_method(
     method: &str,
-    receiver: &Gc<HashSet<Object>>,
+    receiver_ptr: *mut MsObjHeader,  // 指向 MsSet
     args: Vec<Object>,
 ) -> Result<Object> {
+    let set = unsafe { read_set(receiver_ptr) };
     match method {
-        "length" => Ok(Object::Int(receiver.borrow().len() as i64)),
-        "add" => { receiver.borrow_mut().insert(args[0].clone()); Ok(Object::Nil) }
-        "remove" => { receiver.borrow_mut().remove(&args[0]); Ok(Object::Nil) }
-        "contains" => Ok(Object::Bool(receiver.borrow().contains(&args[0]))),
+        "length" => Ok(Object::Int(set.len() as i64)),
+        "add" => { set.insert(args[0].clone()); Ok(Object::Nil) }
+        "remove" => { set.remove(&args[0]); Ok(Object::Nil) }
+        "contains" => Ok(Object::Bool(set.contains(&args[0]))),
         "union" => {
-            let other = expect_set(&args[0])?;
-            let result: HashSet<Object> = receiver.borrow().union(&other).cloned().collect();
-            Ok(Object::Set(Gc::new(result)))
+            let other_ptr = expect_set_ptr(&args[0])?;
+            let other = unsafe { read_set(other_ptr) };
+            let result: HashSet<Object> = set.union(other).cloned().collect();
+            Ok(alloc_set(result))
         }
         "intersection" => {
-            let other = expect_set(&args[0])?;
-            let result: HashSet<Object> = receiver.borrow().intersection(&other).cloned().collect();
-            Ok(Object::Set(Gc::new(result)))
+            let other_ptr = expect_set_ptr(&args[0])?;
+            let other = unsafe { read_set(other_ptr) };
+            let result: HashSet<Object> = set.intersection(other).cloned().collect();
+            Ok(alloc_set(result))
         }
         "difference" => {
-            let other = expect_set(&args[0])?;
-            let result: HashSet<Object> = receiver.borrow().difference(&other).cloned().collect();
-            Ok(Object::Set(Gc::new(result)))
+            let other_ptr = expect_set_ptr(&args[0])?;
+            let other = unsafe { read_set(other_ptr) };
+            let result: HashSet<Object> = set.difference(other).cloned().collect();
+            Ok(alloc_set(result))
         }
         _ => Err(MspError::RuntimeError(format!("set has no method '{}'", method))),
     }
@@ -238,11 +241,22 @@ OpCode::INVOKE => {
     let argc = self.read_byte();
     let receiver = self.stack[self.stack.len() - argc - 1];
     match &receiver {
-        Object::String(_) => call_string_method(...)
-        Object::List(_) => call_list_method(...)
-        Object::Dict(_) => call_dict_method(...)
-        Object::Set(_) => call_set_method(...)
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::STRING as u8 {
+                call_string_method(name, *ptr, args, vm)
+            } else if tag == TypeTag::LIST as u8 {
+                call_list_method(name, *ptr, args, vm)
+            } else if tag == TypeTag::DICT as u8 {
+                call_dict_method(name, *ptr, args)
+            } else if tag == TypeTag::SET as u8 {
+                call_set_method(name, *ptr, args)
+            } else {
+                Err(MspError::RuntimeError(format!("type has no method '{}'", name)))
+            }
+        }
         // ... 其他类型
+        _ => Err(MspError::RuntimeError(format!("type has no method '{}'", name)))
     }
 }
 ```

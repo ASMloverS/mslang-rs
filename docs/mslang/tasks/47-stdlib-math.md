@@ -40,7 +40,7 @@ Phase 6.2b - 标准库
 `src/vm/stdlib.rs` 中注册 `math` 模块：
 
 ```rust
-fn register_math_module(vm: &mut VM) -> Gc<Module> {
+fn register_math_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
 
     // 常量

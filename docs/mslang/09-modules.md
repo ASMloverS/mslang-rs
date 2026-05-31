@@ -18,7 +18,7 @@ import math
 
 ```ms
 from os import path
-from io import open, print
+from io import open, read_file
 from math import sqrt as root
 ```
 
@@ -223,10 +223,10 @@ stdlib/
 ├── string.ms        # 字符串工具
 ├── time.ms          # 时间相关
 ├── json.ms          # JSON 编解码
-├── regex.ms         # 正则表达式
-├── collections.ms   # 高级数据结构
-├── http.ms          # HTTP 客户端
-├── net.ms           # 网络操作
+├── regex.ms         # 正则表达式（API 待文档化）
+├── collections.ms   # 高级数据结构（API 待文档化）
+├── http.ms          # HTTP 客户端（API 待文档化）
+├── net.ms           # 网络操作（API 待文档化）
 ├── fs.ms            # 文件系统操作
 ├── async.ms         # 异步工具
 ├── path.ms          # 路径操作

@@ -72,9 +72,12 @@ impl Object {
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 + b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a + *b as f64)),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a + b)),
-            (Object::String(a), Object::String(b)) => {
-                let result = a.borrow().data.clone() + &b.borrow().data;
-                Ok(Object::String(Gc::new(result)))
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (*(*a)).type_tag } == TypeTag::STRING as u8
+                && unsafe { (*(*b)).type_tag } == TypeTag::STRING as u8 =>
+            {
+                let result = unsafe { read_str(*a) }.to_owned() + unsafe { read_str(*b) };
+                Ok(alloc_string(&result))
             }
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for +: '{}' and '{}'",
@@ -102,12 +105,14 @@ impl Object {
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 * b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a * *b as f64)),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a * b)),
-            (Object::String(a), Object::Int(b)) | (Object::Int(b), Object::String(a)) => {
+            (Object::Ref(a), Object::Int(b)) | (Object::Int(b), Object::Ref(a))
+                if unsafe { (*(*a)).type_tag } == TypeTag::STRING as u8 =>
+            {
                 if *b < 0 {
                     return Err("TypeError: can't multiply string by negative int".to_string());
                 }
-                let repeated = a.borrow().data.repeat(*b as usize);
-                Ok(Object::String(Gc::new(repeated)))
+                let repeated = unsafe { read_str(*a) }.repeat(*b as usize);
+                Ok(alloc_string(&repeated))
             }
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for *: '{}' and '{}'",
@@ -226,7 +231,12 @@ impl Object {
             (Object::Float(a), Object::Float(b)) => Ok(a < b),
             (Object::Int(a), Object::Float(b)) => Ok((*a as f64) < *b),
             (Object::Float(a), Object::Int(b)) => Ok(*a < (*b as f64)),
-            (Object::String(a), Object::String(b)) => Ok(a.borrow().data < b.borrow().data),
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (*(*a)).type_tag } == TypeTag::STRING as u8
+                && unsafe { (*(*b)).type_tag } == TypeTag::STRING as u8 =>
+            {
+                Ok(unsafe { read_str(*a) } < unsafe { read_str(*b) })
+            }
             _ => Err(format!(
                 "TypeError: '{}' not supported between instances of '{}' and '{}'",
                 "<", self.type_name(), other.type_name()
@@ -337,10 +347,11 @@ impl Object {
             Object::Int(_) => Ok(self.clone()),
             Object::Float(f) => Ok(Object::Int(*f as i64)),
             Object::Bool(b) => Ok(Object::Int(if *b { 1 } else { 0 })),
-            Object::String(s) => {
-                s.borrow().data.parse::<i64>()
+            Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+                let s = unsafe { read_str(*ptr) };
+                s.parse::<i64>()
                     .map(Object::Int)
-                    .map_err(|_| format!("ValueError: invalid literal for int(): '{}'", s.borrow().data))
+                    .map_err(|_| format!("ValueError: invalid literal for int(): '{}'", s))
             }
             Object::Nil => Err("TypeError: cannot convert nil to int".to_string()),
         }
@@ -350,17 +361,18 @@ impl Object {
         match self {
             Object::Float(_) => Ok(self.clone()),
             Object::Int(n) => Ok(Object::Float(*n as f64)),
-            Object::String(s) => {
-                s.borrow().data.parse::<f64>()
+            Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+                let s = unsafe { read_str(*ptr) };
+                s.parse::<f64>()
                     .map(Object::Float)
-                    .map_err(|_| format!("ValueError: invalid literal for float(): '{}'", s.borrow().data))
+                    .map_err(|_| format!("ValueError: invalid literal for float(): '{}'", s))
             }
             _ => Err(format!("TypeError: cannot convert {} to float", self.type_name())),
         }
     }
 
     pub fn to_str(&self) -> Object {
-        Object::String(Gc::new(format!("{}", self)))
+        alloc_string(&format!("{}", self))
     }
 
     pub fn to_bool(&self) -> Object {
@@ -436,16 +448,16 @@ mod tests {
 
     #[test]
     fn test_string_concat() {
-        let result = Object::String(Gc::new("hello".into()))
-            .add(&Object::String(Gc::new(" world".into()))).unwrap();
-        assert_eq!(result, Object::String(Gc::new("hello world".into())));
+        let result = alloc_string("hello")
+            .add(&alloc_string(" world")).unwrap();
+        assert_eq!(result, alloc_string("hello world"));
     }
 
     #[test]
     fn test_string_repeat() {
-        let result = Object::String(Gc::new("ab".into()))
+        let result = alloc_string("ab")
             .multiply(&Object::Int(3)).unwrap();
-        assert_eq!(result, Object::String(Gc::new("ababab".into())));
+        assert_eq!(result, alloc_string("ababab"));
     }
 
     #[test]
@@ -471,7 +483,7 @@ mod tests {
 
     #[test]
     fn test_type_conversion() {
-        assert_eq!(Object::String(Gc::new("42".into())).to_int().unwrap(), Object::Int(42));
+        assert_eq!(alloc_string("42").to_int().unwrap(), Object::Int(42));
         assert_eq!(Object::Int(42).to_float().unwrap(), Object::Float(42.0));
         assert_eq!(Object::Int(0).to_bool(), Object::Bool(false));
     }

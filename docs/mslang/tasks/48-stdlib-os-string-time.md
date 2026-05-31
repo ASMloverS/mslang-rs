@@ -59,7 +59,7 @@ Phase 6.2c - 标准库
 `src/vm/stdlib.rs`：
 
 ```rust
-fn register_os_module(vm: &mut VM) -> Gc<Module> {
+fn register_os_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
     exports.insert("getenv".into(), Object::NativeFn(native_os_getenv));
     exports.insert("setenv".into(), Object::NativeFn(native_os_setenv));
@@ -83,7 +83,7 @@ fn register_os_module(vm: &mut VM) -> Gc<Module> {
 ### 2. string 模块
 
 ```rust
-fn register_string_module(vm: &mut VM) -> Gc<Module> {
+fn register_string_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
     exports.insert("format".into(), Object::NativeFn(native_string_format));
     exports.insert("repeat".into(), Object::NativeFn(native_string_repeat));
@@ -103,7 +103,7 @@ fn register_string_module(vm: &mut VM) -> Gc<Module> {
 ### 3. time 模块
 
 ```rust
-fn register_time_module(vm: &mut VM) -> Gc<Module> {
+fn register_time_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
     exports.insert("now".into(), Object::NativeFn(native_time_now));
     exports.insert("sleep".into(), Object::NativeFn(native_time_sleep));
@@ -119,7 +119,7 @@ fn register_time_module(vm: &mut VM) -> Gc<Module> {
 ### 4. path 模块
 
 ```rust
-fn register_path_module(vm: &mut VM) -> Gc<Module> {
+fn register_path_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
     exports.insert("join".into(), Object::NativeFn(native_path_join));
     exports.insert("ext".into(), Object::NativeFn(native_path_ext));

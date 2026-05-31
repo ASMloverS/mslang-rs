@@ -17,10 +17,10 @@ Phase 3.1 - 函数 + 闭包
 
 ```
 CallFrame {
-    closure: Gc<Closure>,    // 被调用的闭包（Phase 3.1 先用 Function 包装为单闭包）
-    ip: usize,               // 程序计数器
-    stack_base: usize,       // 当前帧的栈基址
-    defer_stack_base: usize, // defer 栈基址
+    closure: *mut MsObjHeader,  // 指向 MsClosure；Phase 3.1 先用 Function 包装为单闭包
+    ip: usize,                  // 程序计数器
+    stack_base: usize,          // 当前帧的栈基址
+    defer_stack_base: usize,    // defer 栈基址
 }
 ```
 
@@ -110,20 +110,20 @@ fn_def = "fn" IDENTIFIER "(" param_list? ")" block
 ### 1. src/vm/frame.rs — CallFrame 定义
 
 ```rust
-use crate::vm::object::{Object, Gc};
+use crate::vm::object::{Object, MsObjHeader};
 
 #[derive(Clone)]
 pub struct CallFrame {
-    pub function: Gc<Function>,
+    pub closure: *mut MsObjHeader,  // 指向 MsClosure（由 task 28 定义）
     pub ip: usize,
     pub stack_base: usize,
     pub defer_stack_base: usize,
 }
 
 impl CallFrame {
-    pub fn new(function: Gc<Function>, stack_base: usize) -> Self {
+    pub fn new(closure: *mut MsObjHeader, stack_base: usize) -> Self {
         Self {
-            function,
+            closure,
             ip: 0,
             stack_base,
             defer_stack_base: 0,
@@ -162,7 +162,7 @@ impl Function {
 }
 ```
 
-在 `Object` 枚举中已有 `Function(Gc<Function>)` 变体（参照 [11-bytecode-vm](../11-bytecode-vm.md) § 对象系统）。
+Function 对象在堆上以 `MsFunction`（TypeTag::FUNCTION）存储，通过 `Object::Ref(*mut MsObjHeader)` 引用，类型由 type_tag 区分（参照 [20-object-system-basic](./20-object-system-basic.md) § 对象模型）。
 
 ### 3. src/compiler/mod.rs — 函数声明编译
 
@@ -189,18 +189,19 @@ fn compile_fn_decl(&mut self, node: &FnDecl) {
 
     let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
-    let function = Object::Function(Gc::new(Function {
+    // Function 存入常量池（task 28 中包装为 Closure/MsFunction 堆对象）
+    let function = alloc_function(Function {
         name: func_unit.name,
         arity: func_unit.arity,
         code: func_unit.code,
         constants: func_unit.constants,
         upvalue_count: 0,
         source_file: self.source_file.clone(),
-    }));
+    });
     let idx = self.add_constant(function);
 
     self.emit_constant(idx);
-    let name_idx = self.add_constant(Object::String(node.name.clone().into()));
+    let name_idx = self.add_constant(alloc_string(&node.name));
     self.emit_with_operand(OpCode::STORE_GLOBAL, name_idx as u16);
 }
 ```
@@ -228,7 +229,8 @@ OpCode::CALL => {
     let callee = self.stack[callee_idx].clone();
 
     match callee {
-        Object::Function(func) => {
+        Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::FUNCTION as u8 => {
+            let func = unsafe { read_function(ptr) };
             if argc != func.arity {
                 return self.runtime_error(
                     &format!("expected {} arguments, got {}", func.arity, argc)
@@ -240,8 +242,9 @@ OpCode::CALL => {
             }
 
             let stack_base = callee_idx;
+            // Phase 3.1：将 Function 包装为无上值 Closure 帧
             self.call_stack.push(CallFrame::new(
-                func.clone(),
+                ptr,
                 self.current_frame().stack_base,
             ));
 
@@ -282,7 +285,9 @@ VM 初始化时创建顶层 CallFrame：
 impl VM {
     pub fn new() -> Self {
         let main_function = Function::new("<main>".into(), 0);
-        let main_frame = CallFrame::new(Gc::new(main_function), 0);
+        // alloc_function 返回 Object::Ref(*mut MsObjHeader)；提取裸指针
+        let Object::Ref(main_ptr) = alloc_function(main_function) else { unreachable!() };
+        let main_frame = CallFrame::new(main_ptr, 0);
         Self {
             stack: Vec::new(),
             call_stack: vec![main_frame],

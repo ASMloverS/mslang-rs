@@ -25,10 +25,12 @@ Phase 5.2 - 类 + OOP
 
 ```
 BoundMethod {
-    receiver: Object,     // self 绑定的实例
-    method: Gc<Closure>,  // 方法闭包
+    receiver: Object,          // self 绑定的实例
+    method: *mut MsObjHeader,  // 指向 MsClosure
 }
 ```
+
+BoundMethod 以 `Object::Ref(*mut MsObjHeader)` 存储，type_tag 为 `TypeTag::BOUND_METHOD`。
 
 ### 属性查找顺序
 
@@ -45,49 +47,68 @@ obj.new_attr = value  // 运行时动态添加到 instance.fields
 
 ## 实现细节
 
-### 1. BoundMethod 对象
+### 1. BoundMethod 堆对象
 
-`src/vm/object.rs`：
+`src/vm/object.rs`，引用 [20-object-system-basic](./20-object-system-basic.md) 的 `MsObjHeader`：
 
 ```rust
-struct BoundMethod {
-    receiver: Object,       // 绑定的实例
-    method: Gc<Closure>,    // 方法闭包
+/// BoundMethod 堆对象（TypeTag::BOUND_METHOD = 15）
+#[repr(C)]
+pub struct MsBoundMethod {
+    pub header:   MsObjHeader,
+    pub receiver: Object,             // 绑定的实例
+    pub method:   *mut MsObjHeader,   // 指向 MsClosure
 }
 ```
 
-在 Object 枚举中已包含：
-
 ```rust
-enum Object {
-    // ...
-    BoundMethod(Gc<BoundMethod>),
+/// 分配 BoundMethod 堆对象，返回 Object::Ref。
+pub fn alloc_bound_method(receiver: Object, method: *mut MsObjHeader) -> Object {
+    let obj = Box::new(MsBoundMethod {
+        header: MsObjHeader {
+            gc_meta:   0,
+            type_tag:  TypeTag::BOUND_METHOD as u8,
+            size:      std::mem::size_of::<MsBoundMethod>() as u16,
+            _padding:  0,
+            class_ptr: 0,
+        },
+        receiver,
+        method,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsBoundMethod 内容。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_bound_method` 分配的有效 `MsBoundMethod`。
+pub unsafe fn read_bound_method(ptr: *mut MsObjHeader) -> &'static mut MsBoundMethod {
+    &mut *(ptr as *mut MsBoundMethod)
 }
 ```
 
 ### 2. BoundMethod 调用
 
-当 `CALL` 目标是 `BoundMethod` 时：
+当 `CALL` 目标是 BoundMethod 时：
 
 ```rust
-fn call_bound_method(&mut self, bound: &BoundMethod, argc: u8) -> Result<()> {
-    // 将 receiver（self）作为第一个参数
-    // 然后传入用户提供的 argc 个参数
-    
-    // 设置新 CallFrame
+Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::BOUND_METHOD as u8 => {
+    let bound = unsafe { read_bound_method(ptr) };
+    let closure_ptr = bound.method;
+    let func = unsafe { read_function(unsafe { read_closure(closure_ptr) }.function) };
+
+    // 将 receiver（self）替换到栈上 callee 的位置（slot 0）
+    let receiver = bound.receiver.clone();
+    self.stack[frame_base] = receiver;
+
+    // 设置新 CallFrame，closure 指向 MsClosure
     let frame = CallFrame {
-        closure: bound.method.clone(),
+        closure: closure_ptr,
         ip: 0,
-        stack_base: self.stack.len() - argc as usize - 1, // 包含 callee
+        stack_base: self.stack.len() - argc as usize - 1,
         defer_stack_base: self.defer_stack.len(),
     };
-    
-    // 栈布局已正确：[bound_method, arg0, arg1, ...]
-    // 方法的第 0 个局部变量（self）绑定到 receiver
-    // 这在方法编译时 self 已作为第一个参数声明
-    
     self.call_stack.push(frame);
-    Ok(())
 }
 ```
 
@@ -112,27 +133,18 @@ CALL 处理:
   - slot 2 = b
 ```
 
-需要在 CALL 中替换 BoundMethod 为其 receiver：
-
-```rust
-// 在设置新帧前
-let receiver = bound.receiver.clone();
-// 替换栈底（callee 位置）为 receiver
-self.stack[frame_base] = receiver;
-```
-
 ### 3. 属性查找实现
 
 `src/vm/object.rs` 或 `src/vm/attrs.rs`：
 
 ```rust
-impl Class {
-    fn find_method(&self, name: &str) -> Option<Gc<Closure>> {
-        if let Some(method) = self.methods.get(name) {
-            return Some(method.clone());
+impl MsClass {
+    pub unsafe fn find_method(&self, name: &str) -> Option<*mut MsObjHeader> {
+        if let Some(&ptr) = self.methods.get(name) {
+            return Some(ptr);
         }
-        if let Some(parent) = &self.parent {
-            return parent.find_method(name);
+        if let Some(parent_ptr) = self.parent {
+            return read_class(parent_ptr).find_method(name);
         }
         None
     }
@@ -144,28 +156,29 @@ impl Class {
 ```rust
 fn get_attribute(obj: &Object, name: &str) -> Result<AttrResult> {
     match obj {
-        Object::Instance(inst) => {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
             // 1. 实例字段
             if let Some(val) = inst.fields.get(name) {
                 return Ok(AttrResult::Value(val.clone()));
             }
             // 2. 类方法（含继承链）
-            if let Some(method) = inst.class.find_method(name) {
-                return Ok(AttrResult::Method(obj.clone(), method));
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method(name) } {
+                return Ok(AttrResult::Method(obj.clone(), method_ptr));
             }
             // 3. 类属性
-            if let Some(val) = find_class_attr(&inst.class, name) {
+            if let Some(val) = unsafe { find_class_attr(inst.class, name) } {
                 return Ok(AttrResult::Value(val.clone()));
             }
             Err(...)
         }
-        // 其他类型...
+        _ => { /* 其他类型... */ }
     }
 }
 
 enum AttrResult {
     Value(Object),
-    Method(Object, Gc<Closure>),  // receiver, method → BoundMethod
+    Method(Object, *mut MsObjHeader),  // receiver, method_ptr → 用于构造 BoundMethod
 }
 ```
 
@@ -200,34 +213,13 @@ fn compile_method(&mut self, class_name: &str, method: &MethodDef) -> Result<()>
 
 ### 5. 实例属性存储
 
-`src/vm/object.rs`：
-
-```rust
-struct Instance {
-    class: Gc<Class>,
-    fields: RefCell<HashMap<String, Object>>,  // 使用 RefCell 允许在 Gc 内修改
-}
-```
+实例属性写入 `MsInstance.fields`，由 `SET_ATTR` 指令处理（task 40 已实现）。
 
 `SET_ATTR` 对 Instance 操作：
 
 ```rust
-OpCode::SET_ATTR => {
-    let name_idx = self.read_u16();
-    let name = &self.constants[name_idx as usize].to_string();
-    
-    let value = self.stack_pop();
-    let obj = self.stack_pop();
-    
-    match obj {
-        Object::Instance(ref inst) => {
-            inst.fields.borrow_mut().insert(name.clone(), value);
-        }
-        Object::Class(ref cls) => {
-            cls.set_class_attr(name.clone(), value);
-        }
-        _ => return Err(runtime_error("cannot set attribute on this type")),
-    }
+Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::INSTANCE as u8 => {
+    unsafe { read_instance(ptr) }.fields.insert(name.clone(), value);
 }
 ```
 

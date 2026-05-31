@@ -225,7 +225,7 @@ Dog -> Animal -> Object
 | `__add__(self, other)` | `+` |
 | `__sub__(self, other)` | `-` |
 | `__mul__(self, other)` | `*` |
-| `__div__(self, other)` | `/` |
+| `__div__(self, other)` | `/` |（注：mslang 有意采用 `__div__` 而非 Python 的 `__truediv__`，简化运算符协议）
 | `__floordiv__(self, other)` | `//` |
 | `__mod__(self, other)` | `%` |
 | `__pow__(self, other)` | `**` |

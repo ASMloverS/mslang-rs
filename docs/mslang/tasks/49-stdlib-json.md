@@ -43,7 +43,7 @@ Phase 6.2d - 标准库
 `src/vm/stdlib.rs`：
 
 ```rust
-fn register_json_module(vm: &mut VM) -> Gc<Module> {
+fn register_json_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
     exports.insert("parse".into(), Object::NativeFn(native_json_parse));
     exports.insert("stringify".into(), Object::NativeFn(native_json_stringify));
@@ -86,18 +86,18 @@ fn json_value_to_object(v: serde_json::Value) -> Result<Object> {
                 Ok(Object::Float(n.as_f64().unwrap()))
             }
         }
-        serde_json::Value::String(s) => Ok(Object::String(Gc::new(s))),
+        serde_json::Value::String(s) => Ok(alloc_string(&s)),
         serde_json::Value::Array(arr) => {
             let list: Result<Vec<Object>> = arr.into_iter()
                 .map(json_value_to_object).collect();
-            Ok(Object::List(Gc::new(list?)))
+            Ok(alloc_list(list?))
         }
         serde_json::Value::Object(map) => {
-            let mut dict = HashMap::new();
+            let mut dict = DictMap::new();
             for (k, v) in map {
-                dict.insert(k, json_value_to_object(v)?);
+                dict.insert(alloc_string(&k), json_value_to_object(v)?);
             }
-            Ok(Object::Dict(Gc::new(dict)))
+            Ok(alloc_dict(dict))
         }
     }
 }
@@ -123,18 +123,33 @@ fn object_to_json_value(obj: &Object) -> Result<serde_json::Value> {
         Object::Bool(b) => Ok(serde_json::Value::Bool(*b)),
         Object::Int(i) => Ok(serde_json::json!(*i)),
         Object::Float(f) => Ok(serde_json::json!(*f)),
-        Object::String(s) => Ok(serde_json::Value::String(s.borrow().clone())),
-        Object::List(lst) => {
-            let arr: Result<Vec<_>> = lst.borrow().iter()
-                .map(object_to_json_value).collect();
-            Ok(serde_json::Value::Array(arr?))
-        }
-        Object::Dict(d) => {
-            let mut map = serde_json::Map::new();
-            for (k, v) in d.borrow().iter() {
-                map.insert(k.clone(), object_to_json_value(v)?);
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::STRING as u8 {
+                Ok(serde_json::Value::String(unsafe { read_str(*ptr) }.to_owned()))
+            } else if tag == TypeTag::LIST as u8 {
+                let arr: Result<Vec<_>> = unsafe { read_list(*ptr) }.iter()
+                    .map(object_to_json_value).collect();
+                Ok(serde_json::Value::Array(arr?))
+            } else if tag == TypeTag::DICT as u8 {
+                let mut map = serde_json::Map::new();
+                for (k, v) in unsafe { read_dict(*ptr) }.items() {
+                    let key_str = match k {
+                        Object::Ref(kptr) if unsafe { (*(*kptr)).type_tag } == TypeTag::STRING as u8 => {
+                            unsafe { read_str(*kptr) }.to_owned()
+                        }
+                        _ => return Err(MspError::RuntimeError(
+                            "JSON dict key must be string".to_string()
+                        )),
+                    };
+                    map.insert(key_str, object_to_json_value(v)?);
+                }
+                Ok(serde_json::Value::Object(map))
+            } else {
+                Err(MspError::RuntimeError(
+                    format!("cannot serialize type to JSON: {:?}", obj.type_name())
+                ))
             }
-            Ok(serde_json::Value::Object(map))
         }
         _ => Err(MspError::RuntimeError(
             format!("cannot serialize type to JSON: {:?}", obj.type_name())

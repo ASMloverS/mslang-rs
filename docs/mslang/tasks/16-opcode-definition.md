@@ -103,7 +103,6 @@ Phase 2.1 - 字节码编译 + VM 核心
 | OpCode | 操作数 | 说明 |
 |---|---|---|
 | `JUMP_BACK` | `offset(2)` | 向后跳转（循环用） |
-| `LOOP` | `offset(2)` | 循环跳转 |
 | `BREAK` | `offset(2)` | 跳出循环 |
 | `CONTINUE` | `offset(2)` | 跳到循环开头 |
 
@@ -238,7 +237,6 @@ pub enum OpCode {
     Pop,
     Dup,
     JumpBack,
-    Loop,
     Break,
     Continue,
     Call,
@@ -294,7 +292,7 @@ impl OpCode {
             | Self::LoadGlobal | Self::StoreGlobal
             | Self::GetAttr | Self::SetAttr
             | Self::JumpIfFalse | Self::JumpIfTrue | Self::Jump
-            | Self::JumpBack | Self::Loop | Self::Break | Self::Continue
+            | Self::JumpBack | Self::Break | Self::Continue
             | Self::Closure
             | Self::ForIter
             | Self::Class | Self::Method | Self::GetSuper
@@ -443,7 +441,7 @@ mod tests {
             OpCode::Is, OpCode::In,
             OpCode::Not, OpCode::JumpIfFalse, OpCode::JumpIfTrue, OpCode::Jump,
             OpCode::Pop, OpCode::Dup,
-            OpCode::JumpBack, OpCode::Loop, OpCode::Break, OpCode::Continue,
+            OpCode::JumpBack, OpCode::Break, OpCode::Continue,
             OpCode::Call, OpCode::Return, OpCode::TailCall,
             OpCode::Closure, OpCode::CloseUpvalue,
             OpCode::Iterator, OpCode::ForIter, OpCode::Yield, OpCode::YieldFrom,

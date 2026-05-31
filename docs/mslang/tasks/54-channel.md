@@ -69,8 +69,8 @@ struct Channel {
     buffer: RefCell<VecDeque<Object>>,
     capacity: usize,
     state: RefCell<ChannelState>,
-    waiting_senders: RefCell<Vec<Gc<Coroutine>>>,
-    waiting_receivers: RefCell<Vec<Gc<Coroutine>>>,
+    waiting_senders: RefCell<Vec<*mut MsObjHeader>>,    // 每项指向暂停的协程对象
+    waiting_receivers: RefCell<Vec<*mut MsObjHeader>>,  // 每项指向暂停的协程对象
 }
 ```
 
@@ -109,12 +109,11 @@ OpCode::SEND => {
 
     if channel.capacity == 0 {
         // 无缓冲：尝试匹配等待的接收者
-        if let Some(receiver) = channel.waiting_receivers.borrow_mut().pop() {
-            // 直接传递给接收者
-            // 唤醒接收者协程
-            self.event_loop.ready_queue.push(receiver);
+        if let Some(receiver_ptr) = channel.waiting_receivers.borrow_mut().pop() {
+            // 直接传递给接收者，唤醒接收者协程
+            self.event_loop.ready_queue.push(receiver_ptr);
         } else {
-            // 没有等待的接收者，暂停当前协程
+            // 没有等待的接收者，暂停当前协程（current_coroutine: *mut MsObjHeader）
             channel.waiting_senders.borrow_mut().push(current_coroutine);
             self.yield_coroutine();
         }
@@ -144,16 +143,16 @@ OpCode::RECEIVE => {
     let mut buffer = channel.buffer.borrow_mut();
     if let Some(val) = buffer.pop_front() {
         // 缓冲区有数据
-        // 如果有等待的发送者，将其数据移入缓冲区
-        if let Some(sender) = channel.waiting_senders.borrow_mut().pop() {
-            self.event_loop.ready_queue.push(sender);
+        // 如果有等待的发送者，将其数据移入缓冲区并唤醒
+        if let Some(sender_ptr) = channel.waiting_senders.borrow_mut().pop() {
+            self.event_loop.ready_queue.push(sender_ptr);
         }
         self.stack.push(val);
     } else if channel.is_closed() {
         // 已关闭且缓冲区为空
         self.stack.push(Object::Nil);
     } else {
-        // 缓冲区空且未关闭，暂停当前协程
+        // 缓冲区空且未关闭，暂停当前协程（current_coroutine: *mut MsObjHeader）
         channel.waiting_receivers.borrow_mut().push(current_coroutine);
         self.yield_coroutine();
     }
@@ -168,8 +167,8 @@ OpCode::RECEIVE => {
 "close" => {
     channel.state.replace(ChannelState::Closed);
     // 唤醒所有等待的接收者（它们会收到 nil）
-    for receiver in channel.waiting_receivers.borrow_mut().drain(..) {
-        self.event_loop.ready_queue.push(receiver);
+    for receiver_ptr in channel.waiting_receivers.borrow_mut().drain(..) {
+        self.event_loop.ready_queue.push(receiver_ptr);
     }
     Ok(Object::Nil)
 }

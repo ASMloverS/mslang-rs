@@ -47,7 +47,7 @@ Phase 5.4 - 类 + OOP
 | `__add__(self, other)` | `+` |
 | `__sub__(self, other)` | `-` |
 | `__mul__(self, other)` | `*` |
-| `__div__(self, other)` | `/` |
+| `__div__(self, other)` | `/` |（注：mslang 有意采用 `__div__` 而非 Python 的 `__truediv__`，简化运算符协议）
 | `__floordiv__(self, other)` | `//` |
 | `__mod__(self, other)` | `%` |
 | `__pow__(self, other)` | `**` |
@@ -94,12 +94,15 @@ OpCode::ADD => {
     let a = self.stack_pop();
     
     // 检查 a 是否有 __add__
-    if let Object::Instance(ref inst) = a {
-        if let Some(add_method) = inst.class.find_method("__add__") {
-            let bound = BoundMethod { receiver: a, method: add_method };
-            self.stack_push(b);
-            self.stack_push(Object::BoundMethod(Gc::new(bound)));
-            return self.call_bound_method(1); // 1 arg: b
+    if let Object::Ref(ptr) = &a {
+        if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 {
+            let inst = unsafe { read_instance(*ptr) };
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__add__") } {
+                let bound = alloc_bound_method(a.clone(), method_ptr);
+                self.stack_push(b);
+                self.stack_push(bound);
+                return self.call_bound_method(1); // 1 arg: b
+            }
         }
     }
     
@@ -123,11 +126,14 @@ OpCode::EQUAL => {
     let a = self.stack_pop();
     
     // 检查 __eq__
-    if let Object::Instance(ref inst) = a {
-        if let Some(eq_method) = inst.class.find_method("__eq__") {
-            let result = self.invoke_magic(&a, eq_method, &[b])?;
-            self.stack_push(result);
-            return Ok(());
+    if let Object::Ref(ptr) = &a {
+        if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 {
+            let inst = unsafe { read_instance(*ptr) };
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__eq__") } {
+                let result = self.invoke_magic(&a, method_ptr, &[b])?;
+                self.stack_push(result);
+                return Ok(());
+            }
         }
     }
     
@@ -141,18 +147,20 @@ OpCode::EQUAL => {
 ```rust
 fn object_to_string(&mut self, obj: &Object) -> Result<String> {
     match obj {
-        Object::Instance(inst) => {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
             // 优先 __str__
-            if let Some(str_method) = inst.class.find_method("__str__") {
-                let result = self.invoke_magic(obj, str_method, &[])?;
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__str__") } {
+                let result = self.invoke_magic(obj, method_ptr, &[])?;
                 return Ok(result.as_string().clone());
             }
             // 其次 __repr__
-            if let Some(repr_method) = inst.class.find_method("__repr__") {
-                let result = self.invoke_magic(obj, repr_method, &[])?;
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__repr__") } {
+                let result = self.invoke_magic(obj, method_ptr, &[])?;
                 return Ok(result.as_string().clone());
             }
-            Ok(format!("<{} instance>", inst.class.name))
+            let cls_name = &unsafe { read_class(inst.class) }.name;
+            Ok(format!("<{} instance>", cls_name))
         }
         // 内置类型的字符串表示
         _ => Ok(format_builtin(obj)),
@@ -168,16 +176,17 @@ OpCode::GET_INDEX => {
     let obj = self.stack_pop();
     
     match &obj {
-        Object::Instance(inst) => {
-            if let Some(getitem) = inst.class.find_method("__getitem__") {
-                let result = self.invoke_magic(&obj, getitem, &[key])?;
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__getitem__") } {
+                let result = self.invoke_magic(&obj, method_ptr, &[key])?;
                 self.stack_push(result);
             } else {
                 return Err(runtime_error("object is not subscriptable"));
             }
         }
-        Object::List(list) => { /* 内置 list 下标 */ }
-        Object::Dict(dict) => { /* 内置 dict 下标 */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::LIST as u8 => { /* 内置 list 下标 */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::DICT as u8 => { /* 内置 dict 下标 */ }
         _ => return Err(runtime_error("object is not subscriptable")),
     }
 }
@@ -193,19 +202,19 @@ OpCode::CALL => {
     let callee = self.stack_peek(argc);
     
     match callee {
-        Object::Instance(inst) => {
-            if let Some(call_method) = inst.class.find_method("__call__") {
-                let bound = BoundMethod { receiver: callee, method: call_method };
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__call__") } {
+                let bound = alloc_bound_method(callee, method_ptr);
                 // 替换栈上 callee 为 BoundMethod
-                self.stack[self.stack.len() - argc as usize - 1] = 
-                    Object::BoundMethod(Gc::new(bound));
+                self.stack[self.stack.len() - argc as usize - 1] = bound;
                 return self.call_bound_method(argc);
             }
             return Err(runtime_error("object is not callable"));
         }
-        Object::Class(cls) => { /* 类实例化 */ }
-        Object::Closure(closure) => { /* 普通函数调用 */ }
-        Object::BoundMethod(bound) => { /* 方法调用 */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::CLASS as u8 => { /* 类实例化 */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::CLOSURE as u8 => { /* 普通函数调用 */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::BOUND_METHOD as u8 => { /* 方法调用 */ }
         // ...
     }
 }
@@ -219,9 +228,10 @@ OpCode::IN => {
     let item = self.stack_pop();
     
     match &container {
-        Object::Instance(inst) => {
-            if let Some(contains) = inst.class.find_method("__contains__") {
-                let result = self.invoke_magic(&container, contains, &[item])?;
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method("__contains__") } {
+                let result = self.invoke_magic(&container, method_ptr, &[item])?;
                 self.stack_push(result);
             } else {
                 // 回退到迭代检查
@@ -229,9 +239,9 @@ OpCode::IN => {
                 self.stack_push(Object::Bool(found));
             }
         }
-        Object::List(list) => { /* 内置 list in */ }
-        Object::Set(set) => { /* 内置 set in */ }
-        Object::Dict(dict) => { /* 内置 dict in */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::LIST as u8 => { /* 内置 list in */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::SET as u8 => { /* 内置 set in */ }
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::DICT as u8 => { /* 内置 dict in */ }
         _ => return Err(runtime_error("type does not support 'in'")),
     }
 }
@@ -250,10 +260,11 @@ OpCode::INVOKE => {
     // 直接在 receiver 上查找方法并调用
     // 不创建 BoundMethod 中间对象
     match receiver {
-        Object::Instance(inst) => {
-            if let Some(method) = inst.class.find_method(name) {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
+            if let Some(method_ptr) = unsafe { read_class(inst.class).find_method(name) } {
                 // 直接调用，self 绑定在方法内部处理
-                self.invoke_direct(receiver, method, argc)?;
+                self.invoke_direct(receiver, method_ptr, argc)?;
             } else {
                 return Err(runtime_error(format!("no method '{}'", name)));
             }
@@ -266,16 +277,10 @@ OpCode::INVOKE => {
 ### 8. invoke_magic 辅助方法
 
 ```rust
-fn invoke_magic(&mut self, receiver: &Object, method: Gc<Closure>, args: &[Object]) -> Result<Object> {
-    let bound = BoundMethod {
-        receiver: receiver.clone(),
-        method,
-    };
+fn invoke_magic(&mut self, receiver: &Object, method_ptr: *mut MsObjHeader, args: &[Object]) -> Result<Object> {
+    let bound = alloc_bound_method(receiver.clone(), method_ptr);
     
-    // 保存栈状态
-    let stack_len = self.stack.len();
-    
-    self.stack_push(Object::BoundMethod(Gc::new(bound)));
+    self.stack_push(bound);
     for arg in args {
         self.stack_push(arg.clone());
     }

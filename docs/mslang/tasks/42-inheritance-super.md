@@ -85,8 +85,13 @@ OpCode::INHERIT => {
     let child = self.stack_peek_mut(0); // 子类
     
     match (&parent, child) {
-        (Object::Class(parent_cls), Object::Class(child_cls)) => {
-            child_cls.parent = Some(parent_cls.clone());
+        (Object::Ref(parent_ptr), Object::Ref(child_ptr))
+            if unsafe { (*(*parent_ptr)).type_tag } == TypeTag::CLASS as u8
+            && unsafe { (*(*child_ptr)).type_tag } == TypeTag::CLASS as u8 =>
+        {
+            let parent_cls = unsafe { read_class(*parent_ptr) };
+            let child_cls = unsafe { read_class(*child_ptr) };
+            child_cls.parent = Some(*parent_ptr);
             // 继承父类属性
             for (name, value) in &parent_cls.class_attrs {
                 if !child_cls.class_attrs.contains_key(name) {
@@ -105,19 +110,13 @@ VM 初始化时创建 Object 基类：
 
 ```rust
 fn init_object_class(&mut self) {
-    let object_class = Class {
-        name: "Object".to_string(),
-        methods: HashMap::new(),
-        parent: None,
-        class_attrs: HashMap::new(),
-    };
+    let object_class = alloc_class("Object".to_string());
     
-    // Object.__repr__
-    // Object.__eq__
-    // Object.__ne__
-    // 这些方法编译为内置闭包
+    // Object.__repr__、Object.__eq__、Object.__ne__ 编译为内置闭包后
+    // 通过 read_class + methods.insert 注入
     
-    self.object_class = Gc::new(object_class);
+    let Object::Ref(object_ptr) = object_class else { unreachable!() };
+    self.object_class = object_ptr;
 }
 ```
 
@@ -135,23 +134,23 @@ if !has_explicit_parent {
 ### 3. 方法查找（含继承链）
 
 ```rust
-impl Class {
-    fn find_method(&self, name: &str) -> Option<Gc<Closure>> {
-        if let Some(method) = self.methods.get(name) {
-            return Some(method.clone());
+impl MsClass {
+    pub unsafe fn find_method(&self, name: &str) -> Option<*mut MsObjHeader> {
+        if let Some(&ptr) = self.methods.get(name) {
+            return Some(ptr);
         }
-        if let Some(parent) = &self.parent {
-            return parent.find_method(name);
+        if let Some(parent_ptr) = self.parent {
+            return read_class(parent_ptr).find_method(name);
         }
         None
     }
     
-    fn find_class_attr(&self, name: &str) -> Option<Object> {
+    pub unsafe fn find_class_attr(&self, name: &str) -> Option<Object> {
         if let Some(val) = self.class_attrs.get(name) {
             return Some(val.clone());
         }
-        if let Some(parent) = &self.parent {
-            return parent.find_class_attr(name);
+        if let Some(parent_ptr) = self.parent {
+            return read_class(parent_ptr).find_class_attr(name);
         }
         None
     }
@@ -202,12 +201,8 @@ OpCode::GET_SUPER => {
     // 获取 self（当前实例）
     let receiver = self.get_self();
     
-    let bound = BoundMethod {
-        receiver,
-        method,
-    };
-    
-    self.stack_push(Object::BoundMethod(Gc::new(bound)));
+    let bound = alloc_bound_method(receiver, method_ptr);
+    self.stack_push(bound);
 }
 ```
 

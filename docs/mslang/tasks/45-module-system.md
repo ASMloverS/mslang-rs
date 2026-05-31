@@ -85,14 +85,14 @@ struct Module {
 ```rust
 struct ModuleResolver {
     search_paths: Vec<PathBuf>,
-    cache: HashMap<String, Gc<Module>>,
+    cache: HashMap<String, *mut MsObjHeader>,  // 指向 MsModule（TypeTag::MODULE）
 }
 ```
 
 - `search_paths`：初始化时按优先级填入当前目录、stdlib/、MSLANG_PATH
 - `cache`：已加载模块缓存，键为模块路径字符串
 - `resolve(name: &str) -> Result<PathBuf>`：按搜索规则查找模块文件
-- `load(name: &str, vm: &mut VM) -> Result<Gc<Module>>`：编译并执行 .ms 文件，构建 Module 对象
+- `load(name: &str, vm: &mut VM) -> Result<*mut MsObjHeader>`：编译并执行 .ms 文件，构建 Module 对象（TypeTag::MODULE）
 
 ### 3. 编译器改动
 

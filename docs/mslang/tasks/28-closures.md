@@ -17,8 +17,8 @@ Phase 3.2 - 函数 + 闭包
 
 ```
 Closure {
-    function: Gc<Function>
-    upvalues: Vec<Gc<Upvalue>>
+    function: *mut MsObjHeader   // 指向 MsFunction
+    upvalues: Vec<*mut MsObjHeader>  // 每项指向 MsUpvalue
 }
 ```
 
@@ -69,9 +69,26 @@ RuntimeUpvalue {
 
 ## 实现细节
 
-### 1. src/vm/object.rs — RuntimeUpvalue 与 Closure
+### 1. 堆对象布局
+
+引用 [20-object-system-basic](./20-object-system-basic.md) 的 `MsObjHeader` 和 `TypeTag`。本任务新增以下堆对象：
 
 ```rust
+/// Function 堆对象（TypeTag::FUNCTION = 6）
+#[repr(C)]
+pub struct MsFunction {
+    pub header:        MsObjHeader,
+    pub name:          String,
+    pub arity:         usize,
+    pub code:          Vec<u8>,
+    pub constants:     Vec<Object>,
+    pub upvalue_count: usize,
+    pub is_generator:  bool,
+    pub source_file:   Option<String>,
+}
+
+/// RuntimeUpvalue 堆对象（作为 MsUpvalue，TypeTag::ITERATOR 暂借；
+/// MVP 阶段直接用 Box<RuntimeUpvalue> 管理，GC 替换后迁移）
 pub struct RuntimeUpvalue {
     pub location: usize,
     pub closed: Option<Object>,
@@ -107,13 +124,66 @@ impl RuntimeUpvalue {
     }
 }
 
-pub struct Closure {
-    pub function: Gc<Function>,
-    pub upvalues: Vec<Gc<RuntimeUpvalue>>,
+/// Closure 堆对象（TypeTag::CLOSURE = 7）
+#[repr(C)]
+pub struct MsClosure {
+    pub header:   MsObjHeader,
+    pub function: *mut MsObjHeader,          // 指向 MsFunction
+    pub upvalues: Vec<*mut RuntimeUpvalue>,  // MVP：裸指针；GC 阶段迁移为 MsUpvalue 头
 }
 ```
 
-### 2. src/compiler/mod.rs — 编译单元上值追踪
+### 2. 堆分配辅助函数
+
+```rust
+/// 分配 Function 堆对象，返回 Object::Ref。
+pub fn alloc_function(f: MsFunction) -> Object {
+    let obj = Box::new(f);
+    // 修改 header 的 type_tag（MsFunction 的 header 是第一个字段）
+    let ptr = Box::into_raw(obj) as *mut MsObjHeader;
+    unsafe {
+        (*ptr).type_tag = TypeTag::FUNCTION as u8;
+        (*ptr).gc_meta = 0;
+        (*ptr).size = std::mem::size_of::<MsFunction>() as u16;
+        (*ptr).class_ptr = 0;
+    }
+    Object::Ref(ptr)
+}
+
+/// 读取 MsFunction 内容。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_function` 分配的有效 `MsFunction`。
+pub unsafe fn read_function(ptr: *mut MsObjHeader) -> &'static MsFunction {
+    &*(ptr as *const MsFunction)
+}
+
+/// 分配 Closure 堆对象，返回 Object::Ref。
+pub fn alloc_closure(function: *mut MsObjHeader, upvalues: Vec<*mut RuntimeUpvalue>) -> Object {
+    let obj = Box::new(MsClosure {
+        header: MsObjHeader {
+            gc_meta:   0,
+            type_tag:  TypeTag::CLOSURE as u8,
+            size:      std::mem::size_of::<MsClosure>() as u16,
+            _padding:  0,
+            class_ptr: 0,
+        },
+        function,
+        upvalues,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsClosure 内容。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_closure` 分配的有效 `MsClosure`。
+pub unsafe fn read_closure(ptr: *mut MsObjHeader) -> &'static mut MsClosure {
+    &mut *(ptr as *mut MsClosure)
+}
+```
+
+### 3. src/compiler/mod.rs — 编译单元上值追踪
 
 扩展 `CompilationUnit` 增加上值解析：
 
@@ -146,7 +216,7 @@ impl CompilationUnit {
 }
 ```
 
-### 3. 编译闭包捕获
+### 4. 编译闭包捕获
 
 变量解析优先级调整：
 
@@ -160,19 +230,19 @@ impl CompilationUnit {
 3. 设置 `upvalue_count = sub_unit.upvalues.len()`
 4. 在父编译单元生成 `CLOSURE(func_idx)`，紧跟 `upvalue_count` 个上值操作数
 
-### 4. src/vm/mod.rs — CLOSURE 指令
+### 5. src/vm/mod.rs — CLOSURE 指令
 
 ```rust
 OpCode::CLOSURE => {
     let func_idx = self.read_u16();
-    let func = self.current_frame().function.constants[func_idx as usize].clone();
+    let func_obj = self.current_frame_constants()[func_idx as usize].clone();
 
-    let function = match func {
-        Object::Function(f) => f,
+    let func_ptr = match func_obj {
+        Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::FUNCTION as u8 => ptr,
         _ => return self.runtime_error("CLOSURE expects a Function"),
     };
 
-    let upvalue_count = function.upvalue_count;
+    let upvalue_count = unsafe { read_function(func_ptr) }.upvalue_count;
     let mut upvalues = Vec::with_capacity(upvalue_count);
 
     for _ in 0..upvalue_count {
@@ -185,55 +255,60 @@ OpCode::CLOSURE => {
             let upvalue = self.capture_upvalue(location);
             upvalues.push(upvalue);
         } else {
-            let parent_upvalue = self.current_frame().upvalues[index].clone();
-            upvalues.push(parent_upvalue);
+            let closure_ptr = self.current_frame().closure;
+            let parent_closure = unsafe { read_closure(closure_ptr) };
+            upvalues.push(parent_closure.upvalues[index]);
         }
     }
 
-    let closure = Closure { function, upvalues };
-    self.stack.push(Object::Closure(Gc::new(closure)));
+    let closure_obj = alloc_closure(func_ptr, upvalues);
+    self.stack.push(closure_obj);
 }
 ```
 
-### 5. src/vm/mod.rs — 上值捕获
+### 6. src/vm/mod.rs — 上值捕获
+
+`open_upvalues` 存储 `*mut RuntimeUpvalue`（MVP 阶段，GC 阶段迁移为 `*mut MsObjHeader`）：
 
 ```rust
 impl VM {
-    fn capture_upvalue(&mut self, location: usize) -> Gc<RuntimeUpvalue> {
+    fn capture_upvalue(&mut self, location: usize) -> *mut RuntimeUpvalue {
         for upvalue in &self.open_upvalues {
-            if upvalue.borrow().location == location {
-                return upvalue.clone();
+            if unsafe { (**upvalue).location } == location {
+                return *upvalue;
             }
         }
 
-        let upvalue = Gc::new(RuntimeUpvalue::new(location));
-        self.open_upvalues.push(upvalue.clone());
+        let upvalue = Box::into_raw(Box::new(RuntimeUpvalue::new(location)));
+        self.open_upvalues.push(upvalue);
         upvalue
     }
 }
 ```
 
-### 6. LOAD_UPVALUE / STORE_UPVALUE
+### 7. LOAD_UPVALUE / STORE_UPVALUE
 
 ```rust
 OpCode::LOAD_UPVALUE => {
     let idx = self.read_byte() as usize;
-    let closure = self.current_frame_closure();
-    let upvalue = &closure.upvalues[idx];
-    let value = upvalue.borrow().get(&self.stack);
+    let closure_ptr = self.current_frame().closure;
+    let closure = unsafe { read_closure(closure_ptr) };
+    let upvalue = unsafe { &*closure.upvalues[idx] };
+    let value = upvalue.get(&self.stack);
     self.stack.push(value);
 }
 
 OpCode::STORE_UPVALUE => {
     let idx = self.read_byte() as usize;
     let value = self.stack.last().unwrap().clone();
-    let closure = self.current_frame_closure();
-    let upvalue = closure.upvalues[idx].clone();
-    upvalue.borrow_mut().set(&mut self.stack, value);
+    let closure_ptr = self.current_frame().closure;
+    let closure = unsafe { read_closure(closure_ptr) };
+    let upvalue = unsafe { &mut *closure.upvalues[idx] };
+    upvalue.set(&mut self.stack, value);
 }
 ```
 
-### 7. CLOSE_UPVALUE
+### 8. CLOSE_UPVALUE
 
 ```rust
 OpCode::CLOSE_UPVALUE => {
@@ -252,23 +327,24 @@ fn close_upvalues_from(&mut self, last: usize) {
     let mut i = self.open_upvalues.len();
     while i > 0 {
         i -= 1;
-        let upvalue = &self.open_upvalues[i];
-        if upvalue.borrow().location < last {
+        let upvalue = unsafe { &mut *self.open_upvalues[i] };
+        if upvalue.location < last {
             break;
         }
-        upvalue.borrow_mut().close(&self.stack);
+        upvalue.close(&self.stack);
         self.open_upvalues.remove(i);
     }
 }
 ```
 
-### 8. CALL 指令适配闭包
+### 9. CALL 指令适配闭包
 
 修改 Task 27 的 CALL 指令，增加 Closure 分支：
 
 ```rust
-Object::Closure(closure) => {
-    let func = &closure.function;
+Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::CLOSURE as u8 => {
+    let closure = unsafe { read_closure(ptr) };
+    let func = unsafe { read_function(closure.function) };
     if argc != func.arity {
         return self.runtime_error(
             &format!("expected {} arguments, got {}", func.arity, argc)
@@ -280,25 +356,14 @@ Object::Closure(closure) => {
     }
 
     let stack_base = callee_idx;
-    self.call_stack.push(CallFrame::new_closure(
-        closure.clone(),
+    self.call_stack.push(CallFrame::new(
+        ptr,  // *mut MsObjHeader 指向 MsClosure
         stack_base,
     ));
 }
 ```
 
-同时修改 `CallFrame`，将 `function` 替换为 `closure`：
-
-```rust
-pub struct CallFrame {
-    pub closure: Gc<Closure>,
-    pub ip: usize,
-    pub stack_base: usize,
-    pub defer_stack_base: usize,
-}
-```
-
-读取字节码和常量池改为从 `closure.function` 获取。顶层脚本也包装为无上值的 Closure。
+同时修改 `CallFrame`，将 `closure` 字段类型固定为 `*mut MsObjHeader`（已在 task 27 完成）。读取字节码和常量池改为从 `closure.function`（MsFunction）获取。顶层脚本也包装为无上值的 Closure。
 
 ## 验证标准
 

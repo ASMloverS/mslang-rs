@@ -30,7 +30,7 @@ pub enum TokenKind {
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
-    Class, Self, Super,
+    Class, Zelf, Super,
     True, False, Nil,
     And, Or, Not,
     Try, Except, Finally, Defer, With, Throw,
@@ -128,7 +128,9 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Identifier(v) => write!(f, "Identifier(\"{}\")", v),
             TokenKind::Plus => write!(f, "+"),
             TokenKind::DoubleSlash => write!(f, "//"),
-            // ... 所有变体
+            // 关键字变体名与词素不同时需显式映射，例如：
+            TokenKind::Zelf => write!(f, "self"),
+            // ... 其余变体
             TokenKind::Eof => write!(f, "EOF"),
         }
     }
@@ -170,7 +172,7 @@ pub fn keyword_table() -> HashMap<&'static str, TokenKind> {
     m.insert("break", TokenKind::Break);
     m.insert("continue", TokenKind::Continue);
     m.insert("class", TokenKind::Class);
-    m.insert("self", TokenKind::Self);
+    m.insert("self", TokenKind::Zelf);
     m.insert("super", TokenKind::Super);
     m.insert("true", TokenKind::True);
     m.insert("false", TokenKind::False);
@@ -210,7 +212,7 @@ pub fn reserved_words() -> &'static [&'static str] {
 
 - [ ] 3 种字面量类型：Int, Float, String
 - [ ] Identifier
-- [ ] 35 个关键字（Var, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue, Class, Self, Super, True, False, Nil, And, Or, Not, Try, Except, Finally, Defer, With, Throw, Async, Await, Go, Import, From, As, Yield, Nonlocal）
+- [ ] 35 个关键字（Var, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue, Class, Zelf, Super, True, False, Nil, And, Or, Not, Try, Except, Finally, Defer, With, Throw, Async, Await, Go, Import, From, As, Yield, Nonlocal）
 - [ ] 7 个算术运算符
 - [ ] 6 个比较运算符
 - [ ] 6 个位运算符

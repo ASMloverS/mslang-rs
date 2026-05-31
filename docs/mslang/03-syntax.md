@@ -305,7 +305,7 @@ import_list = IDENTIFIER ("as" IDENTIFIER)? ("," IDENTIFIER ("as" IDENTIFIER)?)*
 import math
 import os.path as pathutil
 from os import path
-from io import open, print as log
+from io import open, read_file
 ```
 
 ### 空语句

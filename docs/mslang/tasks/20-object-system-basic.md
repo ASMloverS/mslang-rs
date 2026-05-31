@@ -8,13 +8,15 @@ Phase 2.3a - 字节码编译 + VM 核心
 
 ## 目标
 
-定义运行时对象系统的基础类型（Nil, Bool, Int, Float, String），包括 Gc<T> 智能指针、Display 实现、真值规则、类型名称和相等性比较。
+定义运行时对象系统的基础类型（Nil, Bool, Int, Float, String），基于 MsObjHeader 对象模型，包括堆对象布局、堆分配辅助函数、Display 实现、真值规则、类型名称和相等性比较。本任务是下游任务（21–55）引用对象模型的规范锚点。
 
 ## 设计规格
 
-引用 [11-bytecode-vm.md](../11-bytecode-vm.md) Object 枚举定义，[02-types.md](../02-types.md) 类型和真值规则。
+引用 [11-bytecode-vm.md](../11-bytecode-vm.md) Object 枚举定义与 MsObjHeader 布局，[14-gc.md](../14-gc.md) TypeTag 枚举，[02-types.md](../02-types.md) 类型和真值规则。
 
-### Object 枚举（基础部分）
+### Object 枚举
+
+来自 [11-bytecode-vm.md](../11-bytecode-vm.md)：
 
 ```rust
 enum Object {
@@ -22,9 +24,52 @@ enum Object {
     Bool(bool),
     Int(i64),
     Float(f64),
-    String(Gc<String>),
-    // 后续任务扩展：
-    // List, Dict, Tuple, Set, Function, Closure, ...
+    Ref(*mut MsObjHeader),   // 引用类型：String/List/Dict/...
+}
+```
+
+基本类型（Nil、Bool、Int、Float）直接内联存储，无需堆分配。所有堆对象统一通过 `Ref(*mut MsObjHeader)` 表示，类型由 `MsObjHeader.type_tag` 区分。
+
+### MsObjHeader 布局
+
+来自 [11-bytecode-vm.md](../11-bytecode-vm.md)，16 bytes：
+
+```
+字节:   0         1         2-3       4-7        8-15
+     ┌─────────┬─────────┬────────┬─────────┬──────────┐
+     │ gc_meta │type_tag │  size  │ padding │class_ptr │
+     │ 1 byte  │ 1 byte  │ 2 byte │ 2 byte  │ 8 byte   │
+     └─────────┴─────────┴────────┴─────────┴──────────┘
+```
+
+- `gc_meta`：GC 元数据（三色标记、代数、finalizer、pin 标志）
+- `type_tag`：类型标签，对应 `TypeTag` 枚举值
+- `size`：对象大小（字节，含头部）
+- `class_ptr`：指向 Class 元数据或类型描述表
+
+### TypeTag 枚举
+
+来自 [14-gc.md](../14-gc.md)：
+
+```rust
+#[repr(u8)]
+enum TypeTag {
+    STRING       = 1,
+    LIST         = 2,
+    DICT         = 3,
+    TUPLE        = 4,
+    SET          = 5,
+    FUNCTION     = 6,
+    CLOSURE      = 7,
+    CLASS        = 8,
+    INSTANCE     = 9,
+    MODULE       = 10,
+    ITERATOR     = 11,
+    GENERATOR    = 12,
+    FUTURE       = 13,
+    CHANNEL      = 14,
+    BOUND_METHOD = 15,
+    LARGE_OBJECT = 0xFF,
 }
 ```
 
@@ -55,63 +100,115 @@ enum Object {
 
 `src/vm/object.rs`
 
-### Gc<T> 智能指针（MVP 简化版）
+### MsObjHeader 结构体
 
 ```rust
-use std::rc::Rc;
-use std::cell::RefCell;
-
-pub struct GcBox<T> {
-    data: T,
-    marked: bool,
-}
-
-pub struct Gc<T> {
-    inner: Rc<RefCell<GcBox<T>>>,
-}
-
-impl<T> Gc<T> {
-    pub fn new(data: T) -> Self {
-        Gc {
-            inner: Rc::new(RefCell::new(GcBox {
-                data,
-                marked: false,
-            })),
-        }
-    }
-
-    pub fn borrow(&self) -> std::cell::Ref<'_, GcBox<T>> {
-        self.inner.borrow()
-    }
-
-    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, GcBox<T>> {
-        self.inner.borrow_mut()
-    }
-}
-
-impl<T: Clone> Clone for Gc<T> {
-    fn clone(&self) -> Self {
-        Gc {
-            inner: Rc::clone(&self.inner),
-        }
-    }
+/// 统一对象头，16 bytes，所有堆对象的公共前缀。
+/// 布局来自 11-bytecode-vm.md；GC 语义见 14-gc.md。
+#[repr(C)]
+pub struct MsObjHeader {
+    pub gc_meta:   u8,   // GC 元数据（三色标记、代数、finalizer、pin）
+    pub type_tag:  u8,   // TypeTag 枚举值
+    pub size:      u16,  // 对象总大小（字节，含头部）
+    pub _padding:  u16,  // 对齐填充，保留
+    pub class_ptr: u64,  // 指向 Class 元数据或类型描述表
 }
 ```
 
-> **注意**：MVP 阶段使用 `Rc<RefCell<>>` 模拟 GC。后续阶段替换为真正的标记-清除 GC（见 [11-bytecode-vm.md](../11-bytecode-vm.md) 垃圾回收章节）。
+### TypeTag 枚举
+
+```rust
+/// 堆对象类型标签。来自 14-gc.md。
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeTag {
+    STRING       = 1,
+    LIST         = 2,
+    DICT         = 3,
+    TUPLE        = 4,
+    SET          = 5,
+    FUNCTION     = 6,
+    CLOSURE      = 7,
+    CLASS        = 8,
+    INSTANCE     = 9,
+    MODULE       = 10,
+    ITERATOR     = 11,
+    GENERATOR    = 12,
+    FUTURE       = 13,
+    CHANNEL      = 14,
+    BOUND_METHOD = 15,
+    LARGE_OBJECT = 0xFF,
+}
+```
 
 ### Object 枚举
 
 ```rust
+/// 运行时值。基本类型内联，堆对象通过 Ref 指针访问。
+/// 来自 11-bytecode-vm.md。
 #[derive(Clone, Debug)]
 pub enum Object {
     Nil,
     Bool(bool),
     Int(i64),
     Float(f64),
-    String(Gc<String>),
+    Ref(*mut MsObjHeader),   // 引用类型：String/List/Dict/...
 }
 ```
+
+### String 堆布局
+
+```rust
+/// 堆上 String 对象的内存布局（MVP：独立数据分配）。
+/// task 52 升级为 header 后紧跟数据的内联布局。
+#[repr(C)]
+pub struct MsStr {
+    pub header:   MsObjHeader,
+    pub data_ptr: *const u8,
+    pub data_len: u32,
+}
+```
+
+### 堆分配辅助函数
+
+这些函数是下游任务（21–51）操作堆对象的 DRY API，无需直接使用裸指针。
+
+```rust
+/// 在堆上分配一个 String 对象，返回 Object::Ref。
+/// MVP：Box 分配；task 52-gc 替换为 TLAB bump 分配。
+pub fn alloc_string(s: &str) -> Object {
+    let bytes: Box<[u8]> = Box::from(s.as_bytes());
+    let data_len = bytes.len() as u32;
+    let data_ptr = Box::into_raw(bytes) as *const u8;
+
+    let ms_str = Box::new(MsStr {
+        header: MsObjHeader {
+            gc_meta:   0,
+            type_tag:  TypeTag::STRING as u8,
+            size:      std::mem::size_of::<MsStr>() as u16,
+            _padding:  0,
+            class_ptr: 0,
+        },
+        data_ptr,
+        data_len,
+    });
+
+    Object::Ref(Box::into_raw(ms_str) as *mut MsObjHeader)
+}
+
+/// 从指向 MsStr 的 Ref 指针读取字符串内容。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_string` 分配的有效 `MsStr`。
+pub unsafe fn read_str(ptr: *mut MsObjHeader) -> &'static str {
+    let ms_str = ptr as *mut MsStr;
+    let data_ptr = (*ms_str).data_ptr;
+    let data_len = (*ms_str).data_len as usize;
+    std::str::from_utf8_unchecked(std::slice::from_raw_parts(data_ptr, data_len))
+}
+```
+
+> **Safety 说明**：这些 unsafe 操作由 task 52-gc 的 GC 基础设施封装；上层任务（21–51）通过辅助函数（`alloc_string`、`read_str` 等）间接操作，无需直接使用裸指针。
 
 ### Display trait
 
@@ -129,7 +226,15 @@ impl std::fmt::Display for Object {
                     write!(f, "{}", n)
                 }
             }
-            Object::String(s) => write!(f, "{}", s.borrow().data),
+            Object::Ref(ptr) => {
+                let tag = unsafe { (**ptr).type_tag };
+                if tag == TypeTag::STRING as u8 {
+                    write!(f, "{}", unsafe { read_str(*ptr) })
+                } else {
+                    // 非 String 的 Ref 类型由后续任务（21+）扩展
+                    write!(f, "<object:{}>", tag)
+                }
+            }
         }
     }
 }
@@ -145,7 +250,14 @@ impl Object {
             Object::Bool(b) => *b,
             Object::Int(n) => *n != 0,
             Object::Float(n) => *n != 0.0,
-            Object::String(s) => !s.borrow().data.is_empty(),
+            Object::Ref(ptr) => {
+                let tag = unsafe { (**ptr).type_tag };
+                if tag == TypeTag::STRING as u8 {
+                    unsafe { !read_str(*ptr).is_empty() }
+                } else {
+                    true
+                }
+            }
         }
     }
 }
@@ -161,7 +273,15 @@ impl Object {
             Object::Bool(_) => "bool",
             Object::Int(_) => "int",
             Object::Float(_) => "float",
-            Object::String(_) => "string",
+            Object::Ref(ptr) => {
+                let tag = unsafe { (**ptr).type_tag };
+                if tag == TypeTag::STRING as u8 {
+                    "string"
+                } else {
+                    // 后续任务扩展其他 Ref 类型的 type_name
+                    "object"
+                }
+            }
         }
     }
 }
@@ -177,8 +297,14 @@ impl PartialEq for Object {
             (Object::Bool(a), Object::Bool(b)) => a == b,
             (Object::Int(a), Object::Int(b)) => a == b,
             (Object::Float(a), Object::Float(b)) => a == b,
-            (Object::String(a), Object::String(b)) => {
-                a.borrow().data == b.borrow().data
+            (Object::Ref(a), Object::Ref(b)) => {
+                let tag_a = unsafe { (**a).type_tag };
+                let tag_b = unsafe { (**b).type_tag };
+                if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
+                    unsafe { read_str(*a) == read_str(*b) }
+                } else {
+                    false
+                }
             }
             (Object::Int(a), Object::Float(b)) => (*a as f64) == *b,
             (Object::Float(a), Object::Int(b)) => *a == (*b as f64),
@@ -206,7 +332,14 @@ impl std::hash::Hash for Object {
                     f.to_bits().hash(state)
                 }
             }
-            Object::String(s) => s.borrow().data.hash(state),
+            Object::Ref(ptr) => {
+                let tag = unsafe { (**ptr).type_tag };
+                if tag == TypeTag::STRING as u8 {
+                    unsafe { read_str(*ptr) }.hash(state)
+                } else {
+                    (*ptr as usize).hash(state)
+                }
+            }
         }
     }
 }
@@ -217,8 +350,8 @@ impl std::hash::Hash for Object {
 1. `Object::Nil.is_truthy()` 返回 `false`
 2. `Object::Int(0).is_truthy()` 返回 `false`
 3. `Object::Int(42).is_truthy()` 返回 `true`
-4. `Object::String("".to_string()).is_truthy()` 返回 `false`
-5. `Object::String("hello".to_string()).is_truthy()` 返回 `true`
+4. `alloc_string("").is_truthy()` 返回 `false`
+5. `alloc_string("hello").is_truthy()` 返回 `true`
 6. `Object::Int(42) == Object::Float(42.0)` 返回 `true`
 7. `Object::Bool(true) == Object::Int(1)` 返回 `false`（不同类型除 int/float 外不等）
 8. 每个类型的 `type_name()` 返回正确字符串
@@ -242,8 +375,8 @@ mod tests {
         assert!(Object::Int(1).is_truthy());
         assert!(!Object::Float(0.0).is_truthy());
         assert!(Object::Float(1.0).is_truthy());
-        assert!(!Object::String(Gc::new(String::new())).is_truthy());
-        assert!(Object::String(Gc::new("hello".to_string())).is_truthy());
+        assert!(!alloc_string("").is_truthy());
+        assert!(alloc_string("hello").is_truthy());
     }
 
     #[test]
@@ -252,7 +385,7 @@ mod tests {
         assert_eq!(Object::Bool(true).type_name(), "bool");
         assert_eq!(Object::Int(42).type_name(), "int");
         assert_eq!(Object::Float(3.14).type_name(), "float");
-        assert_eq!(Object::String(Gc::new("hi".to_string())).type_name(), "string");
+        assert_eq!(alloc_string("hi").type_name(), "string");
     }
 
     #[test]
@@ -265,6 +398,8 @@ mod tests {
         assert_eq!(Object::Float(3.14), Object::Float(3.14));
         assert_ne!(Object::Int(1), Object::Bool(true));
         assert_ne!(Object::Nil, Object::Bool(false));
+        assert_eq!(alloc_string("hello"), alloc_string("hello"));
+        assert_ne!(alloc_string("hello"), alloc_string("world"));
     }
 
     #[test]
@@ -272,7 +407,7 @@ mod tests {
         assert_eq!(format!("{}", Object::Nil), "nil");
         assert_eq!(format!("{}", Object::Bool(true)), "true");
         assert_eq!(format!("{}", Object::Int(42)), "42");
-        assert_eq!(format!("{}", Object::String(Gc::new("hello".to_string()))), "hello");
+        assert_eq!(format!("{}", alloc_string("hello")), "hello");
     }
 
     #[test]

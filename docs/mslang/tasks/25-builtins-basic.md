@@ -158,7 +158,7 @@ fn builtin_println(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 ```rust
 fn builtin_type(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("type() requires 1 argument")?;
-    Ok(Object::String(Gc::new(arg.type_name().to_string())))
+    Ok(alloc_string(arg.type_name()))
 }
 ```
 
@@ -168,11 +168,23 @@ fn builtin_type(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 fn builtin_len(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("len() requires 1 argument")?;
     match arg {
-        Object::String(s) => Ok(Object::Int(s.borrow().data.len() as i64)),
-        Object::List(items) => Ok(Object::Int(items.borrow().data.len() as i64)),
-        Object::Dict(map) => Ok(Object::Int(map.borrow().data.len() as i64)),
-        Object::Tuple(items) => Ok(Object::Int(items.borrow().data.len() as i64)),
-        Object::Set(items) => Ok(Object::Int(items.borrow().data.inner.len() as i64)),
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            let len = if tag == TypeTag::STRING as u8 {
+                unsafe { read_str(*ptr) }.len()
+            } else if tag == TypeTag::LIST as u8 {
+                unsafe { read_list(*ptr) }.len()
+            } else if tag == TypeTag::DICT as u8 {
+                unsafe { read_dict(*ptr) }.len()
+            } else if tag == TypeTag::TUPLE as u8 {
+                unsafe { read_tuple(*ptr) }.len()
+            } else if tag == TypeTag::SET as u8 {
+                unsafe { read_set(*ptr) }.len()
+            } else {
+                return Err(format!("TypeError: object of type '{}' has no len()", arg.type_name()));
+            };
+            Ok(Object::Int(len as i64))
+        }
         _ => Err(format!("TypeError: object of type '{}' has no len()", arg.type_name())),
     }
 }
@@ -193,7 +205,7 @@ fn builtin_float(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 
 fn builtin_str(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("str() requires 1 argument")?;
-    Ok(arg.to_str())
+    Ok(arg.to_str())  // to_str() 内部调用 alloc_string（参照 task 21）
 }
 
 fn builtin_bool(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
@@ -245,9 +257,9 @@ fn builtin_min(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 fn builtin_sum(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("sum() requires 1 argument")?;
     match arg {
-        Object::List(items) => {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::LIST as u8 => {
             let mut total = Object::Int(0);
-            for item in &items.borrow().data {
+            for item in unsafe { read_list(*ptr) }.iter() {
                 total = total.add(item)?;
             }
             Ok(total)

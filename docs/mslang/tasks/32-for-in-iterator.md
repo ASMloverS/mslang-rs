@@ -99,26 +99,41 @@ for_stmt = "for" IDENTIFIER "in" expression block
 OpCode::ITERATOR => {
     let iterable = self.stack_pop();
     let iter = match &iterable {
-        Object::List(_) => IteratorKind::List(ListIterator::new(list)),
-        Object::Tuple(_) => IteratorKind::Tuple(TupleIterator::new(tuple)),
-        Object::Dict(_) => IteratorKind::Dict(DictKeyIterator::new(dict)),
-        Object::Set(_) => IteratorKind::Set(SetIterator::new(set)),
-        Object::String(_) => IteratorKind::String(CharIterator::new(string)),
-        Object::Range(_) => IteratorKind::Range(RangeIterator::new(range)),
-        Object::Generator(_) => IteratorKind::Generator(gen),
-        other => {
-            // 尝试调用 __iter__() 方法
-            if let Some(iter_method) = get_method(other, "__iter__") {
-                let result = call_method(iter_method, &[]);
-                IteratorKind::Custom(result)
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                IteratorKind::List(ListIterator::new(ptr))
+            } else if tag == TypeTag::TUPLE as u8 {
+                IteratorKind::Tuple(TupleIterator::new(ptr))
+            } else if tag == TypeTag::DICT as u8 {
+                IteratorKind::Dict(DictKeyIterator::new(ptr))
+            } else if tag == TypeTag::SET as u8 {
+                IteratorKind::Set(SetIterator::new(ptr))
+            } else if tag == TypeTag::STRING as u8 {
+                IteratorKind::String(CharIterator::new(ptr))
+            } else if tag == TypeTag::ITERATOR as u8 {
+                IteratorKind::Range(RangeIterator::new(ptr))
+            } else if tag == TypeTag::GENERATOR as u8 {
+                IteratorKind::Generator(ptr)
             } else {
-                return Err(MspError::RuntimeError {
-                    message: format!("type '{}' is not iterable", type_name(other)),
-                });
+                // 尝试调用 __iter__() 方法
+                if let Some(iter_method) = get_method(&iterable, "__iter__") {
+                    let result = call_method(iter_method, &[]);
+                    IteratorKind::Custom(result)
+                } else {
+                    return Err(MspError::RuntimeError {
+                        message: format!("type '{}' is not iterable", type_name(&iterable)),
+                    });
+                }
             }
         }
+        other => {
+            return Err(MspError::RuntimeError {
+                message: format!("type '{}' is not iterable", type_name(other)),
+            });
+        }
     };
-    self.stack_push(Object::Iterator(Gc::new(Iterator::new(iter))));
+    self.stack_push(alloc_iterator(IteratorState::from(iter)));
 }
 ```
 
@@ -167,7 +182,7 @@ enum IteratorKind {
     Set(SetIterator),
     String(CharIterator),
     Range(RangeIterator),
-    Generator(Gc<Generator>),
+    Generator(*mut MsObjHeader),  // 指向 MsGenerator（TypeTag::GENERATOR）
     Custom(Object),
 }
 

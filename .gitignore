@@ -30,3 +30,6 @@ Desktop.ini
 *.profraw
 *.profdata
 coverage/
+
+# Claude & Agent
+.claude

@@ -34,8 +34,10 @@ AWAIT 流程：
 ### EventLoop
 
 ```rust
+use std::collections::VecDeque;
+
 struct EventLoop {
-    ready_queue: Vec<Coroutine>,
+    ready_queue: VecDeque<Coroutine>,  // FIFO：pop_front 取协程，push 追加
     paused: Vec<PausedCoroutine>,
 }
 ```
@@ -55,7 +57,7 @@ struct Coroutine {
 ```rust
 struct PausedCoroutine {
     coroutine: Coroutine,
-    waiting_on: Gc<Future>,
+    waiting_on: *mut MsObjHeader,  // 指向 MsFuture（TypeTag::FUTURE）
 }
 ```
 
@@ -85,7 +87,7 @@ enum FutureState {
 
 struct Future {
     state: RefCell<FutureState>,
-    waiters: RefCell<Vec<Gc<Coroutine>>>,
+    waiters: RefCell<Vec<*mut MsObjHeader>>,  // 每项指向 MsCoroutine（TypeTag::FUTURE 的等待者）
 }
 ```
 
@@ -108,19 +110,19 @@ struct Future {
 
 ```rust
 if function.is_async {
-    // 创建 Future
-    let future = Future::new();
-    let future_gc = Gc::new(future);
+    // 创建 Future（Object::Ref，TypeTag::FUTURE）
+    let future_obj = alloc_future(Future::new());
+    let Object::Ref(future_ptr) = future_obj.clone() else { unreachable!() };
 
     // 创建协程执行函数体
     let coroutine = Coroutine::new(call_frame);
-    coroutine.future = Some(future_gc.clone());
+    unsafe { read_coroutine(coroutine_ptr) }.future = Some(future_ptr);
 
     // 将协程加入就绪队列
-    vm.event_loop.ready_queue.push(coroutine);
+    vm.event_loop.ready_queue.push(coroutine_ptr);
 
     // 返回 Future 给调用者
-    self.stack.push(Object::Future(future_gc));
+    self.stack.push(future_obj);
 } else {
     // 普通 CALL
 }
@@ -147,13 +149,14 @@ OpCode::AWAIT => {
             // 快照当前帧
             let frame_snapshot = self.current_frame().clone();
 
-            // 创建暂停协程
+            // 创建暂停协程（MVP：直接用 Coroutine 结构体，GC 阶段迁移为 MsObjHeader）
             let paused = PausedCoroutine {
                 coroutine: Coroutine {
                     frame: frame_snapshot,
                     defer_stack: self.defer_stack.clone(),
+                    tlab: TLAB::empty(),
                 },
-                waiting_on: future.clone(),
+                waiting_on: future_ptr,  // *mut MsObjHeader 指向 MsFuture
             };
             self.event_loop.paused.push(paused);
 
@@ -172,7 +175,7 @@ OpCode::AWAIT => {
 impl EventLoop {
     fn new() -> Self {
         Self {
-            ready_queue: Vec::new(),
+            ready_queue: VecDeque::new(),
             paused: Vec::new(),
         }
     }
@@ -213,7 +216,7 @@ impl EventLoop {
         // 检查暂停列表，唤醒等待的协程
         let mut still_paused = Vec::new();
         for paused in self.paused.drain(..) {
-            if paused.waiting_on.state() == FutureState::Resolved(_) {
+            if matches!(paused.waiting_on.state(), FutureState::Resolved(_)) {
                 // 唤醒：将结果放入栈
                 self.ready_queue.push(paused.coroutine);
             } else {

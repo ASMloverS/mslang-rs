@@ -24,7 +24,7 @@ struct VM {
     call_stack: Vec<CallFrame>,
     globals: HashMap<String, Object>,
     defer_stack: Vec<DeferEntry>,
-    open_upvalues: Vec<Gc<Upvalue>>,
+    open_upvalues: Vec<*mut RuntimeUpvalue>,  // MVP：裸指针列表；GC 阶段迁移
     gc: GarbageCollector,
 }
 ```
@@ -33,7 +33,7 @@ struct VM {
 
 ```rust
 struct CallFrame {
-    closure: Gc<Closure>,
+    closure: *mut MsObjHeader,  // 指向 MsClosure（task 28 定义）
     ip: usize,
     stack_base: usize,
     defer_stack_base: usize,
@@ -236,7 +236,9 @@ impl VM {
                     let name_idx = self.read_u16() as usize;
                     let frame = self.frames.last().unwrap();
                     let name = match &frame.chunk.constants[name_idx] {
-                        Object::String(s) => s.borrow().data.clone(),
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+                            unsafe { read_str(*ptr) }.to_owned()
+                        }
                         _ => return Err("Invalid global name".to_string()),
                     };
                     let value = self.globals.get(&name)
@@ -249,7 +251,9 @@ impl VM {
                     let name_idx = self.read_u16() as usize;
                     let frame = self.frames.last().unwrap();
                     let name = match &frame.chunk.constants[name_idx] {
-                        Object::String(s) => s.borrow().data.clone(),
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+                            unsafe { read_str(*ptr) }.to_owned()
+                        }
                         _ => return Err("Invalid global name".to_string()),
                     };
                     let value = self.pop();

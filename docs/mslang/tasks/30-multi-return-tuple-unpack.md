@@ -71,7 +71,7 @@ t = (1, 2, 3)
 
 ### 1. Tuple 对象
 
-在 `Object` 枚举中已有 `Tuple(Gc<Vec<Object>>)` 变体（参照 [11-bytecode-vm](../11-bytecode-vm.md) § 对象系统）。需实现：
+Tuple 通过 `Object::Ref(*mut MsObjHeader)` + `TypeTag::TUPLE` 存储（参照 [20-object-system-basic](./20-object-system-basic.md) 及 [22-object-system-collections](./22-object-system-collections.md) 的 `alloc_tuple`/`read_tuple`）。需实现：
 
 ```rust
 impl Object {
@@ -92,7 +92,7 @@ OpCode::BUILD_TUPLE => {
     let count = self.read_byte() as usize;
     let start = self.stack.len() - count;
     let elements: Vec<Object> = self.stack.drain(start..).collect();
-    self.stack.push(Object::Tuple(Gc::new(elements)));
+    self.stack.push(alloc_tuple(elements));
 }
 ```
 
@@ -103,8 +103,17 @@ OpCode::UNPACK => {
     let count = self.read_byte() as usize;
     let iterable = self.stack.pop().unwrap();
 
-    let elements = match &iterable {
-        Object::Tuple(t) | Object::List(t) => t.iter().cloned().collect(),
+    let elements: Vec<Object> = match &iterable {
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::TUPLE as u8 {
+                unsafe { read_tuple(*ptr) }.clone()
+            } else if tag == TypeTag::LIST as u8 {
+                unsafe { read_list(*ptr) }.clone()
+            } else {
+                return self.runtime_error("cannot unpack non-iterable")
+            }
+        }
         _ => return self.runtime_error("cannot unpack non-iterable"),
     };
 

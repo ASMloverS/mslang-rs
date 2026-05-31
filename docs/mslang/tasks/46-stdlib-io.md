@@ -40,7 +40,7 @@ FileHandle 需实现 `__enter__` / `__exit__` 魔术方法以支持 `with` 语�
 `src/vm/stdlib.rs` 中注册 `io` 模块：
 
 ```rust
-fn register_io_module(vm: &mut VM) -> Gc<Module> {
+fn register_io_module(vm: &mut VM) -> *mut MsObjHeader {  // 返回指向 MsModule 的指针
     let mut exports = HashMap::new();
     exports.insert("open".into(), Object::NativeFn(native_io_open));
     exports.insert("read_file".into(), Object::NativeFn(native_io_read_file));
@@ -87,7 +87,7 @@ fn native_io_open(vm: &mut VM, args: Vec<Object>) -> Result<Object> {
     let mode = if args.len() > 1 { expect_string(&args[1])? } else { "r" };
     let file = std::fs::File::open(&path)?;  // 或 OpenOptions
     let handle = FileHandle::new(path, mode, file);
-    Ok(Object::FileHandle(Gc::new(handle)))
+    Ok(alloc_file_handle(handle))  // 返回 Object::Ref，type_tag 为自定义扩展标签
 }
 ```
 
@@ -97,7 +97,7 @@ fn native_io_open(vm: &mut VM, args: Vec<Object>) -> Result<Object> {
 fn native_io_read_file(vm: &mut VM, args: Vec<Object>) -> Result<Object> {
     let path = expect_string(&args[0])?;
     let content = std::fs::read_to_string(&path)?;
-    Ok(Object::String(Gc::new(content)))
+    Ok(alloc_string(&content))
 }
 
 fn native_io_write_file(vm: &mut VM, args: Vec<Object>) -> Result<Object> {

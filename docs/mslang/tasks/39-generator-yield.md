@@ -99,9 +99,12 @@ OpCode::CALL => {
     let argc = self.read_byte();
     let callee = self.stack_peek(argc);
     
-    if let Object::Closure(closure) = callee {
-        if closure.function.is_generator {
-            return self.call_generator(closure, argc);
+    if let Object::Ref(ptr) = callee {
+        if unsafe { (*ptr).type_tag } == TypeTag::CLOSURE as u8 {
+            let func = unsafe { read_function(unsafe { read_closure(ptr) }.function) };
+            if func.is_generator {
+                return self.call_generator(ptr, argc);
+            }
         }
     }
     // 普通函数调用
@@ -110,10 +113,10 @@ OpCode::CALL => {
 ```
 
 ```rust
-fn call_generator(&mut self, closure: Gc<Closure>, argc: u8) -> Result<()> {
+fn call_generator(&mut self, closure_ptr: *mut MsObjHeader, argc: u8) -> Result<()> {
     // 创建独立的 CallFrame
     let frame = CallFrame {
-        closure: closure.clone(),
+        closure: closure_ptr,
         ip: 0,
         stack_base: self.stack.len(),
         defer_stack_base: self.defer_stack.len(),
@@ -125,17 +128,19 @@ fn call_generator(&mut self, closure: Gc<Closure>, argc: u8) -> Result<()> {
         gen_stack.push(self.stack_peek(argc as usize - i));
     }
     
-    let generator = Generator {
+    let closure = unsafe { read_closure(closure_ptr) };
+    let func = unsafe { read_function(closure.function) };
+    let generator = MsGenerator {
         frame,
         stack: gen_stack,
-        locals: vec![Object::Nil; closure.function.locals_count],
+        locals: vec![Object::Nil; func.locals_count],
         state: GeneratorState::Suspended,
         receiver: None,  // yield from 用的子迭代器
     };
     
     // 弹出 callee 和参数，压入 Generator
     for _ in 0..=argc as usize { self.stack_pop(); }
-    self.stack_push(Object::Generator(Gc::new(generator)));
+    self.stack_push(alloc_generator(generator));
     Ok(())
 }
 ```
@@ -240,11 +245,11 @@ OpCode::FOR_ITER => {
     let iter = self.stack_peek_mut(0);
     
     match iter {
-        Object::Generator(gen) => {
-            match self.resume_generator(gen) {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::GENERATOR as u8 => {
+            match self.resume_generator(*ptr) {
                 Ok(value) => self.stack_push(value),
                 Err(StopIteration) => {
-                    gen.state = GeneratorState::Exhausted;
+                    unsafe { read_generator(*ptr) }.state = GeneratorState::Exhausted;
                     self.stack_pop(); // 弹出 generator
                     self.ip += offset as usize;
                 }

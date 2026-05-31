@@ -89,7 +89,11 @@
 | 50 | [内置类型方法 - String](50-builtin-methods-string.md) | ⬜ |
 | 51 | [内置类型方法 - List/Dict/Set](51-builtin-methods-list-dict-set.md) | ⬜ |
 
-> **C API 任务（待创建）**：设计规格见 [13-capi](../13-capi.md)。计划拆分为 VM 生命周期与值操作、函数调用/异常/模块注册、Class 操作与 GC 交互三个任务。
+| 59 | C API — VM 生命周期与值操作（待创建） | ⬜ |
+| 60 | C API — 函数调用/异常/模块注册（待创建） | ⬜ |
+| 61 | C API — Class 操作与 GC 交互（待创建） | ⬜ |
+
+> 设计规格见 [13-capi](../13-capi.md)。
 
 ## Phase 7 — 并发
 
@@ -101,7 +105,13 @@
 
 ## Phase 7.5 — 并发 GC 优化（待创建）
 
-> 任务文件待创建。设计规格见 [14-gc](../14-gc.md) Phase 7.5。
+| # | 任务 | 状态 |
+|---|---|---|
+| 62 | 并发标记（tri-color + 写屏障）（待创建） | ⬜ |
+| 63 | 并发清扫与 Compaction（待创建） | ⬜ |
+| 64 | GC 调优接口与 gc.ms 模块（待创建） | ⬜ |
+
+> 设计规格见 [14-gc](../14-gc.md) Phase 7.5。
 
 ## Phase 8 — REPL + 工具链
 

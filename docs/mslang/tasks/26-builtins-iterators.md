@@ -52,17 +52,15 @@ Phase 2.5b - 字节码编译 + VM 核心
 ### 文件位置
 
 `src/vm/builtins.rs`（扩展任务 25）
-`src/vm/object.rs`（添加 Iterator 变体）
+`src/vm/object.rs`（添加 MsIterator 堆对象）
 
-### Object 枚举扩展
+### 对象模型说明
+
+迭代器以 `Object::Ref(*mut MsObjHeader)` 存储，type_tag 为 `TypeTag::ITERATOR`。内部状态封装于 `MsIterator` 堆对象，引用 [20-object-system-basic](./20-object-system-basic.md) 的 `MsObjHeader`。
+
+### MsIterator 堆对象与分配
 
 ```rust
-#[derive(Clone, Debug)]
-pub enum Object {
-    // ... 已有变体 ...
-    Iterator(Gc<IteratorState>),
-}
-
 #[derive(Clone, Debug)]
 pub enum IteratorState {
     Range {
@@ -93,6 +91,35 @@ pub enum IteratorState {
         items: Vec<Object>,
         index: usize,
     },
+}
+
+#[repr(C)]
+pub struct MsIterator {
+    pub header: MsObjHeader,
+    pub state:  IteratorState,
+}
+
+/// 分配 Iterator 堆对象，返回 Object::Ref。
+pub fn alloc_iterator(state: IteratorState) -> Object {
+    let obj = Box::new(MsIterator {
+        header: MsObjHeader {
+            gc_meta:   0,
+            type_tag:  TypeTag::ITERATOR as u8,
+            size:      std::mem::size_of::<MsIterator>() as u16,
+            _padding:  0,
+            class_ptr: 0,
+        },
+        state,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsIterator 的可变状态引用。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_iterator` 分配的有效 `MsIterator`。
+pub unsafe fn read_iterator(ptr: *mut MsObjHeader) -> &'static mut MsIterator {
+    &mut *(ptr as *mut MsIterator)
 }
 ```
 
@@ -128,7 +155,7 @@ impl IteratorState {
                 if *index < chars.len() {
                     let ch = chars[*index];
                     *index += 1;
-                    Some(Object::String(Gc::new(ch.to_string())))
+                    Some(alloc_string(&ch.to_string()))
                 } else {
                     None
                 }
@@ -147,10 +174,10 @@ impl IteratorState {
             IteratorState::Enumerate { inner, index } => {
                 match inner.next() {
                     Some(val) => {
-                        let tuple = Object::Tuple(Gc::new(vec![
+                        let tuple = alloc_tuple(vec![
                             Object::Int(*index as i64),
                             val,
-                        ]));
+                        ]);
                         *index += 1;
                         Some(tuple)
                     }
@@ -166,7 +193,7 @@ impl IteratorState {
                         None => return None,
                     }
                 }
-                Some(Object::Tuple(Gc::new(values)))
+                Some(alloc_tuple(values))
             }
 
             IteratorState::Reversed { items, index } => {
@@ -187,23 +214,37 @@ impl IteratorState {
 ```rust
 fn to_iterator(obj: &Object) -> Result<IteratorState, String> {
     match obj {
-        Object::List(items) => Ok(IteratorState::ListIter {
-            items: items.borrow().data.clone(),
-            index: 0,
-        }),
-        Object::Tuple(items) => Ok(IteratorState::ListIter {
-            items: items.borrow().data.clone(),
-            index: 0,
-        }),
-        Object::String(s) => Ok(IteratorState::StringIter {
-            chars: s.borrow().data.chars().collect(),
-            index: 0,
-        }),
-        Object::Dict(map) => Ok(IteratorState::DictKeys {
-            keys: map.borrow().data.keys().cloned().collect(),
-            index: 0,
-        }),
-        Object::Iterator(state) => Ok(state.borrow().data.clone()),
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                Ok(IteratorState::ListIter {
+                    items: unsafe { read_list(*ptr) }.clone(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::TUPLE as u8 {
+                Ok(IteratorState::ListIter {
+                    items: unsafe { read_tuple(*ptr) }.clone(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::STRING as u8 {
+                Ok(IteratorState::StringIter {
+                    chars: unsafe { read_str(*ptr) }.chars().collect(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::DICT as u8 {
+                Ok(IteratorState::DictKeys {
+                    keys: unsafe { read_dict(*ptr) }.keys().cloned().collect(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::ITERATOR as u8 {
+                Ok(unsafe { read_iterator(*ptr) }.state.clone())
+            } else {
+                Err(format!(
+                    "TypeError: '{}' object is not iterable",
+                    obj.type_name()
+                ))
+            }
+        }
         _ => Err(format!(
             "TypeError: '{}' object is not iterable",
             obj.type_name()
@@ -237,11 +278,11 @@ fn builtin_range(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
         }
         _ => return Err("range() requires 1-3 arguments".to_string()),
     };
-    Ok(Object::Iterator(Gc::new(IteratorState::Range {
+    Ok(alloc_iterator(IteratorState::Range {
         current: start,
         end,
         step,
-    })))
+    }))
 }
 
 fn int_arg(obj: &Object, ctx: &str) -> Result<i64, String> {
@@ -258,8 +299,19 @@ fn int_arg(obj: &Object, ctx: &str) -> Result<i64, String> {
 fn builtin_sorted(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("sorted() requires 1 argument")?;
     let mut items = match arg {
-        Object::List(items) => items.borrow().data.clone(),
-        Object::Tuple(items) => items.borrow().data.clone(),
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                unsafe { read_list(*ptr) }.clone()
+            } else if tag == TypeTag::TUPLE as u8 {
+                unsafe { read_tuple(*ptr) }.clone()
+            } else {
+                return Err(format!(
+                    "TypeError: '{}' object is not iterable",
+                    arg.type_name()
+                ))
+            }
+        }
         _ => {
             return Err(format!(
                 "TypeError: '{}' object is not iterable",
@@ -277,7 +329,7 @@ fn builtin_sorted(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
             _ => std::cmp::Ordering::Equal,
         }
     });
-    Ok(Object::List(Gc::new(items)))
+    Ok(alloc_list(items))
 }
 ```
 
@@ -287,10 +339,10 @@ fn builtin_sorted(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 fn builtin_enumerate(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("enumerate() requires 1 argument")?;
     let inner = to_iterator(arg)?;
-    Ok(Object::Iterator(Gc::new(IteratorState::Enumerate {
+    Ok(alloc_iterator(IteratorState::Enumerate {
         inner: Box::new(inner),
         index: 0,
-    })))
+    }))
 }
 
 fn builtin_zip(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
@@ -299,9 +351,9 @@ fn builtin_zip(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     }
     let iterators: Result<Vec<IteratorState>, String> =
         args.iter().map(|a| to_iterator(a)).collect();
-    Ok(Object::Iterator(Gc::new(IteratorState::Zip {
+    Ok(alloc_iterator(IteratorState::Zip {
         iterators: iterators?,
-    })))
+    }))
 }
 ```
 
@@ -311,8 +363,19 @@ fn builtin_zip(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 fn builtin_reversed(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("reversed() requires 1 argument")?;
     let items = match arg {
-        Object::List(items) => items.borrow().data.clone(),
-        Object::Tuple(items) => items.borrow().data.clone(),
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                unsafe { read_list(*ptr) }.clone()
+            } else if tag == TypeTag::TUPLE as u8 {
+                unsafe { read_tuple(*ptr) }.clone()
+            } else {
+                return Err(format!(
+                    "TypeError: '{}' object is not reversible",
+                    arg.type_name()
+                ))
+            }
+        }
         _ => {
             return Err(format!(
                 "TypeError: '{}' object is not reversible",
@@ -320,10 +383,11 @@ fn builtin_reversed(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
             ))
         }
     };
-    Ok(Object::Iterator(Gc::new(IteratorState::Reversed {
+    let len = items.len();
+    Ok(alloc_iterator(IteratorState::Reversed {
         items,
-        index: items.len(),
-    })))
+        index: len,
+    }))
 }
 ```
 
@@ -374,39 +438,48 @@ fn builtin_all(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 ```rust
 fn builtin_list(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     if args.is_empty() {
-        return Ok(Object::List(Gc::new(Vec::new())));
+        return Ok(alloc_list(Vec::new()));
     }
     let arg = &args[0];
     match arg {
-        Object::String(s) => {
-            let items: Vec<Object> = s
-                .borrow()
-                .data
-                .chars()
-                .map(|c| Object::String(Gc::new(c.to_string())))
-                .collect();
-            Ok(Object::List(Gc::new(items)))
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::STRING as u8 {
+                let items: Vec<Object> = unsafe { read_str(*ptr) }
+                    .chars()
+                    .map(|c| alloc_string(&c.to_string()))
+                    .collect();
+                Ok(alloc_list(items))
+            } else if tag == TypeTag::LIST as u8 {
+                Ok(alloc_list(unsafe { read_list(*ptr) }.clone()))
+            } else if tag == TypeTag::TUPLE as u8 {
+                Ok(alloc_list(unsafe { read_tuple(*ptr) }.clone()))
+            } else {
+                Err(format!("TypeError: cannot convert {} to list", arg.type_name()))
+            }
         }
-        Object::List(items) => {
-            Ok(Object::List(Gc::new(items.borrow().data.clone())))
-        }
-        Object::Tuple(items) => {
-            Ok(Object::List(Gc::new(items.borrow().data.clone())))
-        }
-        _ => Err(format!(
-            "TypeError: cannot convert {} to list",
-            arg.type_name()
-        )),
+        _ => Err(format!("TypeError: cannot convert {} to list", arg.type_name())),
     }
 }
 
 fn builtin_tuple(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     if args.is_empty() {
-        return Ok(Object::Tuple(Gc::new(Vec::new())));
+        return Ok(alloc_tuple(Vec::new()));
     }
     let items = match &args[0] {
-        Object::List(items) => items.borrow().data.clone(),
-        Object::Tuple(items) => items.borrow().data.clone(),
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                unsafe { read_list(*ptr) }.clone()
+            } else if tag == TypeTag::TUPLE as u8 {
+                unsafe { read_tuple(*ptr) }.clone()
+            } else {
+                return Err(format!(
+                    "TypeError: cannot convert {} to tuple",
+                    args[0].type_name()
+                ))
+            }
+        }
         _ => {
             return Err(format!(
                 "TypeError: cannot convert {} to tuple",
@@ -414,25 +487,30 @@ fn builtin_tuple(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
             ))
         }
     };
-    Ok(Object::Tuple(Gc::new(items)))
+    Ok(alloc_tuple(items))
 }
 
 fn builtin_set_fn(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     if args.is_empty() {
-        return Ok(Object::Set(Gc::new(HashSetWrapper {
-            inner: HashSet::new(),
-        })));
+        return Ok(alloc_set(HashSet::new()));
     }
     let mut inner = HashSet::new();
     match &args[0] {
-        Object::List(items) => {
-            for item in &items.borrow().data {
-                inner.insert(item.clone());
-            }
-        }
-        Object::Tuple(items) => {
-            for item in &items.borrow().data {
-                inner.insert(item.clone());
+        Object::Ref(ptr) => {
+            let tag = unsafe { (*(*ptr)).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                for item in unsafe { read_list(*ptr) }.iter() {
+                    inner.insert(item.clone());
+                }
+            } else if tag == TypeTag::TUPLE as u8 {
+                for item in unsafe { read_tuple(*ptr) }.iter() {
+                    inner.insert(item.clone());
+                }
+            } else {
+                return Err(format!(
+                    "TypeError: cannot convert {} to set",
+                    args[0].type_name()
+                ))
             }
         }
         _ => {
@@ -442,7 +520,7 @@ fn builtin_set_fn(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
             ))
         }
     }
-    Ok(Object::Set(Gc::new(HashSetWrapper { inner })))
+    Ok(alloc_set(inner))
 }
 ```
 
@@ -453,14 +531,16 @@ OpCode::Iterator => {
     let iterable = self.pop();
     let iter_state =
         to_iterator(&iterable).map_err(|e| format!("RuntimeError: {}", e))?;
-    self.push(Object::Iterator(Gc::new(iter_state)));
+    self.push(alloc_iterator(iter_state));
 }
 
 OpCode::ForIter => {
     let offset = self.read_u16() as usize;
     let top = self.stack.len() - 1;
     let done = match &mut self.stack[top] {
-        Object::Iterator(state) => state.borrow_mut().data.next().is_none(),
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::ITERATOR as u8 => {
+            unsafe { read_iterator(*ptr) }.state.next().is_none()
+        }
         _ => return Err("RuntimeError: not an iterator".to_string()),
     };
     if done {
@@ -591,8 +671,8 @@ mod tests {
     fn test_enumerate() {
         let inner = IteratorState::ListIter {
             items: vec![
-                Object::String(Gc::new("a".to_string())),
-                Object::String(Gc::new("b".to_string())),
+                alloc_string("a"),
+                alloc_string("b"),
             ],
             index: 0,
         };
@@ -603,10 +683,10 @@ mod tests {
         let first = iter.next().unwrap();
         assert_eq!(
             first,
-            Object::Tuple(Gc::new(vec![
+            alloc_tuple(vec![
                 Object::Int(0),
-                Object::String(Gc::new("a".to_string())),
-            ]))
+                alloc_string("a"),
+            ])
         );
     }
 
@@ -620,8 +700,8 @@ mod tests {
                 },
                 IteratorState::ListIter {
                     items: vec![
-                        Object::String(Gc::new("x".to_string())),
-                        Object::String(Gc::new("y".to_string())),
+                        alloc_string("x"),
+                        alloc_string("y"),
                     ],
                     index: 0,
                 },
@@ -631,10 +711,10 @@ mod tests {
         let first = iter.next().unwrap();
         assert_eq!(
             first,
-            Object::Tuple(Gc::new(vec![
+            alloc_tuple(vec![
                 Object::Int(1),
-                Object::String(Gc::new("x".to_string())),
-            ]))
+                alloc_string("x"),
+            ])
         );
     }
 
@@ -643,14 +723,14 @@ mod tests {
         let mut vm = VM::new();
         vm.register_builtins();
 
-        let result = builtin_any(&mut vm, &[Object::List(Gc::new(vec![
+        let result = builtin_any(&mut vm, &[alloc_list(vec![
             Object::Bool(false), Object::Bool(true),
-        ]))]).unwrap();
+        ])]).unwrap();
         assert_eq!(result, Object::Bool(true));
 
-        let result = builtin_all(&mut vm, &[Object::List(Gc::new(vec![
+        let result = builtin_all(&mut vm, &[alloc_list(vec![
             Object::Bool(true), Object::Bool(false),
-        ]))]).unwrap();
+        ])]).unwrap();
         assert_eq!(result, Object::Bool(false));
     }
 }

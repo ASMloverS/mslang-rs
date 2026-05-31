@@ -36,12 +36,12 @@ class_var  = "var"? IDENTIFIER "=" expression
 ```
 Class {
     name: String
-    methods: HashMap<String, Gc<Closure>>
-    parent: Option<Gc<Class>>
+    methods: HashMap<String, *mut MsObjHeader>  // 每项指向 MsClosure
+    parent: Option<*mut MsObjHeader>             // 指向父类 MsClass，或 null
 }
 
 Instance {
-    class: Gc<Class>
+    class: *mut MsObjHeader   // 指向 MsClass
     fields: HashMap<String, Object>
 }
 ```
@@ -121,7 +121,85 @@ struct ClassVar {
 }
 ```
 
-### 3. 编译 class 定义
+### 3. 堆对象布局
+
+引用 [20-object-system-basic](./20-object-system-basic.md) 的 `MsObjHeader` 和 `TypeTag`。本任务新增：
+
+```rust
+/// Class 堆对象（TypeTag::CLASS = 8）
+#[repr(C)]
+pub struct MsClass {
+    pub header:      MsObjHeader,
+    pub name:        String,
+    pub methods:     HashMap<String, *mut MsObjHeader>,  // 指向 MsClosure
+    pub parent:      Option<*mut MsObjHeader>,           // 指向 MsClass
+    pub class_attrs: HashMap<String, Object>,
+}
+
+/// Instance 堆对象（TypeTag::INSTANCE = 9）
+#[repr(C)]
+pub struct MsInstance {
+    pub header: MsObjHeader,
+    pub class:  *mut MsObjHeader,        // 指向 MsClass
+    pub fields: HashMap<String, Object>,
+}
+```
+
+### 4. 堆分配辅助函数
+
+```rust
+/// 分配 Class 堆对象，返回 Object::Ref。
+pub fn alloc_class(name: String) -> Object {
+    let obj = Box::new(MsClass {
+        header: MsObjHeader {
+            gc_meta:   0,
+            type_tag:  TypeTag::CLASS as u8,
+            size:      std::mem::size_of::<MsClass>() as u16,
+            _padding:  0,
+            class_ptr: 0,
+        },
+        name,
+        methods: HashMap::new(),
+        parent: None,
+        class_attrs: HashMap::new(),
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsClass 内容。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_class` 分配的有效 `MsClass`。
+pub unsafe fn read_class(ptr: *mut MsObjHeader) -> &'static mut MsClass {
+    &mut *(ptr as *mut MsClass)
+}
+
+/// 分配 Instance 堆对象，返回 Object::Ref。
+pub fn alloc_instance(class_ptr: *mut MsObjHeader) -> Object {
+    let obj = Box::new(MsInstance {
+        header: MsObjHeader {
+            gc_meta:   0,
+            type_tag:  TypeTag::INSTANCE as u8,
+            size:      std::mem::size_of::<MsInstance>() as u16,
+            _padding:  0,
+            class_ptr: class_ptr as u64,
+        },
+        class: class_ptr,
+        fields: HashMap::new(),
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsInstance 内容。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_instance` 分配的有效 `MsInstance`。
+pub unsafe fn read_instance(ptr: *mut MsObjHeader) -> &'static mut MsInstance {
+    &mut *(ptr as *mut MsInstance)
+}
+```
+
+### 5. 编译 class 定义
 
 `src/compiler/statement.rs`：
 
@@ -142,51 +220,56 @@ struct ClassVar {
 5. emit STORE_GLOBAL "Animal"    → 存为全局变量
 ```
 
-### 4. CLASS 指令实现
+### 6. CLASS 指令实现
 
 ```rust
 OpCode::CLASS => {
     let name_idx = self.read_u16();
-    let name = &self.constants[name_idx as usize];
-    
-    let class = Class {
-        name: name.clone(),
-        methods: HashMap::new(),
-        parent: None,
+    let name_obj = &self.constants[name_idx as usize];
+    let name = match name_obj {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+            unsafe { read_str(*ptr) }.to_owned()
+        }
+        _ => return self.runtime_error("CLASS expects a string name"),
     };
-    
-    self.stack_push(Object::Class(Gc::new(class)));
+    self.stack_push(alloc_class(name));
 }
 ```
 
-### 5. METHOD 指令实现
+### 7. METHOD 指令实现
 
 ```rust
 OpCode::METHOD => {
     let name_idx = self.read_u16();
-    let name = &self.constants[name_idx as usize];
+    let name = match &self.constants[name_idx as usize] {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+            unsafe { read_str(*ptr) }.to_owned()
+        }
+        _ => return self.runtime_error("METHOD expects a string name"),
+    };
     
-    let method = self.stack_pop(); // Closure
-    let class = self.stack_peek_mut(0); // Class
+    let method = self.stack_pop(); // Object::Ref → MsClosure
+    let class_obj = self.stack_peek_mut(0);
     
-    if let Object::Class(cls) = class {
-        cls.methods.insert(name.clone(), method);
+    if let Object::Ref(cls_ptr) = class_obj {
+        if unsafe { (*(*cls_ptr)).type_tag } == TypeTag::CLASS as u8 {
+            let class = unsafe { read_class(*cls_ptr) };
+            if let Object::Ref(method_ptr) = method {
+                class.methods.insert(name, method_ptr);
+            }
+        }
     }
 }
 ```
 
-### 6. 类实例化（调用 Class）
+### 8. 类实例化（调用 Class）
 
-当 `CALL` 的目标是 `Object::Class` 时：
+当 `CALL` 的目标是 `Object::Ref` 且 type_tag 为 `TypeTag::CLASS` 时：
 
 ```rust
-fn call_class(&mut self, class: Gc<Class>, argc: u8) -> Result<()> {
+fn call_class(&mut self, cls_ptr: *mut MsObjHeader, argc: u8) -> Result<()> {
     // 创建实例
-    let instance = Instance {
-        class: class.clone(),
-        fields: HashMap::new(),
-    };
-    let inst_obj = Object::Instance(Gc::new(instance));
+    let inst_obj = alloc_instance(cls_ptr);
     
     // 弹出 callee（class）和参数
     let args: Vec<Object> = (0..argc).rev()
@@ -198,62 +281,63 @@ fn call_class(&mut self, class: Gc<Class>, argc: u8) -> Result<()> {
     self.stack_push(inst_obj.clone());
     
     // 调用 __init__（如果存在）
-    if let Some(init) = class.methods.get("__init__") {
-        // 绑定 self
-        let bound = BoundMethod {
-            receiver: inst_obj,
-            method: init.clone(),
-        };
-        self.stack_push(Object::BoundMethod(Gc::new(bound)));
+    let class = unsafe { read_class(cls_ptr) };
+    if let Some(init_ptr) = class.methods.get("__init__").copied() {
+        // 绑定 self，构造 BoundMethod（task 41 定义 alloc_bound_method）
+        let bound = alloc_bound_method(inst_obj, init_ptr);
+        self.stack_push(bound);
         for arg in args {
             self.stack_push(arg);
         }
         self.call(argc + 1); // self + args
     }
     
-    // 返回实例（__init__ 执行完毕后实例在栈上）
     Ok(())
 }
 ```
 
-### 7. GET_ATTR / SET_ATTR 实现
+### 9. GET_ATTR / SET_ATTR 实现
 
 ```rust
 OpCode::GET_ATTR => {
     let name_idx = self.read_u16();
-    let name = &self.constants[name_idx as usize];
+    let name = match &self.constants[name_idx as usize] {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+            unsafe { read_str(*ptr) }.to_owned()
+        }
+        _ => return self.runtime_error("GET_ATTR expects a string name"),
+    };
     
     let obj = self.stack_pop();
     match &obj {
-        Object::Instance(inst) => {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
             // 先查实例字段
-            if let Some(val) = inst.fields.get(name) {
+            if let Some(val) = inst.fields.get(&name) {
                 self.stack_push(val.clone());
             }
             // 再查类方法
-            else if let Some(method) = inst.class.find_method(name) {
-                // 返回 BoundMethod
-                let bound = BoundMethod {
-                    receiver: obj,
-                    method: method.clone(),
-                };
-                self.stack_push(Object::BoundMethod(Gc::new(bound)));
+            else if let Some(method_ptr) = unsafe { read_class(inst.class) }.methods.get(&name).copied() {
+                let bound = alloc_bound_method(obj, method_ptr);
+                self.stack_push(bound);
             }
             // 最后查类属性
-            else if let Some(val) = inst.class.get_class_attr(name) {
+            else if let Some(val) = unsafe { read_class(inst.class) }.class_attrs.get(&name) {
                 self.stack_push(val.clone());
             }
             else {
+                let cls_name = &unsafe { read_class(inst.class) }.name;
                 return Err(runtime_error(format!(
-                    "'{}' has no attribute '{}'", inst.class.name, name
+                    "'{}' has no attribute '{}'", cls_name, name
                 )));
             }
         }
-        Object::Class(cls) => {
-            // 访问类方法或类属性
-            if let Some(method) = cls.methods.get(name) {
-                self.stack_push(Object::Closure(method.clone()));
-            } else if let Some(val) = cls.get_class_attr(name) {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::CLASS as u8 => {
+            let cls = unsafe { read_class(*ptr) };
+            if let Some(method_ptr) = cls.methods.get(&name).copied() {
+                let closure_obj = Object::Ref(method_ptr);
+                self.stack_push(closure_obj);
+            } else if let Some(val) = cls.class_attrs.get(&name) {
                 self.stack_push(val.clone());
             } else {
                 return Err(runtime_error(format!(
@@ -261,31 +345,37 @@ OpCode::GET_ATTR => {
                 )));
             }
         }
-        // 其他类型...
         _ => { /* 内置类型的属性 */ }
     }
 }
 
 OpCode::SET_ATTR => {
     let name_idx = self.read_u16();
-    let name = &self.constants[name_idx as usize];
+    let name = match &self.constants[name_idx as usize] {
+        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+            unsafe { read_str(*ptr) }.to_owned()
+        }
+        _ => return self.runtime_error("SET_ATTR expects a string name"),
+    };
     
     let value = self.stack_pop();
     let obj = self.stack_pop();
     
-    if let Object::Instance(inst) = obj {
-        inst.fields.insert(name.clone(), value);
-        self.stack_push(Object::Nil);
-    } else if let Object::Class(cls) = obj {
-        cls.set_class_attr(name.clone(), value);
-        self.stack_push(Object::Nil);
-    } else {
-        return Err(runtime_error("cannot set attribute"));
+    match obj {
+        Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::INSTANCE as u8 => {
+            unsafe { read_instance(ptr) }.fields.insert(name, value);
+            self.stack_push(Object::Nil);
+        }
+        Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::CLASS as u8 => {
+            unsafe { read_class(ptr) }.class_attrs.insert(name, value);
+            self.stack_push(Object::Nil);
+        }
+        _ => return Err(runtime_error("cannot set attribute")),
     }
 }
 ```
 
-### 8. print() 与 __repr__
+### 10. print() 与 __repr__
 
 当 `print(obj)` 时，检查 obj 是否为 Instance 且其 class 有 `__repr__` 方法。如果有，调用 `__repr__` 获取字符串；否则输出默认格式如 `<ClassName instance>`。
 
