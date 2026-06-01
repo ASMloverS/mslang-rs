@@ -126,6 +126,26 @@ for i in countdown(5) {
 - `yield expr` 暂停执行并返回 `expr` 的值
 - 函数体执行完毕时抛出 `StopIteration`
 
+### 生成器资源清理
+
+生成器被 GC 回收但尚未耗尽时，VM 自动注入 `GeneratorExit` 异常（内部异常，不可被用户 `except` 捕获）并恢复生成器帧执行，触发生成器内部的 `defer` 和 `finally` 块执行。这确保文件句柄等资源被正确释放。
+
+```ms
+fn read_lines(path) {
+    with open(path) as f {
+        for line in f.lines() {
+            yield line.strip()
+        }
+    }
+}
+
+gen = read_lines("big.txt")
+gen.__next__()    # 读一行
+gen = nil         # 丢弃生成器 → GC 回收时自动关闭文件
+```
+
+也可手动调用 `gen.close()` 提前关闭生成器（立即触发清理，不等 GC）。
+
 ```ms
 fn fibonacci() {
     a, b = 0, 1

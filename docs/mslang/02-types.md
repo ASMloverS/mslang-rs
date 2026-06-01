@@ -96,7 +96,7 @@ speed = 1.5e8
 **特殊浮点值**：
 - `NaN`：`0.0 / 0.0` 产生 NaN。NaN 不等于任何值（包括自身）：`NaN == NaN` 为 `false`。使用 `x != x` 检测 NaN。
 - `Infinity`：`1.0 / 0.0` 产生正无穷，`-1.0 / 0.0` 产生负无穷。
-- `-0.0`：负零与 `0.0` 相等（`0.0 == -0.0` 为 `true`）。注意：`is` 仅适用于引用类型（堆分配对象）；对内联值（int、float、bool、nil），`is` 退化为值比较（即 `is` 等价于 `==`），因此 `0.0 is -0.0` 为 `true`。
+- `-0.0`：负零与 `0.0` 相等（`0.0 == -0.0` 为 `true`）。
 
 ```
 1 + 2.0   # 3.0 (float)
@@ -185,6 +185,8 @@ person = {
 | 长度 | `d.length()` | 键值对数 |
 
 **访问语义**：`d["key"]` 访问不存在的键返回 `nil`（不抛异常）。`d.remove("key")` 删除不存在的键抛出 `KeyError`。需要区分"键不存在"和"值为 nil"时，使用 `d.contains("key")` 或 `d.get("key", sentinel)`。
+
+> **设计注**：`d["key"]` 返回 nil 的设计意味着无法通过下标操作区分"键不存在"和"值为 nil"两种情况。这是有意的取舍（简化常见路径）。需要严格区分的场景应使用 `d.contains()` 或 `d.get()` with sentinel 模式。
 
 **Dict 保持插入顺序**（与 Python 3.7+ 一致）。
 
@@ -283,12 +285,16 @@ isinstance(a, Object)    # true（所有实例隐式继承 Object）
 |---|---|---|---|
 | int | `+ - * // % ** & \| ^ << >>` | int | int |
 | int | `/` | int | float |
-| int | `+ - * /` | float | float |
+| int | `+ - * / // % **` | float | float |
+| int | `& \| ^ << >>` | float | TypeError |
 | float | `+ - * / // % **` | float | float |
+| float | `& \| ^ << >>` | any | TypeError |
 | string | `+` | string | string（拼接） |
 | string | `*` | int | string（重复） |
 | list | `+` | list | list（拼接） |
 | list | `*` | int | list（重复） |
+
+> **注**：int 与 float 混合的 `//`、`%`、`**` 运算结果为 float。例如 `7 // 2.0` → `3.0`，`2 ** 0.5` → `1.4142...`。位运算符（`& | ^ << >> ~`）仅接受 int 操作数，float 或其他类型操作数抛出 `TypeError`。
 
 ### 比较运算
 
@@ -299,6 +305,24 @@ isinstance(a, Object)    # true（所有实例隐式继承 Object）
 | int | `== !=` | float | 数值比较 |
 | int | `< > <= >=` | float | 数值比较 |
 | 其他不同类型 | 比较 | — | `==` 返回 false，`< >` 抛出运行时错误 |
+
+### `is` 运算符语义
+
+`is` 执行**身份比较**（两个引用是否指向同一个堆对象），仅适用于引用类型（String、List、Dict、Tuple、Set、Instance、Class、Function 等）。
+
+对内联值（int、float、bool、nil），`is` **抛出 `TypeError`**。这些类型没有堆身份的概念，应使用 `==` 进行值比较。
+
+```ms
+a = [1, 2]
+b = [1, 2]
+a == b     # true（值相等）
+a is b     # false（不同对象）
+
+x = 42
+y = 42
+x == y     # true
+x is y     # TypeError: 'is' cannot be used with inline type 'int'
+```
 
 ### 逻辑运算
 

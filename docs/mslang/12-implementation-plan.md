@@ -224,7 +224,7 @@ while i < 5 {
 }
 ```
 
-> **注意**：由于 mslang 支持顶层 await（见 [08-concurrency](08-concurrency.md)），VM 核心需要在初始设计中就支持可暂停的执行帧。建议在 CallFrame 设计时预留帧快照/恢复能力，以便 Phase 7 无缝集成 async/await。
+> **注意**：由于 mslang 支持顶层 await（见 [08-concurrency](08-concurrency.md)），VM 核心需要在初始设计中就支持可暂停的执行帧。`CallFrame` 的值栈必须按帧分段管理，每帧的栈区间 `[stack_base..stack_top)` 可独立复制/恢复（详见 [11-bytecode-vm](11-bytecode-vm.md) CallFrame 章节）。编译器在 `AWAIT` 和 `YIELD` 指令处生成帧快照代码，确保 Phase 7 可直接复用。
 
 ### 2.5 内置函数
 
@@ -501,15 +501,26 @@ while i < 5 {
 
 **验证**：channel 正确传递数据
 
-### 7.3 go 关键字
+### 7.3 select
+
+- [ ] SELECT 指令
+- [ ] 多 channel 同时监听
+- [ ] 随机选择就绪分支
+- [ ] default 非阻塞分支
+- [ ] 空 select 永久阻塞
+
+**验证**：select 正确复用多个 channel
+
+### 7.4 go 关键字
 
 - [ ] GO 指令
 - [ ] 协程启动
+- [ ] JoinHandle 对象（join/is_done/cancel）
 - [ ] 并发执行
 
-**验证**：go 启动的协程并发执行
+**验证**：go 启动的协程并发执行，JoinHandle 可获取返回值
 
-> **注意**：`select`（多 channel 复用）已保留语法但未列入任何 Phase，计划在并发模型稳定后作为 Phase 7 增量实现。
+> **注意**：`select` 已纳入 Phase 7 同步实现（见 7.3 节），而非延后。没有 `select` 会导致超时、多 channel 监听等常见并发模式无法安全表达。
 
 ---
 

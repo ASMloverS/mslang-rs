@@ -25,7 +25,7 @@ nonlocal
 global
 ```
 
-共 **36** 个关键字。
+共 **36** 个关键字。以下标识符暂不是关键字但在当前版本作为保留字处理（不可用作变量名），将在后续 Phase 启用时升级为正式关键字：`select`、`case`、`default`。
 
 ### 标识符
 
@@ -325,12 +325,12 @@ enum TokenKind {
 
 以下标识符暂无语义，但保留给未来版本使用，不可用作变量名：
 
-| 保留字 | 用途 |
-|---|---|
-| `select` | 多 channel 复用（见 [08-concurrency](08-concurrency.md)） |
-| `default` | select 的默认分支 |
-| `case` | select 的 case 分支 |
-| `export` | 模块显式导出（见 [09-modules](09-modules.md)） |
-| `match` | 模式匹配（预留） |
+| 保留字 | 用途 | 状态 |
+|---|---|---|
+| `select` | 多 channel 复用（见 [08-concurrency](08-concurrency.md)） | Phase 7 实现 |
+| `default` | select 的默认分支 | Phase 7 实现 |
+| `case` | select 的 case 分支 | Phase 7 实现 |
+| `export` | 模块显式导出（见 [09-modules](09-modules.md)） | 预留，无实现计划 |
+| `match` | 模式匹配 | 预留，无实现计划 |
 
 > **词法处理**：保留字由关键字查找表统一管理。匹配到保留字时词法分析器报错（"保留字不可用作标识符"）。保留字不需要在 Token 枚举中定义——仅在查找表中标记为"禁止"。

@@ -53,7 +53,9 @@ print(dog)       # "Animal(Dog)"  调用 __repr__
 - 在方法内部通过 `self.attr = val` 设置实例属性
 - `self` 不需要在调用时传入（编译器自动绑定）
 
-> **解析规则**：`self` 在词法层是关键字，但在方法定义的参数列表中有特殊豁免——方法第一个参数位置允许使用 `self` 标识符。编译器对此做特例处理。方法内部的闭包可以捕获 `self` 作为 upvalue：`fn method(self) { return fn() { self.x } }` 中匿名函数通过闭包捕获外层的 `self`。
+> **解析规则**：`self` 在词法层是关键字（不能用作普通变量名），但在方法定义的参数列表第一个位置有特殊豁免——允许使用 `self` 标识符作为方法首参数。这是 `self` 唯一可用作标识符的位置。方法内部的闭包可以捕获 `self` 作为 upvalue：`fn method(self) { return fn() { self.x } }` 中匿名函数通过闭包捕获外层的 `self`。
+>
+> **与 Python 的区别**：Python 中 `self` 仅是约定（可用任意名称），mslang 中 `self` 是关键字。这意味着 `self` 不能在方法参数以外的任何位置用作变量名（赋值目标、for 循环变量等）。
 
 ```ms
 class Point {
@@ -225,10 +227,12 @@ Dog -> Animal -> Object
 | `__add__(self, other)` | `+` |
 | `__sub__(self, other)` | `-` |
 | `__mul__(self, other)` | `*` |
-| `__div__(self, other)` | `/` |（注：mslang 有意采用 `__div__` 而非 Python 的 `__truediv__`，简化运算符协议）
+| `__div__(self, other)` | `/` |
 | `__floordiv__(self, other)` | `//` |
 | `__mod__(self, other)` | `%` |
 | `__pow__(self, other)` | `**` |
+
+> **注**：mslang 有意采用 `__div__` 而非 Python 的 `__truediv__`，简化运算符协议。
 
 ### 容器协议
 

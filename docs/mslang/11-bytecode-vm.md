@@ -127,6 +127,7 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | `FOR_ITER` | `offset(2)` | 迭代下一步，结束则跳转 |
 | `YIELD` | — | yield 暂停 |
 | `YIELD_FROM` | — | yield from 委托 |
+| `CLOSE_GENERATOR` | — | 关闭生成器（注入 GeneratorExit，触发 defer/finally） |
 
 ### 构造器
 
@@ -175,7 +176,7 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | `CHANNEL` | `buffer_size(1)` | 创建 channel |
 | `SEND` | — | channel 发送 |
 | `RECEIVE` | — | channel 接收 |
-| `GO` | — | 启动协程 |
+| `GO` | — | 启动协程，返回 JoinHandle |
 | `AWAIT` | — | await Future |
 | `HALT` | — | 程序结束 |
 
@@ -320,6 +321,8 @@ struct CallFrame {
 }
 ```
 
+> **可暂停帧设计要求**：为支持顶层 `await`（[08-concurrency](08-concurrency.md)）和生成器 `yield`，`CallFrame` 必须能在任意 `AWAIT`/`YIELD` 指令处被快照并稍后恢复。实现方案：`CallFrame` 的所有字段（`ip`、`stack_base`、`defer_stack_base`）均为值类型，可直接复制。帧快照时还需保存该帧在值栈中的 `[stack_base..stack_top)` 区间。生成器对象和 `PausedCoroutine` 持有此快照用于恢复。Phase 2 实现时须确保值栈按帧分段管理（每帧的栈区间独立可复制），避免 Phase 7 大规模重构。
+
 ### 执行循环
 
 ```rust
@@ -460,7 +463,16 @@ PausedCoroutine {
 Coroutine {
     frame: CallFrame                 # 当前执行帧
     defer_stack: Vec<DeferEntry>     # 协程自己的 defer 栈
-    tlab: TLAB                       # 协程私有分配缓冲区
+    tlab: TLAB                       # 协程私有分配缓冲
+    handle: Option<Gc<JoinHandle>>   # 关联的 JoinHandle（无持有者为匿名协程）
+}
+
+JoinHandle {
+    header: MsObjHeader
+    result: Option<Object>           # 协程返回值（完成后设值）
+    error: Option<Object>            # 协程异常（panic 时设值）
+    done: bool                       # 是否已完成
+    waiters: Vec<Coroutine>          # 等待 join 的协程列表
 }
 ```
 

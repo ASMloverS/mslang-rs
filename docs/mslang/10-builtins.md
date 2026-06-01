@@ -48,17 +48,21 @@ isinstance("x", int)     # false
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `print` | `print(*args)` | 打印参数（空格分隔），追加换行 |
-| `println` | `println(*args)` | `print` 的别名（行为完全一致，保留用于兼容） |
+| `println` | `println(*args)` | **已弃用**。`print` 的别名，行为完全一致。推荐统一使用 `print` |
 | `input` | `input(prompt?) -> string` | 读取用户输入 |
+| `open` | `open(path, mode?) -> File` | 打开文件，返回文件对象（支持 `with` 语句） |
 
 ```ms
 print("hello")                  # hello（末尾换行）
 print("a", "b", "c")           # a b c（末尾换行）
-println("a", "b")              # a b（println 是 print 的别名）
-
-> **说明**：`print` 和 `println` 行为完全相同（均追加换行）。推荐统一使用 `print`。
 
 name = input("Enter name: ")   # 带提示的输入
+
+# open() 是全局内置函数，无需 import
+with open("data.txt") as f {
+    content = f.read()
+}
+# open() 等价于 io.open()，后者提供额外的选项
 ```
 
 ### 数学
@@ -88,7 +92,7 @@ round(3.14159, 2)  # 3.14
 |---|---|---|
 | `len` | `len(val) -> int` | 长度 |
 
-`len(val)` 与 `val.length()` 方法等价，返回值相同。推荐使用 `len()` 内置函数（更简洁），`.length()` 方法保持向后兼容。
+`len(val)` 返回长度。推荐使用 `len()` 内置函数。`.length()` 方法作为遗留兼容保留，新代码应统一使用 `len()`。
 
 | `range` | `range(end) -> iterator` | 0 到 end-1 |
 | `range` | `range(start, end) -> iterator` | start 到 end-1 |
@@ -248,8 +252,9 @@ d.merge({"c": 3})      # {"a": 1, "b": 2, "c": 3}
 ```ms
 import io
 
-# 文件操作
-f = io.open("file.txt", "r")    # 打开文件
+# io.open() 提供与全局 open() 相同的文件打开功能
+# 全局 open() 是 io.open() 的快捷方式，无需 import
+f = io.open("file.txt", "r")    # 等价于 open("file.txt", "r")
 content = f.read()              # 读取全部
 lines = f.lines()               # 按行读取
 f.close()                       # 关闭

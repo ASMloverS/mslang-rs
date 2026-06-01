@@ -217,6 +217,7 @@ Error
 ├── message      # 错误消息（string）
 ├── type         # 错误类型名（string）
 ├── traceback    # 堆栈跟踪（string）
+├── __cause__    # 链式异常中的原始异常（Error 或 nil）
 ```
 
 ### 内置异常类型
@@ -233,7 +234,8 @@ Error                      # 所有异常的基类
 ├── IOError                # IO 错误
 ├── ZeroDivisionError      # 除零错误
 ├── OverflowError          # 溢出错误
-└── StopIteration          # 迭代结束
+├── StopIteration          # 迭代结束
+└── GeneratorExit          # 生成器关闭（内部异常，不可被 except 捕获）
 ```
 
 ### 自定义异常类
@@ -272,7 +274,9 @@ fn assert_positive(n) {
 throw_stmt = "throw" expression?
 ```
 
-`throw` 后跟表达式时，表达式应为 Error 实例或子类实例。裸 `throw`（无表达式）用于 re-throw：在 `except` 块内重新抛出当前捕获的异常。在 `except` 块外使用裸 `throw` 抛出 `RuntimeError`。
+- `throw ErrorInstance`：抛出指定 Error 实例
+- `throw "string"`：自动包装为 `RuntimeError(message)`（`message` 为字符串内容）
+- `throw`（无表达式）：在 `except` 块内重新抛出当前捕获的异常；在 `except` 块外抛出 `RuntimeError("nothing to rethrow")`
 
 ### 异常传播
 
@@ -304,6 +308,14 @@ fn copy_file(src, dst) {
 1. defer 在函数**返回前**执行（包括正常返回和异常返回）
 2. 多个 defer 按 **LIFO**（后进先出）顺序执行
 3. defer 的参数在 **defer 声明时**求值，不是在执行时
+
+### defer 异常交互规则
+
+1. **defer 处理器抛出异常**：LIFO 栈中后续的 defer 仍继续执行（不会被跳过）。最后一个 defer 抛出的异常作为函数的最终异常；之前的异常被附加为 `__cause__` 属性（异常链）。
+2. **函数正常返回 + defer 抛异常**：defer 的异常向外传播，函数的返回值被丢弃。
+3. **函数因异常返回 + defer 正常执行**：defer 执行完毕后，原异常继续向外传播。
+4. **函数因异常返回 + defer 也抛异常**：原异常被附加到 defer 异常的 `__cause__` 属性中，defer 异常向外传播。
+5. **defer 不能修改函数的返回值**：defer 在 `return` 求值之后执行，返回值已被保存。
 
 ```ms
 fn example() {

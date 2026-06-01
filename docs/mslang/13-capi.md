@@ -122,6 +122,7 @@ typedef enum MsType {
     MS_TYPE_CHANNEL,
     MS_TYPE_ITERATOR,
     MS_TYPE_BOUND_METHOD,
+    MS_TYPE_JOIN_HANDLE,
 } MsType;
 
 typedef enum MsStatus {
@@ -492,6 +493,7 @@ MS_API void     ms_err_clear(MsVM* vm);
 MS_API const char* ms_err_type_name(MsVM* vm, MsValue* err);
 MS_API const char* ms_err_message(MsVM* vm, MsValue* err);
 MS_API const char* ms_err_traceback(MsVM* vm, MsValue* err);
+MS_API MsValue*    ms_err_cause(MsVM* vm, MsValue* err);
 ```
 
 返回借用引用，仅在 err 存活期间有效。
@@ -654,7 +656,25 @@ MS_API int  ms_gc_is_enabled(MsVM* vm);
 MS_API void ms_gc_set_threshold(MsVM* vm, MsGcType type, double threshold);
 MS_API void ms_gc_set_promotion_age(MsVM* vm, uint32_t age);
 MS_API void ms_gc_set_gc_threads(MsVM* vm, uint32_t threads);
+```
 
+### GC 调试模式
+
+```c
+MS_API void ms_gc_set_debug(MsVM* vm, int enable);
+```
+
+启用 debug 模式后（仅 `debug_assertions` 构建可用），GC 增加以下运行时检查：
+
+- **root/unroot 配对检查**：检测重复 `ms_unroot`、未 root 先 unroot
+- **解引用类型标签校验**：每次通过 `MsValue*` 访问堆对象时验证 `type_tag` 合法
+- **GC 后堆一致性验证**：每次 GC 完成后遍历堆，检查所有可达对象类型标签一致
+
+> debug 模式有显著性能开销，仅用于开发调试。
+
+### GC 统计
+
+```c
 typedef struct MsGcStats {
     uint64_t minor_gc_count;
     uint64_t major_gc_count;

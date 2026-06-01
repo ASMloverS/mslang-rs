@@ -101,9 +101,32 @@ go async_fetch("http://example.com")
 ```
 
 `go` 表达式：
-- 立即返回，不等待协程完成
+- 立即返回一个 **JoinHandle** 对象，不等待协程完成
 - 被启动的协程在事件循环中并发执行
-- 协程的返回值被丢弃（除非通过 channel 传递）
+- 协程的返回值可通过 JoinHandle 获取
+
+### JoinHandle
+
+`go` 返回的 JoinHandle 提供协程生命周期控制：
+
+```ms
+handle = go fn() {
+    return heavy_result()
+}
+
+# 等待协程完成并获取返回值
+result = await handle.join()
+
+# 协程 panic 时，join 抛出对应异常
+```
+
+| 方法 | 说明 |
+|---|---|
+| `await handle.join()` | 等待协程完成，返回结果（或抛出异常） |
+| `handle.is_done()` | 协程是否已完成 |
+| `handle.cancel()` | 请求取消协程（协程在下一个 `await`/channel 操作点终止） |
+
+> **注**：不持有 JoinHandle 的 `go` 协程（如 `go fn() { ... }` 不赋值给变量）返回值被丢弃，panic 不会传播到主协程。
 
 ## Channel
 
@@ -195,6 +218,7 @@ for val in ch {
 - 接收方仍可接收缓冲区中剩余的数据
 - 从已关闭的空 channel 接收返回 `nil`
 - 向已关闭的 channel 发送抛出运行时错误
+- `channel.close()` 是幂等的：重复调用不报错
 
 ```ms
 ch = channel(3)
@@ -211,12 +235,12 @@ for val in ch {
 }
 ```
 
-## select（保留）
+## select（多 channel 复用）
 
-多 channel 复用的 `select` 语法保留给后续版本：
+`select` 语法用于同时等待多个 channel 操作，任一分支就绪即执行：
 
 ```ms
-# 保留语法（暂不实现）
+# select 语法（Phase 7 实现）
 select {
     case val = <-ch1 {
         print("from ch1: " + str(val))
@@ -229,6 +253,13 @@ select {
     }
 }
 ```
+
+### select 语义
+
+- 多个 `case` 分支同时就绪时，**随机选择一个**执行（避免饥饿）
+- `default` 分支在所有 channel 操作均未就绪时立即执行（非阻塞）
+- 无 `default` 时，`select` 阻塞直到某个 case 就绪
+- 空 `select {}`（无任何 case）永久阻塞当前协程
 
 > **注意**：`select`、`case`、`default` 为保留关键字（见 [01-lexical](01-lexical.md)），不可用作变量名。
 
@@ -270,17 +301,17 @@ async fn worker(id) {
 ```ms
 async fn fetch_all(urls) {
     results = []
-    ch = channel(len(urls))
+    handles = []
 
     for url in urls {
-        go fn(u) {
+        handles.push(go fn(u) {
             resp = await http_get(u)
-            ch <- resp
-        }(url)
+            return resp
+        }(url))
     }
 
-    for i in range(len(urls)) {
-        results.push(<-ch)
+    for handle in handles {
+        results.push(await handle.join())
     }
 
     return results
@@ -313,20 +344,37 @@ for item in ch {
 }
 ```
 
+### JoinHandle 示例
+
+```ms
+handles = []
+for i in range(3) {
+    handles.push(go fn(n) {
+        return n * n
+    }(i))
+}
+
+for h in handles {
+    print(await h.join())    # 0, 1, 4
+}
+```
+
 ### 超时控制
 
 ```ms
 async fn fetch_with_timeout(url, timeout_ms) {
     ch = channel(1)
-
-    go fn() {
+    handle = go fn() {
         resp = await http_get(url)
         ch <- resp
-    }()
+    }
 
     go fn() {
         await sleep(timeout_ms)
-        ch <- nil
+        if !ch.closed() {
+            handle.cancel()
+            ch <- nil
+        }
     }()
 
     result = <-ch
