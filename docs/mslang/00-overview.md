@@ -51,7 +51,7 @@ for msg in main_thinking(names) {
 ### 核心特性
 
 - [x] 动态类型系统
-- [x] 变量声明：`x = val` / `var x = val` / `x := val`
+- [x] 变量声明：`x = val` / `var x = val` / `x := val` / `global x`
 - [x] 常量声明：`const NAME = val`
 - [x] 花括号代码块，无分号
 - [x] `#` 行注释

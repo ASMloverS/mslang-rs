@@ -11,6 +11,8 @@ mslang 的并发模型基于 **async/await** 协程，辅以 **channel** 进行�
 | 通信方式 | async/await + channel |
 | 启动并发 | `go fn() { ... }` |
 
+> **设计说明**：mslang 并发模型遵循 CSP（Communicating Sequential Processes）理念——"不要通过共享内存来通信，而要通过通信来共享内存"。协程间共享可变状态无同步保护，应避免直接共享；所有数据交换应通过 channel 进行。
+
 ## async/await
 
 ### async 函数
@@ -121,6 +123,8 @@ ch <- value
 # 接收
 value = <-ch
 ```
+
+> **注意**：channel 的发送和接收操作可能阻塞当前协程。在主脚本顶层（非 `go` 协程）中使用无缓冲 channel 的发送或接收会导致死锁。channel 操作应在 `go` 启动的协程或 `async fn` 中使用。
 
 ### 无缓冲 channel
 
@@ -245,6 +249,8 @@ mslang 内置事件循环 (EventLoop)：
 - 协作式调度：协程在 `await`、channel 操作时主动让出
 - 公平调度：就绪协程按 FIFO 顺序执行
 - 无抢占：没有时间片轮转
+
+> **风险提示**：CPU 密集型协程（如纯计算循环）如果不包含 `await` 或 channel 操作，将持续占用执行权，饿死其他协程。建议在长循环中定期调用 `await async.sleep(0)` 主动让出。
 
 ### 与 defer 的交互
 

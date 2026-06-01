@@ -48,13 +48,16 @@ isinstance("x", int)     # false
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | `print` | `print(*args)` | 打印参数（空格分隔），追加换行 |
-| `println` | `println(*args)` | 等价于 `print`，别名（两者行为完全一致） |
+| `println` | `println(*args)` | `print` 的别名（行为完全一致，保留用于兼容） |
 | `input` | `input(prompt?) -> string` | 读取用户输入 |
 
 ```ms
 print("hello")                  # hello（末尾换行）
 print("a", "b", "c")           # a b c（末尾换行）
 println("a", "b")              # a b（println 是 print 的别名）
+
+> **说明**：`print` 和 `println` 行为完全相同（均追加换行）。推荐统一使用 `print`。
+
 name = input("Enter name: ")   # 带提示的输入
 ```
 
@@ -292,7 +295,7 @@ os.getenv("PATH")          # 环境变量
 os.setenv("KEY", "val")    # 设置环境变量
 os.getcwd()                # 当前工作目录
 os.chdir("/tmp")           # 改变目录
-os.exec("ls -la")          # 执行命令
+os.exec("ls -la")          # 执行命令（注意：避免拼接不可信输入，防止命令注入）
 os.exit(0)                 # 退出程序
 os.args                    # 命令行参数列表
 ```
@@ -361,7 +364,7 @@ gc.is_enabled()                 # 返回 bool
 
 gc.set_threshold("major", 2.0)  # Old GC 触发比率（allocated > live * ratio 时触发）
 gc.set_threshold("minor", 4)    # Young 代大小（MB）
-gc.set_promotion_age(3)         # Young→Old 晋升年龄
+gc.set_promotion_age(3)         # Young→Old 晋升年龄（范围 1-3）
 gc.set_gc_threads(4)            # GC Worker 线程数
 
 gc.stats()                      # 返回统计信息 dict

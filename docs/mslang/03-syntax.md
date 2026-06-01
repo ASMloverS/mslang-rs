@@ -69,7 +69,7 @@ const PI = 3.14159
 const MAX_SIZE = 100
 ```
 
-常量必须在声明时初始化，之后不可修改。常量值必须是编译时可确定的字面量或常量表达式。
+常量必须在声明时初始化，之后不可修改。常量值仅允许以下形式：字面量（整数、浮点、字符串、布尔、nil）、其他常量引用、二元算术运算（`+` `-` `*` `/` `//` `%` `**`）。运行时表达式（函数调用、变量引用等）不允许出现在 `const` 右侧。
 
 ### nonlocal 声明
 
@@ -89,6 +89,26 @@ fn make_counter() {
 ```
 
 `nonlocal` 声明当前函数内的变量名绑定到外层（非全局）函数作用域的同名变量。必须在变量使用前声明。未声明 `nonlocal` 时，`=` 赋值在当前函数作用域创建新局部变量。
+
+### global 声明
+
+```
+global_stmt = "global" IDENTIFIER ("," IDENTIFIER)*
+```
+
+```ms
+counter = 0
+
+fn increment() {
+    global counter
+    counter += 1
+}
+
+increment()
+print(counter)    # 1
+```
+
+`global` 声明当前函数内的变量名绑定到全局作用域的同名变量。必须在变量使用前声明。未声明 `global` 时，`=` 赋值在当前函数作用域创建新局部变量，不会修改全局变量。
 
 ### 赋值语句
 
@@ -198,6 +218,8 @@ for key, value in dict.items() {
 
 遍历 dict 时默认遍历键。使用 `dict.items()` 遍历键值对。
 
+> **注意**：在 `for..in` 迭代期间修改被迭代的容器（增删元素）行为未定义。建议避免此操作，或在迭代前复制容器：`for item in list.copy() { ... }`。
+
 ### break / continue / return
 
 ```
@@ -242,6 +264,8 @@ fn example() {
     # 输出: third, second, first
 }
 ```
+
+> **注意**：`defer` 在模块顶层使用时，在模块执行完毕时执行（等价于整个模块被包裹在隐式函数中）。
 
 ### try / except / finally
 
@@ -449,7 +473,7 @@ primary = literal
         | "super" "." IDENTIFIER                 // 父类属性/方法访问（可后接调用）
         | "(" expression ("," expression)* ")"   # 分组或元组
         | "[" list_content? "]"                  // 列表
-        | "{" dict_content? "}"                  // dict 或 set
+        | "{" (dict_content | set_content)? "}"  // dict 或 set
         | fn_literal                             // 匿名函数
         | comprehension                          // 推导式
 
@@ -489,6 +513,8 @@ list_comp = "[" expression for_clause+ ("if" expression)? "]"
 for_clause = "for" IDENTIFIER ("," IDENTIFIER)? "in" expression
 ```
 
+> **作用域规则**：推导式内部创建隐式作用域。推导式中的循环变量（`for x in ...` 中的 `x`）不会泄漏到外层作用域。
+
 #### Dict 字面量
 
 ```
@@ -504,7 +530,7 @@ dict_content = (expression ":" expression) ("," (expression ":" expression))* ",
 
 ```
 set_content = expression ("," expression)+ ","?
-```
+            | expression ","                        # 单元素 set（需尾部逗号）
 
 非空花括号，且元素没有冒号分隔，解析为 set。
 
@@ -512,7 +538,7 @@ set_content = expression ("," expression)+ ","?
 {1, 2, 3}
 ```
 
-注意：`{}` 是空 dict，空 set 用 `set()`。
+注意：`{}` 是空 dict，空 set 用 `set()`。单元素花括号 `{1}` 不匹配 set 语法，将被解析为分组表达式（等价于 `1`）。单元素 set 使用 `{1,}`（尾部逗号）或 `set([1])`。
 
 #### 元组
 
@@ -557,7 +583,7 @@ mslang 使用**函数级作用域**（类似 Python）：
 - `if`/`while`/`for`/`with` 块**不创建**新作用域
 - 内层函数可以访问外层变量（闭包）
 - `var` 和 `:=` 在当前函数作用域创建新变量
-- `=` 赋值时：仅在当前函数作用域内查找，找不到则在当前作用域创建新变量（不穿透外层）；使用 `nonlocal` 声明可绑定外层变量
+- `=` 赋值时：仅在当前函数作用域内查找，找不到则在当前作用域创建新变量（不穿透外层）；使用 `nonlocal` 声明可绑定外层函数变量，使用 `global` 声明可绑定全局变量
 
 ```ms
 x = 10               # 全局

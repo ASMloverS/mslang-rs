@@ -22,9 +22,10 @@ async      await      go
 import     from       as
 yield
 nonlocal
+global
 ```
 
-共 **35** 个关键字。
+共 **36** 个关键字。
 
 ### 标识符
 
@@ -253,7 +254,7 @@ enum TokenKind {
 
     // 标识符与关键字
     Identifier(String),
-    // 35 个关键字
+    // 36 个关键字
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
@@ -263,7 +264,7 @@ enum TokenKind {
     Try, Except, Finally, Defer, With, Throw,
     Async, Await, Go,
     Import, From, As,
-    Yield, Nonlocal,
+    Yield, Nonlocal, Global,
 
     // 算术
     Plus, Minus, Star, Slash, DoubleSlash, Percent, DoubleStar,
@@ -271,8 +272,8 @@ enum TokenKind {
     EqualEqual, BangEqual, Less, Greater, LessEqual, GreaterEqual,
     // 位运算
     Ampersand, Pipe, Caret, LeftShift, RightShift, Tilde,
-    // 成员
-    In, Is,
+    // 身份比较
+    Is,
     // 赋值
     Equal, PlusEqual, MinusEqual, StarEqual, SlashEqual,
     DoubleSlashEqual, PercentEqual, DoubleStarEqual,
@@ -331,3 +332,5 @@ enum TokenKind {
 | `case` | select 的 case 分支 |
 | `export` | 模块显式导出（见 [09-modules](09-modules.md)） |
 | `match` | 模式匹配（预留） |
+
+> **词法处理**：保留字由关键字查找表统一管理。匹配到保留字时词法分析器报错（"保留字不可用作标识符"）。保留字不需要在 Token 枚举中定义——仅在查找表中标记为"禁止"。

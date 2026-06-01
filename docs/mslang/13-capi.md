@@ -586,6 +586,8 @@ MS_MODULE_INIT const MsModuleDef* ms_module_init(MsVM* vm);
 3. 动态加载库，调用 `ms_module_init(vm)`
 4. 将返回的模块定义注册到 VM
 
+> **安全提示**：动态库加载执行任意原生代码，无签名验证。仅在可信环境中使用，避免从不可信路径加载 `.dll`/`.so` 文件。
+
 构建命令：
 
 ```bash
