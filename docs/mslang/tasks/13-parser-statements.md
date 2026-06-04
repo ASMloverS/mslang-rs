@@ -275,7 +275,7 @@ fn parse_param_list(&mut self) -> Result<Vec<Param>> {
                 is_variadic: true,
             });
         } else {
-            let name = self.expect_identifier("expected parameter name")?;
+            let name = self.parse_param_name()?;
             let default = if self.match_token(&[TokenKind::Equal]) {
                 Some(self.parse_expression()?)
             } else {
@@ -295,6 +295,26 @@ fn parse_param_list(&mut self) -> Result<Vec<Param>> {
 
     Ok(params)
 }
+
+fn parse_param_name(&mut self) -> Result<String> {
+    let tok = self.peek();
+    match &tok.kind {
+        TokenKind::Identifier(name) => {
+            let name = name.clone();
+            self.advance();
+            Ok(name)
+        }
+        TokenKind::Zelf => {
+            self.advance();
+            Ok("self".to_string())
+        }
+        _ => Err(MspError::ParseError {
+            line: tok.span.start.line,
+            column: tok.span.start.column,
+            message: "expected parameter name".into(),
+        }),
+    }
+}
 ```
 
 ### parse_import()
@@ -302,6 +322,7 @@ fn parse_param_list(&mut self) -> Result<Vec<Param>> {
 ```rust
 fn parse_import(&mut self) -> Result<Stmt> {
     self.advance(); // consume 'import'
+    let is_stdlib = self.match_token(&[TokenKind::At]);
     let module_path = self.parse_module_path()?;
     let alias = if self.match_token(&[TokenKind::As]) {
         Some(self.expect_identifier("expected alias name")?)
@@ -309,7 +330,7 @@ fn parse_import(&mut self) -> Result<Stmt> {
         None
     };
     self.consume_newline();
-    Ok(Stmt::Import { module_path, alias })
+    Ok(Stmt::Import { module_path, alias, is_stdlib })
 }
 ```
 
@@ -318,6 +339,22 @@ fn parse_import(&mut self) -> Result<Stmt> {
 ```rust
 fn parse_from_import(&mut self) -> Result<Stmt> {
     self.advance(); // consume 'from'
+    let is_stdlib = self.match_token(&[TokenKind::At]);
+    if is_stdlib {
+        let std_tok = self.peek();
+        match &std_tok.kind {
+            TokenKind::Identifier(name) if name == "std" => {
+                self.advance();
+            }
+            _ => {
+                return Err(MspError::ParseError {
+                    line: std_tok.span.start.line,
+                    column: std_tok.span.start.column,
+                    message: "expected 'std' after '@' in from-import".into(),
+                });
+            }
+        }
+    }
     let module_path = self.parse_module_path()?;
     self.expect(TokenKind::Import, "expected 'import' after module path")?;
 
@@ -336,7 +373,7 @@ fn parse_from_import(&mut self) -> Result<Stmt> {
     }
 
     self.consume_newline();
-    Ok(Stmt::FromImport { module_path, targets })
+    Ok(Stmt::FromImport { module_path, targets, is_stdlib })
 }
 ```
 
@@ -412,6 +449,24 @@ fn parse_nonlocal(&mut self) -> Result<Stmt> {
 
 在 `parse_statement()` 分发中添加 `TokenKind::Nonlocal` 分支调用 `parse_nonlocal()`。
 
+### parse_global()
+
+参照 [03-syntax](../03-syntax.md) § global 声明：
+
+```rust
+fn parse_global(&mut self) -> Result<Stmt> {
+    self.advance(); // consume 'global'
+    let mut names = vec![self.expect_identifier("expected identifier after 'global'")?];
+    while self.match_token(&[TokenKind::Comma]) {
+        names.push(self.expect_identifier("expected identifier after ','")?);
+    }
+    self.consume_newline();
+    Ok(Stmt::Global { names })
+}
+```
+
+在 `parse_statement()` 分发中添加 `TokenKind::Global` 分支调用 `parse_global()`。
+
 ## 验证标准
 
 1. `var`, `:=`, `=` 三种声明方式正确解析
@@ -423,6 +478,7 @@ fn parse_nonlocal(&mut self) -> Result<Stmt> {
 7. 函数声明（含默认参数和可变参数）正确解析
 8. `import` 和 `from...import` 正确解析
 9. `nonlocal` 声明正确解析（含多个变量名）
+10. `global` 声明正确解析（含多个变量名）
 
 ## 测试用例
 

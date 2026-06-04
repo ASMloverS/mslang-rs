@@ -247,6 +247,23 @@ fn read_exponent(&mut self, start: Position) -> Result<String> {
 }
 ```
 
+### read_float_exponent()
+
+处理无小数点的科学计数法形式（如 `1e10`, `2E-5`）：
+
+```rust
+fn read_float_exponent(&mut self, int_part: String, start: Position) -> Result<Token> {
+    let exp = self.read_exponent(start)?;
+    let full = format!("{}e{}", int_part, exp);
+    let value: f64 = full.parse().map_err(|_| MspError::LexError {
+        line: start.line,
+        column: start.column,
+        message: format!("invalid float literal: {}", full),
+    })?;
+    Ok(self.make_token(TokenKind::Float(value), start, &full))
+}
+```
+
 ### 注意事项
 
 - `0` 后面不跟 `x`/`b`/`o`/`.` 时，解析为十进制 `0`
@@ -254,6 +271,7 @@ fn read_exponent(&mut self, start: Position) -> Result<String> {
 - `3.14` → `Float(3.14)`，`1.5e-3` → `Float(0.0015)`，`1e10` → `Float(10000000000.0)`
 - 浮点数至少有一个小数位：`3.` 是非法的（缺少小数部分）
 - `0.` 同样非法
+- `1e10` 形式（无小数点）通过 `read_float_exponent()` 处理
 
 ## 验证标准
 

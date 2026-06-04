@@ -88,10 +88,11 @@
 | 49 | [标准库 - json 模块](49-stdlib-json.md) | ⬜ |
 | 50 | [内置类型方法 - String](50-builtin-methods-string.md) | ⬜ |
 | 51 | [内置类型方法 - List/Dict/Set](51-builtin-methods-list-dict-set.md) | ⬜ |
+| 60 | [标准库 - gc 模块](60-stdlib-gc.md) | ⬜ |
 
-| 59 | C API — VM 生命周期与值操作（待创建） | ⬜ |
-| 60 | C API — 函数调用/异常/模块注册（待创建） | ⬜ |
-| 61 | C API — Class 操作与 GC 交互（待创建） | ⬜ |
+| 65 | C API — VM 生命周期与值操作（待创建） | ⬜ |
+| 66 | C API — 函数调用/异常/模块注册（待创建） | ⬜ |
+| 67 | C API — Class 操作与 GC 交互（待创建） | ⬜ |
 
 > 设计规格见 [13-capi](../13-capi.md)。
 
@@ -102,6 +103,8 @@
 | 53 | [async/await 协程](53-async-await.md) | ⬜ |
 | 54 | [Channel 通信](54-channel.md) | ⬜ |
 | 55 | [go 关键字与并发执行](55-go-concurrency.md) | ⬜ |
+| 59 | [select 语句（多 channel 复用）](59-select.md) | ⬜ |
+| 61 | [标准库 - async 模块](61-stdlib-async.md) | ⬜ |
 
 ## Phase 7.5 — 并发 GC 优化（待创建）
 

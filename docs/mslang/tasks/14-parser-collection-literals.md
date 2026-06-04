@@ -123,6 +123,21 @@ fn parse_list_literal(&mut self) -> Result<Expr> {
 }
 ```
 
+### parse_for_targets()
+
+解析推导式 for 子句中的变量目标（支持多变量解构）：
+
+```rust
+fn parse_for_targets(&mut self) -> Result<Vec<String>> {
+    let first = self.expect_identifier("expected variable name after 'for'")?;
+    let mut targets = vec![first];
+    while self.match_token(&[TokenKind::Comma]) {
+        targets.push(self.expect_identifier("expected variable name after ','")?);
+    }
+    Ok(targets)
+}
+```
+
 ### parse_list_comprehension()
 
 ```rust
@@ -130,10 +145,10 @@ fn parse_list_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     let mut for_clauses = Vec::new();
 
     while self.match_token(&[TokenKind::For]) {
-        let target = self.expect_identifier("expected variable name after 'for'")?;
+        let targets = self.parse_for_targets()?;
         self.expect(TokenKind::In, "expected 'in' in comprehension")?;
         let iterable = self.parse_expression()?;
-        for_clauses.push(ForClause { target, iterable });
+        for_clauses.push(ForClause { targets, iterable });
     }
 
     let condition = if self.match_token(&[TokenKind::If]) {
@@ -218,10 +233,10 @@ fn parse_dict_comprehension(&mut self, key_expr: Expr, value_expr: Expr) -> Resu
     let mut for_clauses = Vec::new();
 
     while self.match_token(&[TokenKind::For]) {
-        let target = self.expect_identifier("expected variable name")?;
+        let targets = self.parse_for_targets()?;
         self.expect(TokenKind::In, "expected 'in'")?;
         let iterable = self.parse_expression()?;
-        for_clauses.push(ForClause { target, iterable });
+        for_clauses.push(ForClause { targets, iterable });
     }
 
     let condition = if self.match_token(&[TokenKind::If]) {
@@ -248,10 +263,10 @@ fn parse_set_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     let mut for_clauses = Vec::new();
 
     while self.match_token(&[TokenKind::For]) {
-        let target = self.expect_identifier("expected variable name")?;
+        let targets = self.parse_for_targets()?;
         self.expect(TokenKind::In, "expected 'in'")?;
         let iterable = self.parse_expression()?;
-        for_clauses.push(ForClause { target, iterable });
+        for_clauses.push(ForClause { targets, iterable });
     }
 
     let condition = if self.match_token(&[TokenKind::If]) {
@@ -453,7 +468,7 @@ mod tests {
         match expr {
             Expr::ListComprehension { for_clauses, condition, .. } => {
                 assert_eq!(for_clauses.len(), 1);
-                assert_eq!(for_clauses[0].target, "x");
+                assert_eq!(for_clauses[0].targets, vec!["x".to_string()]);
                 assert!(condition.is_some());
             }
             _ => panic!("expected list comprehension"),
@@ -477,8 +492,8 @@ mod tests {
         match expr {
             Expr::ListComprehension { for_clauses, .. } => {
                 assert_eq!(for_clauses.len(), 2);
-                assert_eq!(for_clauses[0].target, "row");
-                assert_eq!(for_clauses[1].target, "x");
+                assert_eq!(for_clauses[0].targets, vec!["row".to_string()]);
+                assert_eq!(for_clauses[1].targets, vec!["x".to_string()]);
             }
             _ => panic!("expected list comprehension"),
         }

@@ -20,8 +20,9 @@ Phase 1.3f - 基础设施
    - 行尾是运算符（`+`, `-`, `*`, `/`, `//`, `%`, `**`, `=`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&`, `|`, `^`, `<<`, `>>`, `and`, `or`, `not`, `in`, `is`）
    - 行尾是逗号 `,`
    - 行尾是左括号 `(`, `[`, `{`
-   - 行首是运算符
    - 字符串字面量内（已由引号界定，不允许跨行）
+
+> **设计决策**（引用 [03-syntax](../03-syntax.md)）：不采用"行首是运算符"作为续行条件。该规则会导致歧义——`x = f()\n-value` 会被错误解析为 `x = f() - value`（减法），而非两条独立语句。若需跨行书写二元运算，请在行尾放置运算符（推荐）或将右操作数用括号包裹。
 
 ### 换行符统一
 
@@ -93,11 +94,6 @@ fn is_continuation(&self) -> bool {
         return true;
     }
 
-    // 规则 4: 行首是运算符（检查下一行第一个非空白字符）
-    if self.next_non_whitespace_is_operator() {
-        return true;
-    }
-
     false
 }
 ```
@@ -118,28 +114,6 @@ fn is_binary_operator(kind: &TokenKind) -> bool {
         | TokenKind::In | TokenKind::Is
         | TokenKind::Dot | TokenKind::Arrow
     )
-}
-```
-
-### next_non_whitespace_is_operator()
-
-```rust
-fn next_non_whitespace_is_operator(&self) -> bool {
-    let mut i = self.pos;
-    while i < self.chars.len() {
-        let c = self.chars[i];
-        if c == ' ' || c == '\t' {
-            i += 1;
-            continue;
-        }
-        // 检查是否是运算符开头的字符
-        return matches!(
-            c,
-            '+' | '-' | '*' | '/' | '%' | '=' | '!' | '<' | '>'
-            | '&' | '|' | '^' | '~' | '.'
-        );
-    }
-    false
 }
 ```
 
@@ -178,7 +152,7 @@ pub struct Lexer {
 - 注释行后的换行：如果前一个非注释 token 触发了续行，注释后的换行也应被跳过
 - 空行（连续换行）不应产生多个 `Newline` token
 - 括号深度跟踪与续行规则互补
-- **实现策略**："行首是运算符" 在 token 流中的判定通过 `next_non_whitespace_is_operator()` 实现——当遇到 `\n` 时，向前查看下一个非空白字符是否为运算符起始字符。这避免了在 token 流中维护"行首"概念，而是在字符级直接判定
+- **不采用"行首运算符"续行**：该规则会导致 `x = f()\n-value` 被错误解析为减法（详见 [03-syntax](../03-syntax.md) § 语句终止设计决策）
 
 ## 验证标准
 

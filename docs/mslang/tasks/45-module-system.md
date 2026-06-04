@@ -38,11 +38,42 @@ import_target = IDENTIFIER ("as" IDENTIFIER)?
 2. **标准库目录** — mslang 安装目录下的 `stdlib/`
 3. **MS_PATH** — 环境变量指定的路径（用 `;` 分隔）
 
+### 安全模块加载（`import @std`）
+
+参照 [09-modules](../09-modules.md) § 安全模块加载：
+
+```
+import @std math         # 强制从标准库目录加载，跳过当前目录搜索
+from @std io import open
+```
+
+`@std` 前缀确保只从标准库目录搜索模块，避免当前目录下的同名文件被恶意替换。在安全模式（`MS_SAFE=1`）下，所有非 `@std` 的 import 被禁止。
+
+搜索规则更新：
+
+```
+import foo -> foo.ms, foo/index.ms, stdlib/foo.ms
+import @std foo -> stdlib/foo.ms（仅标准库目录）
+```
+
+### 安全模式
+
+参照 [09-modules](../09-modules.md)：
+
+- 环境变量 `MS_SAFE=1` 启用安全模式
+- CLI 参数 `ms run --safe` 启用安全模式
+- 安全模式下：
+  - 禁止 `os.exec()`
+  - 禁止 `import` 非标准库模块（只允许 `import @std xxx`）
+  - 禁止文件写入操作
+  - 限制网络访问
+
 ### 搜索规则
 
 ```
 import foo -> foo.ms, foo/index.ms, stdlib/foo.ms
 import os.path -> os/path.ms, os/path/index.ms
+import @std math -> stdlib/math.ms（仅标准库）
 ```
 
 ### 导出规则
@@ -134,6 +165,9 @@ OpCode::IMPORT => {
 6. 模块私有变量（var/:=/=）不可从外部访问
 7. 包模块（目录 + index.ms）正确加载
 8. 模块作用域相互隔离
+9. `import @std math` 正确从标准库目录加载（跳过当前目录）
+10. `from @std io import open` 正确加载标准库模块的指定名称
+11. 安全模式（`MS_SAFE=1`）下，非 `@std` import 被拒绝
 
 ## 测试用例
 

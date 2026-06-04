@@ -97,6 +97,8 @@ fn compile_binary(&mut self, left: &Expr, op: &BinaryOp, right: &Expr, line: usi
         BinaryOp::Greater => OpCode::Greater,
         BinaryOp::LessEqual => OpCode::LessEqual,
         BinaryOp::GreaterEqual => OpCode::GreaterEqual,
+        BinaryOp::In => OpCode::In,
+        BinaryOp::Is => OpCode::Is,
         _ => return Err(format!("Unsupported binary op: {:?}", op)),
     };
     self.emit_byte(opcode as u8, line);

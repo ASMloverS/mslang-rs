@@ -35,6 +35,7 @@ Phase 1.4b - 基础设施
 - import 语句
 - throw 语句
 - nonlocal 声明
+- global 声明
 
 ### 程序结构
 
@@ -131,15 +132,20 @@ pub enum Stmt {
     Import {
         module_path: Vec<String>,
         alias: Option<String>,
+        is_stdlib: bool,
     },
     FromImport {
         module_path: Vec<String>,
         targets: Vec<(String, Option<String>)>,
+        is_stdlib: bool,
     },
     Throw {
         expr: Option<Expr>,
     },
     Nonlocal {
+        names: Vec<String>,
+    },
+    Global {
         names: Vec<String>,
     },
 }
@@ -267,14 +273,14 @@ impl std::fmt::Display for Stmt {
                     None => write!(f, "with {} {{\n{}\n}}", expression, b.join("\n")),
                 }
             }
-            Stmt::Import { module_path, alias } => {
+            Stmt::Import { module_path, alias, .. } => {
                 let path = module_path.join(".");
                 match alias {
                     Some(a) => write!(f, "import {} as {}", path, a),
                     None => write!(f, "import {}", path),
                 }
             }
-            Stmt::FromImport { module_path, targets } => {
+            Stmt::FromImport { module_path, targets, .. } => {
                 let path = module_path.join(".");
                 let ts: Vec<_> = targets.iter()
                     .map(|(name, alias)| match alias {
@@ -291,6 +297,7 @@ impl std::fmt::Display for Stmt {
                 }
             }
             Stmt::Nonlocal { names } => write!(f, "nonlocal {}", names.join(", ")),
+            Stmt::Global { names } => write!(f, "global {}", names.join(", ")),
         }
     }
 }
@@ -410,6 +417,7 @@ mod tests {
         let stmt = Stmt::Import {
             module_path: vec!["os".into(), "path".into()],
             alias: Some("pathutil".into()),
+            is_stdlib: false,
         };
         assert_eq!(format!("{}", stmt), "import os.path as pathutil");
     }

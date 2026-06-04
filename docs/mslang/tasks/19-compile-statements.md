@@ -250,6 +250,30 @@ fn compile_return(&mut self, value: &Option<Expr>, line: usize) -> Result<(), St
 }
 ```
 
+### 编译 nonlocal / global 声明
+
+`nonlocal` 和 `global` 声明不产生字节码指令，仅在编译器的符号表中标记变量绑定语义：
+
+```rust
+fn compile_nonlocal(&mut self, names: &[String]) -> Result<(), String> {
+    for name in names {
+        self.mark_nonlocal(name);
+    }
+    Ok(())
+}
+
+fn compile_global(&mut self, names: &[String]) -> Result<(), String> {
+    for name in names {
+        self.mark_global(name);
+    }
+    Ok(())
+}
+```
+
+- `mark_nonlocal(name)` 将变量标记为绑定到外层函数作用域
+- `mark_global(name)` 将变量标记为绑定到全局作用域
+- 后续对该变量的 `LOAD`/`STORE` 指令选择将依据这些标记决定
+
 ### 编译 block 语句
 
 ```rust

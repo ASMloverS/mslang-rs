@@ -232,6 +232,33 @@ OpCode::JumpBack => {
 }
 ```
 
+### 身份比较指令
+
+引用 [02-types.md](../02-types.md) § `is` 运算符：仅适用于引用类型（list, dict, set, class instance, string, function, module）。对内联值（int, float, bool, nil）使用 `is` 抛出 `TypeError`。
+
+```rust
+OpCode::Is => {
+    let b = self.pop();
+    let a = self.pop();
+    match (&a, &b) {
+        (Object::Int(_), _) | (Object::Float(_), _) |
+        (Object::Bool(_), _) | (Object::Nil, _) => {
+            return Err("TypeError: 'is' not supported for inline types (int, float, bool, nil)".to_string());
+        }
+        _ => {
+            self.push(Object::Bool(a.is_same_reference(&b)));
+        }
+    }
+}
+
+OpCode::In => {
+    let b = self.pop();
+    let a = self.pop();
+    let result = b.contains(&a)?;
+    self.push(Object::Bool(result));
+}
+```
+
 ### 错误处理
 
 所有运算操作可能返回 `Err(String)`，run 循环中使用 `?` 传播错误：

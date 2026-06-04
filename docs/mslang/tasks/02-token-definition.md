@@ -26,7 +26,7 @@ pub enum TokenKind {
     // 标识符
     Identifier(String),
 
-    // 35 个关键字
+    // 36 个关键字
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
@@ -36,7 +36,7 @@ pub enum TokenKind {
     Try, Except, Finally, Defer, With, Throw,
     Async, Await, Go,
     Import, From, As,
-    Yield, Nonlocal,
+    Yield, Nonlocal, Global,
 
     // 算术运算符 (+ - * / // % **)
     Plus, Minus, Star, Slash, DoubleSlash, Percent, DoubleStar,
@@ -44,10 +44,9 @@ pub enum TokenKind {
     EqualEqual, BangEqual, Less, Greater, LessEqual, GreaterEqual,
     // 位运算符 (& | ^ << >> ~)
     Ampersand, Pipe, Caret, LeftShift, RightShift, Tilde,
-    // 成员运算符 (in is) — In/Is 既作为关键字 token，也在表达式解析中作为比较运算符使用
-    // 词法分析器统一返回 TokenKind::In / TokenKind::Is（关键字身份）
+    // 身份比较 — Is 与 In 类似：词法分析器通过关键字查找表返回 TokenKind::Is
     // 表达式解析器在 parse_comparison() 中将其视为比较运算符（双重角色）
-    // In 同时也作为 for..in 语法的关键字使用
+    Is,
     // 赋值运算符 (= += -= *= /= //= %= **= &= |= ^= <<= >>=)
     Equal, PlusEqual, MinusEqual, StarEqual, SlashEqual,
     DoubleSlashEqual, PercentEqual, DoubleStarEqual,
@@ -194,6 +193,8 @@ pub fn keyword_table() -> HashMap<&'static str, TokenKind> {
     m.insert("as", TokenKind::As);
     m.insert("yield", TokenKind::Yield);
     m.insert("nonlocal", TokenKind::Nonlocal);
+    m.insert("global", TokenKind::Global);
+    m.insert("is", TokenKind::Is);
     m
 }
 ```
@@ -212,7 +213,8 @@ pub fn reserved_words() -> &'static [&'static str] {
 
 - [ ] 3 种字面量类型：Int, Float, String
 - [ ] Identifier
-- [ ] 35 个关键字（Var, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue, Class, Zelf, Super, True, False, Nil, And, Or, Not, Try, Except, Finally, Defer, With, Throw, Async, Await, Go, Import, From, As, Yield, Nonlocal）
+- [ ] 36 个关键字（Var, Const, Fn, Return, If, Elif, Else, While, For, In, Break, Continue, Class, Zelf, Super, True, False, Nil, And, Or, Not, Try, Except, Finally, Defer, With, Throw, Async, Await, Go, Import, From, As, Yield, Nonlocal, Global）
+- [ ] 1 个身份比较 token（Is，通过关键字查找表识别，但规格中归类为运算符而非关键字）
 - [ ] 7 个算术运算符
 - [ ] 6 个比较运算符
 - [ ] 6 个位运算符
@@ -227,7 +229,7 @@ pub fn reserved_words() -> &'static [&'static str] {
 
 1. `cargo build` 编译通过
 2. TokenKind 变体数量覆盖 [01-lexical](../01-lexical.md) Token 完整列表中所有元素
-3. 关键字表包含 35 个条目
+3. 关键字查找表包含 37 个条目（36 个关键字 + Is）
 4. Display 实现正确输出
 
 ## 测试用例
@@ -256,7 +258,7 @@ mod tests {
     #[test]
     fn test_keyword_count() {
         let kw = keyword_table();
-        assert_eq!(kw.len(), 35);
+        assert_eq!(kw.len(), 37);
     }
 
     #[test]
