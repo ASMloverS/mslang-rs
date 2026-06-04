@@ -50,13 +50,13 @@ mslang-rs/
 │   │   └── stats.rs            # GC 统计与调优
 │   ├── capi/
 │   │   ├── mod.rs              # C API 入口
-│   │   ├── vm.rs               # ms_vm_* 实现
-│   │   ├── value.rs            # ms_int/ms_string 等实现
-│   │   ├── call.rs             # ms_call/ms_await 等实现
-│   │   ├── error.rs            # ms_throw/ms_err_* 实现
-│   │   ├── module.rs           # ms_register_module 等实现
-│   │   ├── class.rs            # ms_class_* 实现
-│   │   └── gc.rs               # ms_root/ms_gc_* 实现
+│   │   ├── vm.rs               # msVm* 实现
+│   │   ├── value.rs            # msInt/msString 等实现
+│   │   ├── call.rs             # msCall/msAwait 等实现
+│   │   ├── error.rs            # msThrow/msErr* 实现
+│   │   ├── module.rs           # msRegisterModule 等实现
+│   │   ├── class.rs            # msClass* 实现
+│   │   └── gc.rs               # msRoot/msGc* 实现
 │   ├── module/
 │   │   ├── mod.rs
 │   │   └── resolver.rs         # 模块解析
@@ -567,10 +567,10 @@ while i < 5 {
 
 ### 7.5.5 C API GC 交互
 
-- [ ] ms_root / ms_unroot 实现
-- [ ] ms_write_barrier 实现
+- [ ] msRoot / msUnroot 实现
+- [ ] msWriteBarrier 实现
 - [ ] C finalizer 注册与延迟执行
-- [ ] GC 控制 API（ms_gc_collect 等）
+- [ ] GC 控制 API（msGcCollect 等）
 
 **验证**：C 扩展模块与 GC 正确协作
 

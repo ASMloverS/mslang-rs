@@ -36,7 +36,7 @@ import_target = IDENTIFIER ("as" IDENTIFIER)?
 按以下顺序搜索模块：
 1. **当前目录** — 脚本所在目录
 2. **标准库目录** — mslang 安装目录下的 `stdlib/`
-3. **MSLANG_PATH** — 环境变量指定的路径（用 `;` 分隔）
+3. **MS_PATH** — 环境变量指定的路径（用 `;` 分隔）
 
 ### 搜索规则
 
@@ -89,7 +89,7 @@ struct ModuleResolver {
 }
 ```
 
-- `search_paths`：初始化时按优先级填入当前目录、stdlib/、MSLANG_PATH
+- `search_paths`：初始化时按优先级填入当前目录、stdlib/、MS_PATH
 - `cache`：已加载模块缓存，键为模块路径字符串
 - `resolve(name: &str) -> Result<PathBuf>`：按搜索规则查找模块文件
 - `load(name: &str, vm: &mut VM) -> Result<*mut MsObjHeader>`：编译并执行 .ms 文件，构建 Module 对象（TypeTag::MODULE）
