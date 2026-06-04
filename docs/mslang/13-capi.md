@@ -59,19 +59,19 @@ include/mslang/
 
 ```c
 #ifdef _WIN32
-    #ifdef MS_BUILDING
-        #define MS_API __declspec(dllexport)
-    #else
-        #define MS_API __declspec(dllimport)
-    #endif
+  #ifdef MS_BUILDING
+  #define MS_API __declspec(dllexport)
+  #else
+  #define MS_API __declspec(dllimport)
+  #endif
 #else
-    #define MS_API __attribute__((visibility("default")))
+  #define MS_API __attribute__((visibility("default")))
 #endif
 
 #ifdef _WIN32
-    #define MS_MODULE_INIT __declspec(dllexport)
+  #define MS_MODULE_INIT __declspec(dllexport)
 #else
-    #define MS_MODULE_INIT __attribute__((visibility("default")))
+  #define MS_MODULE_INIT __attribute__((visibility("default")))
 #endif
 ```
 
@@ -95,7 +95,7 @@ typedef struct MsValue MsValue;
 typedef MsValue* (*MsCFunction)(MsVM* vm, MsValue* const* args, int nargs);
 
 typedef void (*MsAsyncFunction)(MsVM* vm, MsValue* const* args, int nargs,
-                                MsValue* future);
+    MsValue* future);
 
 typedef void (*MsFinalizerFn)(MsVM* vm, MsValue* obj, void* userdata);
 ```
@@ -104,37 +104,37 @@ typedef void (*MsFinalizerFn)(MsVM* vm, MsValue* obj, void* userdata);
 
 ```c
 typedef enum MsType {
-    MS_TYPE_NIL = 0,
-    MS_TYPE_BOOL,
-    MS_TYPE_INT,
-    MS_TYPE_FLOAT,
-    MS_TYPE_STRING,
-    MS_TYPE_LIST,
-    MS_TYPE_DICT,
-    MS_TYPE_TUPLE,
-    MS_TYPE_SET,
-    MS_TYPE_FUNCTION,
-    MS_TYPE_CLASS,
-    MS_TYPE_INSTANCE,
-    MS_TYPE_MODULE,
-    MS_TYPE_GENERATOR,
-    MS_TYPE_FUTURE,
-    MS_TYPE_CHANNEL,
-    MS_TYPE_ITERATOR,
-    MS_TYPE_BOUND_METHOD,
-    MS_TYPE_JOIN_HANDLE,
+  MS_TYPE_NIL = 0,
+  MS_TYPE_BOOL,
+  MS_TYPE_INT,
+  MS_TYPE_FLOAT,
+  MS_TYPE_STRING,
+  MS_TYPE_LIST,
+  MS_TYPE_DICT,
+  MS_TYPE_TUPLE,
+  MS_TYPE_SET,
+  MS_TYPE_FUNCTION,
+  MS_TYPE_CLASS,
+  MS_TYPE_INSTANCE,
+  MS_TYPE_MODULE,
+  MS_TYPE_GENERATOR,
+  MS_TYPE_FUTURE,
+  MS_TYPE_CHANNEL,
+  MS_TYPE_ITERATOR,
+  MS_TYPE_BOUND_METHOD,
+  MS_TYPE_JOIN_HANDLE,
 } MsType;
 
 typedef enum MsStatus {
-    MS_OK      =  0,
-    MS_ERROR   = -1,
-    MS_YIELD   =  1,
+  MS_OK      =  0,
+  MS_ERROR   = -1,
+  MS_YIELD   =  1,
 } MsStatus;
 
 typedef enum MsGcType {
-    MS_GC_MINOR = 0,
-    MS_GC_MAJOR = 1,
-    MS_GC_FULL  = 2,
+  MS_GC_MINOR = 0,
+  MS_GC_MAJOR = 1,
+  MS_GC_FULL  = 2,
 } MsGcType;
 ```
 
@@ -431,9 +431,9 @@ MS_API MsValue* msCallAsync(MsVM* vm, MsValue* func, MsValue* const* args, int n
 MS_API MsValue* msAwait(MsVM* vm, MsValue* future);
 
 typedef enum MsFutureState {
-    MS_FUTURE_PENDING,
-    MS_FUTURE_RESOLVED,
-    MS_FUTURE_REJECTED,
+  MS_FUTURE_PENDING,
+  MS_FUTURE_RESOLVED,
+  MS_FUTURE_REJECTED,
 } MsFutureState;
 
 MS_API MsFutureState msFutureState(MsVM* vm, MsValue* future);
@@ -449,7 +449,7 @@ MS_API void msFutureReject(MsVM* vm, MsValue* future, MsValue* error);
 
 ```c
 typedef void (*MsAsyncFunction)(MsVM* vm, MsValue* const* args, int nargs,
-                                MsValue* future);
+    MsValue* future);
 ```
 
 C async 函数接收参数和一个 Future。必须在异步操作完成后调用 `msFutureResolve` 或 `msFutureReject`。
@@ -519,7 +519,7 @@ MS_API MsStatus msThrowIoError(MsVM* vm, const char* fmt, ...);
 
 ```c
 MS_API MsStatus msTry(MsVM* vm, MsValue* func, MsValue* const* args, int nargs,
-                       MsValue** result);
+    MsValue** result);
 ```
 
 示例：
@@ -527,9 +527,9 @@ MS_API MsStatus msTry(MsVM* vm, MsValue* func, MsValue* const* args, int nargs,
 ```c
 MsValue* result = NULL;
 if (msTry(vm, riskyFunc, args, 2, &result) != MS_OK) {
-    MsValue* err = msErrFetch(vm);
-    fprintf(stderr, "caught: %s\n", msErrMessage(vm, err));
-    msUnroot(vm, err);
+  MsValue* err = msErrFetch(vm);
+  fprintf(stderr, "caught: %s\n", msErrMessage(vm, err));
+  msUnroot(vm, err);
 }
 ```
 
@@ -541,19 +541,19 @@ if (msTry(vm, riskyFunc, args, 2, &result) != MS_OK) {
 
 ```c
 typedef struct MsFuncDef {
-    const char* name;
-    MsCFunction func;
+  const char* name;
+  MsCFunction func;
 } MsFuncDef;
 
 typedef struct MsConstDef {
-    const char* name;
-    MsValue* val;
+  const char* name;
+  MsValue* val;
 } MsConstDef;
 
 typedef struct MsModuleDef {
-    const char* name;
-    const MsFuncDef* methods;   // NULL 终止
-    const MsConstDef* consts;   // NULL 终止
+  const char* name;
+  const MsFuncDef* methods;   // NULL 终止
+  const MsConstDef* consts;   // NULL 终止
 } MsModuleDef;
 ```
 
@@ -676,14 +676,14 @@ MS_API void msGcSetDebug(MsVM* vm, int enable);
 
 ```c
 typedef struct MsGcStats {
-    uint64_t minorGcCount;
-    uint64_t majorGcCount;
-    uint64_t totalPauseNs;
-    uint64_t lastPauseNs;
-    uint64_t youngSize;
-    uint64_t oldSize;
-    uint64_t losSize;
-    uint64_t bytesFreed;
+  uint64_t minorGcCount;
+  uint64_t majorGcCount;
+  uint64_t totalPauseNs;
+  uint64_t lastPauseNs;
+  uint64_t youngSize;
+  uint64_t oldSize;
+  uint64_t losSize;
+  uint64_t bytesFreed;
 } MsGcStats;
 
 MS_API MsGcStats msGcStats(MsVM* vm);
@@ -698,41 +698,41 @@ MS_API MsGcStats msGcStats(MsVM* vm);
 #include <stdio.h>
 
 int main(void) {
-    MsVM* vm = msVmNew();
+  MsVM* vm = msVmNew();
 
-    const char* script =
-        "fn fibonacci(n) {\n"
-        "    if n <= 1 { return n }\n"
-        "    return fibonacci(n - 1) + fibonacci(n - 2)\n"
-        "}\n";
+  const char* script =
+    "fn fibonacci(n) {\n"
+    "  if n <= 1 { return n }\n"
+    "  return fibonacci(n - 1) + fibonacci(n - 2)\n"
+    "}\n";
 
-    if (msExecString(vm, script, "fib.ms") != MS_OK) {
-        MsValue* err = msErrFetch(vm);
-        fprintf(stderr, "error: %s\n", msErrMessage(vm, err));
-        msUnroot(vm, err);
-        msVmFree(vm);
-        return 1;
-    }
-
-    MsValue* fib = msGetGlobal(vm, "fibonacci");
-    msRoot(vm, fib);
-
-    MsValue* arg = msInt(10);
-    MsValue* result = msCall1(vm, fib, arg);
-
-    if (!msErrOccurred(vm)) {
-        printf("fibonacci(10) = %ld\n", msToInt(vm, result));
-        msUnroot(vm, result);
-    } else {
-        MsValue* err = msErrFetch(vm);
-        fprintf(stderr, "call error: %s\n", msErrMessage(vm, err));
-        msUnroot(vm, err);
-    }
-
-    msUnroot(vm, arg);
-    msUnroot(vm, fib);
+  if (msExecString(vm, script, "fib.ms") != MS_OK) {
+    MsValue* err = msErrFetch(vm);
+    fprintf(stderr, "error: %s\n", msErrMessage(vm, err));
+    msUnroot(vm, err);
     msVmFree(vm);
-    return 0;
+    return 1;
+  }
+
+  MsValue* fib = msGetGlobal(vm, "fibonacci");
+  msRoot(vm, fib);
+
+  MsValue* arg = msInt(10);
+  MsValue* result = msCall1(vm, fib, arg);
+
+  if (!msErrOccurred(vm)) {
+    printf("fibonacci(10) = %ld\n", msToInt(vm, result));
+    msUnroot(vm, result);
+  } else {
+    MsValue* err = msErrFetch(vm);
+    fprintf(stderr, "call error: %s\n", msErrMessage(vm, err));
+    msUnroot(vm, err);
+  }
+
+  msUnroot(vm, arg);
+  msUnroot(vm, fib);
+  msVmFree(vm);
+  return 0;
 }
 ```
 
@@ -744,59 +744,59 @@ int main(void) {
 #include <stdlib.h>
 
 static MsValue* fileRead(MsVM* vm, MsValue* const* args, int nargs) {
-    if (nargs < 1 || !msIsString(args[0])) {
-        return msThrowTypeError(vm, "string", "other");
-    }
-    const char* path = msToString(vm, args[0]);
+  if (nargs < 1 || !msIsString(args[0])) {
+    return msThrowTypeError(vm, "string", "other");
+  }
+  const char* path = msToString(vm, args[0]);
 
-    FILE* f = fopen(path, "rb");
-    if (!f) {
-        return msThrowIoError(vm, "cannot open: %s", path);
-    }
+  FILE* f = fopen(path, "rb");
+  if (!f) {
+    return msThrowIoError(vm, "cannot open: %s", path);
+  }
 
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  fseek(f, 0, SEEK_SET);
 
-    char* buf = malloc(size + 1);
-    fread(buf, 1, size, f);
-    buf[size] = '\0';
-    fclose(f);
+  char* buf = malloc(size + 1);
+  fread(buf, 1, size, f);
+  buf[size] = '\0';
+  fclose(f);
 
-    MsValue* result = msStringn(vm, buf, size);
-    free(buf);
-    return result;
+  MsValue* result = msStringn(vm, buf, size);
+  free(buf);
+  return result;
 }
 
 static MsValue* fileWrite(MsVM* vm, MsValue* const* args, int nargs) {
-    if (nargs < 2 || !msIsString(args[0]) || !msIsString(args[1])) {
-        return msThrowTypeError(vm, "string, string", "other");
-    }
-    const char* path = msToString(vm, args[0]);
-    const char* data = msToString(vm, args[1]);
+  if (nargs < 2 || !msIsString(args[0]) || !msIsString(args[1])) {
+    return msThrowTypeError(vm, "string, string", "other");
+  }
+  const char* path = msToString(vm, args[0]);
+  const char* data = msToString(vm, args[1]);
 
-    FILE* f = fopen(path, "wb");
-    if (!f) {
-        return msThrowIoError(vm, "cannot open: %s", path);
-    }
-    fputs(data, f);
-    fclose(f);
-    return msNil();
+  FILE* f = fopen(path, "wb");
+  if (!f) {
+    return msThrowIoError(vm, "cannot open: %s", path);
+  }
+  fputs(data, f);
+  fclose(f);
+  return msNil();
 }
 
 static const MsFuncDef fileioFuncs[] = {
-    {"read",  fileRead},
-    {"write", fileWrite},
-    {NULL, NULL}
+  {"read",  fileRead},
+  {"write", fileWrite},
+  {NULL, NULL}
 };
 
 MS_MODULE_INIT const MsModuleDef* msModuleInit(MsVM* vm) {
-    static const MsModuleDef def = {
-        .name = "fileio",
-        .methods = fileioFuncs,
-        .consts = NULL,
-    };
-    return &def;
+  static const MsModuleDef def = {
+    .name = "fileio",
+    .methods = fileioFuncs,
+    .consts = NULL,
+  };
+  return &def;
 }
 ```
 
