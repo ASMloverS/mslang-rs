@@ -90,9 +90,21 @@
 | 51 | [内置类型方法 - List/Dict/Set](51-builtin-methods-list-dict-set.md) | ⬜ |
 | 60 | [标准库 - gc 模块](60-stdlib-gc.md) | ⬜ |
 
-| 65 | C API — VM 生命周期与值操作（待创建） | ⬜ |
-| 66 | C API — 函数调用/异常/模块注册（待创建） | ⬜ |
-| 67 | C API — Class 操作与 GC 交互（待创建） | ⬜ |
+### C API（Phase 6 末尾 — MVP 同步特性）
+
+| # | 任务 | 状态 |
+|---|---|---|
+| 65 | [C API 基础设施（cbindgen + 手写类型头文件 + 构建集成）](65-capi-infrastructure.md) | ⬜ |
+| 66 | [C API — VM 生命周期与配置](66-capi-vm.md) | ⬜ |
+| 67 | [C API — 值创建与类型判断](67-capi-value-creation.md) | ⬜ |
+| 68 | [C API — 值转换、比较与通用操作](68-capi-value-convert.md) | ⬜ |
+| 69 | [C API — 集合操作（List/Dict/Tuple/Set + 迭代器）](69-capi-collections.md) | ⬜ |
+| 70 | [C API — 函数调用](70-capi-call.md) | ⬜ |
+| 71 | [C API — 异常处理](71-capi-error.md) | ⬜ |
+| 72 | [C API — C 扩展模块注册与动态加载](72-capi-module.md) | ⬜ |
+| 73 | [C API — Class 操作](73-capi-class.md) | ⬜ |
+| 74 | [C API — GC 交互（Root/写屏障/Finalizer/控制/统计）](74-capi-gc.md) | ⬜ |
+| 75 | [C API — 集成测试（嵌入 + 扩展端到端）](75-capi-integration-test.md) | ⬜ |
 
 > 设计规格见 [13-capi](../13-capi.md)。
 
@@ -106,6 +118,14 @@
 | 59 | [select 语句（多 channel 复用）](59-select.md) | ⬜ |
 | 61 | [标准库 - async 模块](61-stdlib-async.md) | ⬜ |
 
+## Phase 7 后 — Async/Channel/Generator C API
+
+| # | 任务 | 状态 |
+|---|---|---|
+| 76 | [C API — Async/Channel/Generator](76-capi-async-channel.md) | ⬜ |
+
+> 设计规格见 [13-capi](../13-capi.md) § call.h（异步部分）。依赖 Phase 7 并发特性（task 53-55）。
+
 ## Phase 7.5 — 并发 GC 优化（待创建）
 
 | # | 任务 | 状态 |
@@ -113,8 +133,9 @@
 | 62 | 并发标记（tri-color + 写屏障）（待创建） | ⬜ |
 | 63 | 并发清扫与 Compaction（待创建） | ⬜ |
 | 64 | GC 调优接口与 gc.ms 模块（待创建） | ⬜ |
+| 77 | [C API — 并发 GC 交互（并发写屏障/调优）](77-capi-concurrent-gc.md) | ⬜ |
 
-> 设计规格见 [14-gc](../14-gc.md) Phase 7.5。
+> 设计规格见 [14-gc](../14-gc.md) Phase 7.5。Task 77 与 62-64 协调。
 
 ## Phase 8 — REPL + 工具链
 
