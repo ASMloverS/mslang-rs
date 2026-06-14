@@ -30,7 +30,7 @@ Phase 1.3a - 基础设施
 
 ```rust
 pub struct Lexer {
-    source: String,
+    source: String,  // 保留用于调试/错误报告；chars 用于所有字符访问
     chars: Vec<char>,
     pos: usize,
     line: usize,
@@ -88,7 +88,7 @@ fn advance(&mut self) -> Option<char> {
 ```rust
 fn skip_whitespace(&mut self) {
     while let Some(c) = self.peek_char() {
-        if c == ' ' || c == '\t' || c == '\r' {
+        if c == ' ' || c == '\t' || c == '\r' {  // \r: 防御性处理裸 \r（标准仅定义 \r\n 归一化）
             self.advance();
         } else {
             break;
@@ -97,6 +97,9 @@ fn skip_whitespace(&mut self) {
 }
 
 fn skip_comment(&mut self) {
+    // 注意：此方法在 '\n' 处停止但不消费换行符。
+    // next_token() 中注释后递归调用会处理该换行。
+    // 大量连续注释行会导致递归深度增加（已知限制）。
     while let Some(c) = self.peek_char() {
         if c == '\n' { break; }
         self.advance();
@@ -208,6 +211,102 @@ fn current_position(&self) -> Position {
         offset: self.pos,
     }
 }
+```
+
+### 基础读取方法（task 03 实现，task 04-07 增强）
+
+task 03 提供以下方法的基础实现，确保编译通过和核心测试可运行。后续 task 增强这些方法：
+
+- `read_identifier`：基础标识符读取 + 关键字查找（task 06 增加保留字检查）
+- `read_number`：基础十进制整数（task 04 增加 hex/binary/octal/float）
+- `read_equal`：`=` 与 `==` 区分（task 07 无增强，已完整）
+- 其余 `read_*`：基础单字符 token（task 07 增加多字符运算符匹配）
+- `read_string`：stub（task 05 实现）
+
+```rust
+fn read_identifier(&mut self, first: char, start: Position) -> Result<Token> {
+    let mut lexeme = String::new();
+    lexeme.push(first);
+    while let Some(c) = self.peek_char() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            lexeme.push(c);
+            self.advance();
+        } else {
+            break;
+        }
+    }
+    let kind = keyword_table()
+        .get(lexeme.as_str())
+        .cloned()
+        .unwrap_or_else(|| TokenKind::Identifier(lexeme.clone()));
+    Ok(self.make_token(kind, start, &lexeme))
+}
+
+fn read_number(&mut self, first: char, start: Position) -> Result<Token> {
+    let mut lexeme = String::new();
+    lexeme.push(first);
+    while let Some(c) = self.peek_char() {
+        if c.is_ascii_digit() {
+            lexeme.push(c);
+            self.advance();
+        } else {
+            break;
+        }
+    }
+    let value: i64 = lexeme.parse().map_err(|_| MspError::LexError {
+        line: start.line,
+        column: start.column,
+        message: format!("invalid integer literal '{}'", lexeme),
+    })?;
+    Ok(self.make_token(TokenKind::Int(value), start, &lexeme))
+}
+
+fn read_equal(&mut self, start: Position) -> Result<Token> {
+    match self.peek_char() {
+        Some('=') => {
+            self.advance();
+            Ok(self.make_token(TokenKind::EqualEqual, start, "=="))
+        }
+        _ => Ok(self.make_token(TokenKind::Equal, start, "=")),
+    }
+}
+
+fn read_string(&mut self, start: Position) -> Result<Token> {
+    Err(MspError::LexError {
+        line: start.line,
+        column: start.column,
+        message: "string literals not yet implemented (task 05)".into(),
+    })
+}
+
+fn read_bang(&mut self, start: Position) -> Result<Token> {
+    match self.peek_char() {
+        Some('=') => {
+            self.advance();
+            Ok(self.make_token(TokenKind::BangEqual, start, "!="))
+        }
+        _ => Err(MspError::LexError {
+            line: start.line,
+            column: start.column,
+            message: "unexpected character '!'".into(),
+        }),
+    }
+}
+
+// 以下方法在 task 03 中返回基础单字符 token。
+// task 07 将增强为完整的多字符运算符匹配（+=, -=, **, //, <<, >>=, .., ... 等）。
+fn read_plus(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Plus, start, "+")) }
+fn read_minus(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Minus, start, "-")) }
+fn read_star(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Star, start, "*")) }
+fn read_slash(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Slash, start, "/")) }
+fn read_percent(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Percent, start, "%")) }
+fn read_less(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Less, start, "<")) }
+fn read_greater(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Greater, start, ">")) }
+fn read_ampersand(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Ampersand, start, "&")) }
+fn read_pipe(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Pipe, start, "|")) }
+fn read_caret(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Caret, start, "^")) }
+fn read_dot(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Dot, start, ".")) }
+fn read_colon(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Colon, start, ":")) }
 ```
 
 ## 验证标准
