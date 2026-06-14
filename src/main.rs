@@ -6,7 +6,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long)]
+    #[arg(long)]
     version: bool,
 }
 
@@ -21,7 +21,7 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     if cli.version {
-        println!("mslang 0.1.0");
+        println!("mslang {}", env!("CARGO_PKG_VERSION"));
         return;
     }
     match cli.command {
@@ -29,6 +29,9 @@ fn main() {
         Some(Commands::Eval { expr: _ }) => {}
         Some(Commands::Repl) => {}
         Some(Commands::Check { file: _ }) => {}
-        None => { Cli::parse_from(["ms", "--help"]); }
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+        }
     }
 }

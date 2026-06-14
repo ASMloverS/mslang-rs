@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum MspError {
     #[error("lexer error at {line}:{column}: {message}")]
     LexError { line: usize, column: usize, message: String },
@@ -11,8 +12,8 @@ pub enum MspError {
     #[error("compile error: {message}")]
     CompileError { message: String },
 
-    #[error("runtime error: {message}")]
-    RuntimeError { message: String },
+    #[error("runtime error: {0}")]
+    RuntimeError(String),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
