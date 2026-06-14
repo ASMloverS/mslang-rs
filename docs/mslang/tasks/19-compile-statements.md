@@ -49,7 +49,7 @@ fn compile_var_decl(&mut self, name: &str, init: &Expr, line: usize) -> Result<(
 
 fn compile_global_assign(&mut self, name: &str, value: &Expr, line: usize) -> Result<(), String> {
     self.compile_expression(value)?;
-    let name_idx = self.add_constant(Object::String(Gc::new(name.to_string())));
+    let name_idx = self.add_constant(alloc_string(name));
     self.emit_byte(OpCode::StoreGlobal as u8, line);
     self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
     Ok(())

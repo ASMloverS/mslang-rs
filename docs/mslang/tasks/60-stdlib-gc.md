@@ -70,66 +70,44 @@ Phase 6.2 - 模块系统 + 标准库
 pub fn register_gc_module(vm: &mut VM) {
     let mut exports = HashMap::new();
 
-    exports.insert("collect".into(), Object::BuiltinFn {
-        name: "gc.collect".into(),
-        arity: 0,
-        func: gc_collect,
-    });
-    exports.insert("collect_minor".into(), Object::BuiltinFn {
-        name: "gc.collect_minor".into(),
-        arity: 0,
-        func: gc_collect_minor,
-    });
-    exports.insert("enable".into(), Object::BuiltinFn {
-        name: "gc.enable".into(),
-        arity: 0,
-        func: gc_enable,
-    });
-    exports.insert("disable".into(), Object::BuiltinFn {
-        name: "gc.disable".into(),
-        arity: 0,
-        func: gc_disable,
-    });
-    exports.insert("is_enabled".into(), Object::BuiltinFn {
-        name: "gc.is_enabled".into(),
-        arity: 0,
-        func: gc_is_enabled,
-    });
-    exports.insert("set_threshold".into(), Object::BuiltinFn {
-        name: "gc.set_threshold".into(),
-        arity: 2,
-        func: gc_set_threshold,
-    });
-    exports.insert("set_promotion_age".into(), Object::BuiltinFn {
-        name: "gc.set_promotion_age".into(),
-        arity: 1,
-        func: gc_set_promotion_age,
-    });
-    exports.insert("set_gc_threads".into(), Object::BuiltinFn {
-        name: "gc.set_gc_threads".into(),
-        arity: 1,
-        func: gc_set_gc_threads,
-    });
-    exports.insert("stats".into(), Object::BuiltinFn {
-        name: "gc.stats".into(),
-        arity: 0,
-        func: gc_stats,
-    });
-    exports.insert("count".into(), Object::BuiltinFn {
-        name: "gc.count".into(),
-        arity: 0,
-        func: gc_count,
-    });
-    exports.insert("mem_alloc".into(), Object::BuiltinFn {
-        name: "gc.mem_alloc".into(),
-        arity: 0,
-        func: gc_mem_alloc,
-    });
-    exports.insert("mem_live".into(), Object::BuiltinFn {
-        name: "gc.mem_live".into(),
-        arity: 0,
-        func: gc_mem_live,
-    });
+    // 原生函数通过 alloc_native_function 分配为堆对象（Ref + TypeTag::FUNCTION）
+    // 参照 Task 20 对象模型、Task 25 内置函数注册
+    exports.insert("collect".into(), alloc_native_function(NativeFunction {
+        name: "gc.collect".into(), arity: 0, func: gc_collect,
+    }));
+    exports.insert("collect_minor".into(), alloc_native_function(NativeFunction {
+        name: "gc.collect_minor".into(), arity: 0, func: gc_collect_minor,
+    }));
+    exports.insert("enable".into(), alloc_native_function(NativeFunction {
+        name: "gc.enable".into(), arity: 0, func: gc_enable,
+    }));
+    exports.insert("disable".into(), alloc_native_function(NativeFunction {
+        name: "gc.disable".into(), arity: 0, func: gc_disable,
+    }));
+    exports.insert("is_enabled".into(), alloc_native_function(NativeFunction {
+        name: "gc.is_enabled".into(), arity: 0, func: gc_is_enabled,
+    }));
+    exports.insert("set_threshold".into(), alloc_native_function(NativeFunction {
+        name: "gc.set_threshold".into(), arity: 2, func: gc_set_threshold,
+    }));
+    exports.insert("set_promotion_age".into(), alloc_native_function(NativeFunction {
+        name: "gc.set_promotion_age".into(), arity: 1, func: gc_set_promotion_age,
+    }));
+    exports.insert("set_gc_threads".into(), alloc_native_function(NativeFunction {
+        name: "gc.set_gc_threads".into(), arity: 1, func: gc_set_gc_threads,
+    }));
+    exports.insert("stats".into(), alloc_native_function(NativeFunction {
+        name: "gc.stats".into(), arity: 0, func: gc_stats,
+    }));
+    exports.insert("count".into(), alloc_native_function(NativeFunction {
+        name: "gc.count".into(), arity: 0, func: gc_count,
+    }));
+    exports.insert("mem_alloc".into(), alloc_native_function(NativeFunction {
+        name: "gc.mem_alloc".into(), arity: 0, func: gc_mem_alloc,
+    }));
+    exports.insert("mem_live".into(), alloc_native_function(NativeFunction {
+        name: "gc.mem_live".into(), arity: 0, func: gc_mem_live,
+    }));
 
     vm.builtin_modules.insert("gc".into(), Module { name: "gc".into(), exports, globals: HashMap::new() });
 }
@@ -151,18 +129,18 @@ fn gc_collect(vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
 fn gc_stats(vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
     let stats = vm.gc.get_stats();
     let mut pairs = Vec::new();
-    pairs.push((Object::String("minor_count".into()), Object::Int(stats.minor_count as i64)));
-    pairs.push((Object::String("major_count".into()), Object::Int(stats.major_count as i64)));
-    pairs.push((Object::String("total_pause_ns".into()), Object::Int(stats.total_pause_ns as i64)));
-    pairs.push((Object::String("last_pause_ns".into()), Object::Int(stats.last_pause_ns as i64)));
-    pairs.push((Object::String("young_size".into()), Object::Int(stats.young_size as i64)));
-    pairs.push((Object::String("old_size".into()), Object::Int(stats.old_size as i64)));
-    pairs.push((Object::String("los_size".into()), Object::Int(stats.los_size as i64)));
-    pairs.push((Object::String("bytes_freed".into()), Object::Int(stats.bytes_freed as i64)));
-    pairs.push((Object::String("promotion_age".into()), Object::Int(stats.promotion_age as i64)));
-    pairs.push((Object::String("gc_threads".into()), Object::Int(stats.gc_threads as i64)));
-    pairs.push((Object::String("gc_enabled".into()), Object::Bool(stats.gc_enabled)));
-    Ok(Object::Dict(pairs))
+    pairs.push((alloc_string("minor_count"), Object::Int(stats.minor_count as i64)));
+    pairs.push((alloc_string("major_count"), Object::Int(stats.major_count as i64)));
+    pairs.push((alloc_string("total_pause_ns"), Object::Int(stats.total_pause_ns as i64)));
+    pairs.push((alloc_string("last_pause_ns"), Object::Int(stats.last_pause_ns as i64)));
+    pairs.push((alloc_string("young_size"), Object::Int(stats.young_size as i64)));
+    pairs.push((alloc_string("old_size"), Object::Int(stats.old_size as i64)));
+    pairs.push((alloc_string("los_size"), Object::Int(stats.los_size as i64)));
+    pairs.push((alloc_string("bytes_freed"), Object::Int(stats.bytes_freed as i64)));
+    pairs.push((alloc_string("promotion_age"), Object::Int(stats.promotion_age as i64)));
+    pairs.push((alloc_string("gc_threads"), Object::Int(stats.gc_threads as i64)));
+    pairs.push((alloc_string("gc_enabled"), Object::Bool(stats.gc_enabled)));
+    Ok(alloc_dict(&pairs))
 }
 ```
 

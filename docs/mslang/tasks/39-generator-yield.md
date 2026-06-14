@@ -4,7 +4,7 @@
 Phase 4.7 - 控制流 + 高级语法
 
 ## 前置任务
-28-closures
+28-closures, 37-try-except-finally
 
 ## 目标
 实现生成器函数与 yield/yield from，支持帧快照/恢复机制，生成器对象可作为迭代器在 for..in 中使用。同时实现生成器表达式（圆括号推导式）的编译与执行。
@@ -311,6 +311,65 @@ fn compile_generator_expression(&mut self, gen_expr: &GeneratorExpression) -> Re
 - 多个 `for_clause` 编译为嵌套循环
 - `condition` 编译为 `if` 包裹的 `yield`
 
+### 9. 生成器关闭与 GC 清理（CLOSE_GENERATOR）
+
+参照 [05-control-flow](../05-control-flow.md) § GeneratorExit、[07-advanced](../07-advanced.md) § 生成器关闭、[11-bytecode-vm](../11-bytecode-vm.md) § CLOSE_GENERATOR：
+
+当生成器被 GC 回收但尚未耗尽（state != Exhausted）时，VM 必须自动注入 `GeneratorExit` 异常并恢复生成器帧执行，以触发 defer/finally 资源清理（如关闭文件句柄）。
+
+#### CLOSE_GENERATOR 指令
+
+```rust
+OpCode::CloseGenerator => {
+    let gen_obj = self.stack_pop();
+    if let Object::Ref(ptr) = gen_obj {
+        if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8 {
+            self.close_generator(*ptr)?;
+        }
+    }
+    Ok(())
+}
+```
+
+#### close_generator 实现
+
+```rust
+fn close_generator(&mut self, gen_ptr: *mut MsObjHeader) -> Result<()> {
+    let gen = unsafe { read_generator(gen_ptr) };
+    match gen.state {
+        GeneratorState::Exhausted | GeneratorState::Closed => return Ok(()),
+        GeneratorState::Running => return Ok(()), // 正在运行，不重复关闭
+        GeneratorState::Suspended => {}
+    }
+
+    // 注入 GeneratorExit 异常并恢复执行
+    let gen_exit = self.create_exception("GeneratorExit", "generator closed");
+    self.resume_generator_with_exception(gen_ptr, gen_exit)?;
+
+    // 恢复后生成器应执行完 defer/finally 并到达 Exhausted 状态
+    // 若生成器内部捕获了 GeneratorExit（不应发生），忽略
+    Ok(())
+}
+```
+
+#### GC finalizer 钩子
+
+在 Task 52-gc 的 finalizer 阶段，对 state == Suspended 的 Generator 对象调用 `close_generator`：
+
+```rust
+// 参照 14-gc.md § finalizer 队列
+fn finalize_generator(obj: *mut MsObjHeader) {
+    let gen = unsafe { read_generator(obj) };
+    if gen.state == GeneratorState::Suspended {
+        // 通过 VM 引用注入 GeneratorExit 并恢复执行
+        // 注意：finalizer 在 GC 安全点执行，此时 mutator 已暂停
+        vm.close_generator(obj).ok();
+    }
+}
+```
+
+> **注意**：生成器的 GC finalizer 需要访问 VM 状态以恢复执行帧。Task 52-gc 的 finalizer 队列设计需支持携带 VM 引用或使用回调机制。
+
 ## 验证标准
 
 1. 调用生成器函数返回 Generator 对象，不执行函数体
@@ -322,6 +381,7 @@ fn compile_generator_expression(&mut self, gen_expr: &GeneratorExpression) -> Re
 7. 无限生成器（如 fibonacci）可惰性求值
 8. 生成器表达式 `(x*x for x in range(10))` 返回惰性 Generator 对象
 9. 带过滤的生成器表达式 `(x for x in nums if x > 0)` 正确过滤
+10. 未耗尽的生成器被 GC 回收时自动注入 GeneratorExit，触发 defer/finally 清理
 
 ## 测试用例
 

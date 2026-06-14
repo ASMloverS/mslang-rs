@@ -40,6 +40,7 @@ Error
 ├── message      # 错误消息（string）
 ├── type         # 错误类型名（string）
 ├── traceback    # 堆栈跟踪（string）
+├── __cause__    # 链式异常中的原始异常（Error 或 nil）
 ```
 
 ### 内置异常类型层级
@@ -56,7 +57,8 @@ Error
 ├── IOError
 ├── ZeroDivisionError
 ├── OverflowError
-└── StopIteration
+├── StopIteration
+└── GeneratorExit       # 生成器关闭（内部异常，不可被用户 except 捕获）
 ```
 
 ### 语义
@@ -84,11 +86,13 @@ fn init_exception_classes(&mut self) {
     error_class.set_attr("message", Object::Nil);
     error_class.set_attr("type", Object::Nil);
     error_class.set_attr("traceback", Object::Nil);
+    error_class.set_attr("__cause__", Object::Nil);
     
     let subclasses = [
         "ValueError", "TypeError", "IndexError", "KeyError",
         "AttributeError", "NameError", "RuntimeError", "IOError",
         "ZeroDivisionError", "OverflowError", "StopIteration",
+        "GeneratorExit",
     ];
     
     for name in &subclasses {
@@ -109,6 +113,7 @@ throw ValueError("test")
 → 调用 __init__(self, "test")（或直接设置 message 字段）
 → 设置 type = "ValueError"
 → 设置 traceback = 当前调用栈信息
+→ 设置 __cause__ = nil（除非由 defer 异常链设置）
 ```
 
 ### 2. 编译 try/except/finally
@@ -184,15 +189,23 @@ OpCode::CATCH => {
 
 ```rust
 fn exception_matches(&self, exception: &Object, target_type: &str) -> bool {
-    if let Object::Instance(inst) = exception {
-        let mut class = inst.class.clone();
-        loop {
-            if class.name == target_type {
-                return true;
+    if let Object::Ref(ptr) = exception {
+        if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+            let inst = unsafe { read_instance(*ptr) };
+            // GeneratorExit 不可被用户 except 捕获（参照 05-control-flow.md § 异常类型）
+            // 仅 CLOSE_GENERATOR 内部流程可处理
+            if inst.class_name == "GeneratorExit" && target_type != "GeneratorExit" {
+                return false;
             }
-            match &class.parent {
-                Some(parent) => class = parent.clone(),
-                None => return false,
+            let mut class = inst.class.clone();
+            loop {
+                if class.name == target_type {
+                    return true;
+                }
+                match &class.parent {
+                    Some(parent) => class = parent.clone(),
+                    None => return false,
+                }
             }
         }
     }
@@ -250,6 +263,8 @@ fn throw(&mut self, err: Object) -> Result<()> {
 6. 子类异常匹配父类型 except
 7. throw 正确创建和抛出异常
 8. 未捕获异常终止程序并打印堆栈
+9. 异常对象含 `__cause__` 属性（默认 nil，defer 异常链时指向原异常）
+10. GeneratorExit 不可被用户 except 捕获
 
 ## 测试用例
 

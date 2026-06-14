@@ -69,6 +69,7 @@ enum TypeTag {
     FUTURE       = 13,
     CHANNEL      = 14,
     BOUND_METHOD = 15,
+    JOIN_HANDLE  = 16,
     LARGE_OBJECT = 0xFF,
 }
 ```
@@ -119,6 +120,7 @@ pub struct MsObjHeader {
 
 ```rust
 /// 堆对象类型标签。来自 14-gc.md。
+/// 本定义为全局唯一权威 TypeTag，其他任务（52-gc 等）应引用此处，不得重复定义。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeTag {
@@ -137,6 +139,7 @@ pub enum TypeTag {
     FUTURE       = 13,
     CHANNEL      = 14,
     BOUND_METHOD = 15,
+    JOIN_HANDLE  = 16,
     LARGE_OBJECT = 0xFF,
 }
 ```
@@ -326,6 +329,10 @@ impl std::hash::Hash for Object {
             Object::Bool(b) => b.hash(state),
             Object::Int(n) => n.hash(state),
             Object::Float(f) => {
+                // NaN 不可哈希（参照 02-types.md § hash）
+                if f.is_nan() {
+                    panic!("TypeError: unhashable type: float NaN");
+                }
                 if *f == 0.0 {
                     0.0f64.to_bits().hash(state)
                 } else {

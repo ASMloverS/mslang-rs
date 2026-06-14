@@ -114,7 +114,7 @@ fn native_json_stringify(vm: &mut VM, args: Vec<Object>) -> Result<Object> {
     let json_val = object_to_json_value(&args[0])?;
     let s = serde_json::to_string(&json_val)
         .map_err(|e| MspError::RuntimeError(format!("json stringify error: {}", e)))?;
-    Ok(Object::String(Gc::new(s)))
+    Ok(alloc_string(&s))
 }
 
 fn object_to_json_value(obj: &Object) -> Result<serde_json::Value> {

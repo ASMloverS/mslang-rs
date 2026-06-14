@@ -166,7 +166,7 @@ fn compile_unpack_assign(&mut self, targets: &[String], value: &Expr) {
         match self.resolve_local(target) {
             Some(slot) => self.emit_with_operand(OpCode::STORE_LOCAL, slot as u8),
             None => {
-                let idx = self.add_constant(Object::String(target.clone().into()));
+                let idx = self.add_constant(alloc_string(target));
                 self.emit_with_operand(OpCode::STORE_GLOBAL, idx as u16);
             }
         }

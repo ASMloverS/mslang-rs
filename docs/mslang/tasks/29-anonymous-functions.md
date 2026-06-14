@@ -116,7 +116,7 @@ fn compile_fn_literal(&mut self, params: &[String], body: &Block) {
         constants: func_unit.constants,
         upvalue_count: func_unit.upvalues.len(),
     };
-    let idx = self.add_constant(Object::Function(Gc::new(function)));
+    let idx = self.add_constant(alloc_function(function));
 
     self.emit_with_operand(OpCode::CLOSURE, idx as u16);
 

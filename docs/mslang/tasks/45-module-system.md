@@ -140,20 +140,77 @@ struct ModuleResolver {
 ```rust
 OpCode::IMPORT => {
     let module_name = self.read_constant(idx);
-    let module = self.module_resolver.load(&module_name, self)?;
-    self.stack.push(Object::Module(module));
+    let module_ptr = self.module_resolver.load(&module_name, self)?;
+    // Module 通过 Ref + TypeTag::MODULE 表示（参照 Task 20 对象模型）
+    self.stack.push(Object::Ref(module_ptr));
 }
 ```
 
 ### 5. 模块加载流程
 
 1. 检查缓存：如果已加载，直接返回缓存的 Module
-2. 解析路径：调用 `ModuleResolver::resolve` 查找 .ms 文件
-3. 读取源码：读取文件内容
-4. 编译：Lexer → Parser → Compiler，生成字节码
-5. 执行：在新的全局作用域中执行字节码
-6. 构建导出表：扫描顶层定义，fn/class/const 加入 exports
-7. 缓存：将 Module 存入缓存
+2. **循环导入检测**：检查 `loading_stack`，若模块已在加载中（部分初始化），参照 [09-modules](../09-modules.md) § 循环导入：
+   - 返回已部分初始化的 Module（允许访问已定义的名称）
+   - 访问尚未初始化的名称时抛出 `NameError`
+3. 解析路径：调用 `ModuleResolver::resolve` 查找 .ms 文件
+4. 读取源码：读取文件内容
+5. 编译：Lexer → Parser → Compiler，生成字节码
+6. **加入 loading_stack**：标记为「加载中」（防止循环导入时重复执行）
+7. 执行：在新的全局作用域中执行字节码
+8. 构建导出表：扫描顶层定义，fn/class/const 加入 exports
+9. **移出 loading_stack**：标记为「加载完成」
+10. 缓存：将 Module 存入缓存
+
+```rust
+struct ModuleResolver {
+    search_paths: Vec<PathBuf>,
+    cache: HashMap<String, *mut MsObjHeader>,
+    loading_stack: HashSet<String>,  // 正在加载中的模块（循环导入检测）
+}
+
+fn load(&mut self, name: &str, vm: &mut VM) -> Result<*mut MsObjHeader, String> {
+    // 1. 已缓存 → 直接返回
+    if let Some(ptr) = self.cache.get(name) {
+        return Ok(*ptr);
+    }
+
+    // 2. 循环导入检测：模块正在加载中 → 返回部分初始化的 Module
+    if self.loading_stack.contains(name) {
+        // 返回部分初始化的 Module（已在 cache 中预留空壳）
+        // 访问未初始化名称时由 GET_ATTR 触发 NameError
+        let partial = self.cache.get(name).copied()
+            .ok_or_else(|| format!("ImportError: circular import detected for '{}'", name))?;
+        return Ok(partial);
+    }
+
+    // 3. 解析路径
+    let path = self.resolve(name)?;
+
+    // 4. 预分配空 Module 并加入 loading_stack + cache（支持循环导入部分访问）
+    let partial_module = alloc_module(name, HashMap::new(), HashMap::new());
+    let partial_ptr = if let Object::Ref(p) = partial_module { p } else { unreachable!() };
+    self.loading_stack.insert(name.to_string());
+    self.cache.insert(name.to_string(), partial_ptr);
+
+    // 5-7. 编译并执行
+    let source = std::fs::read_to_string(&path)
+        .map_err(|e| format!("ImportError: cannot load '{}': {}", name, e))?;
+    let unit = compile(&source, name)?;
+    let (exports, globals) = vm.execute_module(unit)?;
+
+    // 8. 填充 Module
+    unsafe {
+        let module = read_module_mut(partial_ptr);
+        module.exports = exports;
+        module.globals = globals;
+    }
+
+    // 9. 标记为加载完成
+    self.loading_stack.remove(name);
+
+    Ok(partial_ptr)
+}
+```
 
 ## 验证标准
 
@@ -168,6 +225,7 @@ OpCode::IMPORT => {
 9. `import @std math` 正确从标准库目录加载（跳过当前目录）
 10. `from @std io import open` 正确加载标准库模块的指定名称
 11. 安全模式（`MS_SAFE=1`）下，非 `@std` import 被拒绝
+12. 循环导入（A imports B, B imports A）不导致死循环：部分初始化的模块可访问已定义名称，未定义名称抛出 NameError
 
 ## 测试用例
 

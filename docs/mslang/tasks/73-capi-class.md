@@ -72,9 +72,9 @@ MS_API MsStatus  msClassAddStatic(MsVM* vm, MsValue* cls, const char* name, MsVa
 | `MsValue` | `src/capi/types.rs` | 值的不透明类型 |
 | `MsStatus` | `src/capi/types.rs` | 返回状态枚举 |
 | `MsCFunction` | `include/mslang/types.h` | C 函数指针类型 |
-| `Object::Class` | `src/vm/object.rs` | 运行时 Class 对象 |
-| `Object::Instance` | `src/vm/object.rs` | 运行时 Instance 对象 |
-| `Object::NativeFunction` | `src/vm/object.rs` | 原生函数包装 |
+| `Object::Ref` + `TypeTag::CLASS` | `src/vm/object.rs` | 运行时 Class 对象 |
+| `Object::Ref` + `TypeTag::INSTANCE` | `src/vm/object.rs` | 运行时 Instance 对象 |
+| `Object::Ref` + `TypeTag::FUNCTION` | `src/vm/object.rs` | 原生函数（通过 `alloc_native_function`） |
 
 ### msGetClass
 
@@ -206,7 +206,8 @@ pub extern "C" fn msInstanceGet(
     let inner = vm_ref.inner.lock().unwrap();
 
     match &obj_inner {
-        Object::Instance(inst) => {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance(*ptr) };
             if let Some(field_val) = inst.fields.get(&attr_str) {
                 let val = Box::new(MsValue { inner: field_val.clone() });
                 return Box::into_raw(val);
@@ -259,7 +260,8 @@ pub extern "C" fn msInstanceSet(
     let mut inner = vm_ref.inner.lock().unwrap();
 
     match &mut obj_inner {
-        Object::Instance(inst) => {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
+            let inst = unsafe { read_instance_mut(*ptr) };
             let old = inst.fields.insert(attr_str, val_obj);
             if old.is_none() || old != Some(val_obj) {
                 inner.vm.write_barrier(&obj_inner, &unsafe { (*val).inner });
@@ -299,7 +301,9 @@ pub extern "C" fn msIsInstance(
     let cls_inner = unsafe { (*cls).inner.clone() };
 
     let obj_class = match &obj_inner {
-        Object::Instance(inst) => &inst.class_obj,
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
+            &unsafe { read_instance(*ptr) }.class_obj
+        }
         _ => return MS_FALSE,
     };
 

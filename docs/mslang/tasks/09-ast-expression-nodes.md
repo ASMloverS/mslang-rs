@@ -185,7 +185,7 @@ pub enum Literal {
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BinaryOp {
-    Add, Sub, Mul, Div, FloorDiv, Mod, Power,
+    Add, Subtract, Multiply, Divide, FloorDiv, Modulo, Power,
     Equal, NotEqual, Less, Greater, LessEqual, GreaterEqual,
     BitAnd, BitOr, BitXor, LeftShift, RightShift,
     And, Or,
@@ -312,8 +312,8 @@ impl std::fmt::Display for Literal {
 impl std::fmt::Display for BinaryOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            BinaryOp::Add => "+", BinaryOp::Sub => "-", BinaryOp::Mul => "*",
-            BinaryOp::Div => "/", BinaryOp::FloorDiv => "//", BinaryOp::Mod => "%",
+            BinaryOp::Add => "+", BinaryOp::Subtract => "-", BinaryOp::Multiply => "*",
+            BinaryOp::Divide => "/", BinaryOp::FloorDiv => "//", BinaryOp::Modulo => "%",
             BinaryOp::Power => "**", BinaryOp::Equal => "==", BinaryOp::NotEqual => "!=",
             BinaryOp::Less => "<", BinaryOp::Greater => ">",
             BinaryOp::LessEqual => "<=", BinaryOp::GreaterEqual => ">=",
@@ -378,7 +378,7 @@ mod tests {
                 op: BinaryOp::Add,
                 right: Box::new(Expr::Literal(Literal::Int(2))),
             }),
-            op: BinaryOp::Mul,
+            op: BinaryOp::Multiply,
             right: Box::new(Expr::Literal(Literal::Int(3))),
         };
         assert_eq!(format!("{}", expr), "((1 + 2) * 3)");

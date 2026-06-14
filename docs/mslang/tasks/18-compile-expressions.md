@@ -43,7 +43,7 @@ fn compile_literal(&mut self, expr: &Expr, line: usize) -> Result<(), String> {
     match expr {
         Expr::Int(n) => self.emit_constant(Object::Int(*n), line),
         Expr::Float(f) => self.emit_constant(Object::Float(*f), line),
-        Expr::String(s) => self.emit_constant(Object::String(Gc::new(s.clone())), line),
+        Expr::String(s) => self.emit_constant(alloc_string(s), line),
         Expr::Bool(true) => self.emit_byte(OpCode::True as u8, line),
         Expr::Bool(false) => self.emit_byte(OpCode::False as u8, line),
         Expr::Nil => self.emit_byte(OpCode::Nil as u8, line),
@@ -64,7 +64,7 @@ fn compile_identifier(&mut self, name: &str, line: usize) -> Result<(), String> 
         self.emit_byte(OpCode::LoadUpvalue as u8, line);
         self.emit_byte(idx as u8, line);
     } else {
-        let name_idx = self.add_constant(Object::String(Gc::new(name.to_string())));
+        let name_idx = self.add_constant(alloc_string(name));
         self.emit_byte(OpCode::LoadGlobal as u8, line);
         self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
     }
@@ -125,6 +125,8 @@ fn compile_unary(&mut self, op: &UnaryOp, operand: &Expr, line: usize) -> Result
 
 引用 [03-syntax.md](../03-syntax.md) 链式比较：`1 < x < 10` 等价于 `(1 < x) and (x < 10)`
 
+编译策略：对每个中间操作数生成额外加载，避免依赖 Swap 指令。
+
 ```rust
 fn compile_comparison(&mut self, first: &Expr, comparisons: &[(BinaryOp, Expr)], line: usize) -> Result<(), String> {
     self.compile_expression(first)?;
@@ -134,17 +136,26 @@ fn compile_comparison(&mut self, first: &Expr, comparisons: &[(BinaryOp, Expr)],
         self.emit_byte(self.comparison_opcode(op) as u8, line);
         return Ok(());
     }
+    // 链式比较：a op1 b op2 c => (a op1 b) and (b op2 c) and ...
+    // 策略：对每段，加载右操作数→比较→如果为 false 短路跳到结束
+    let mut end_jumps: Vec<usize> = Vec::new();
     for (i, (op, right)) in comparisons.iter().enumerate() {
-        self.compile_expression(right)?;
-        let opcode = self.comparison_opcode(op);
-        self.emit_byte(opcode as u8, line);
-        if i < comparisons.len() - 1 {
-            self.emit_byte(OpCode::Dup as u8, line);
-            self.emit_byte(OpCode::Swap as u8, line);
+        if i > 0 {
+            // 重新加载上一个操作数作为本次左操作数
+            self.compile_expression(&comparisons[i - 1].1)?;
         }
+        self.compile_expression(right)?;
+        self.emit_byte(self.comparison_opcode(op) as u8, line);
+        // 如果比较结果为 false，短路到结束（合并为 and）
+        let jump = self.emit_jump(OpCode::JumpIfFalse, line);
+        end_jumps.push(jump);
+        self.emit_byte(OpCode::Pop as u8, line); // 弹出 bool true
     }
-    for _ in 1..comparisons.len() {
-        self.emit_byte(OpCode::BitAnd as u8, line);
+    // 所有比较都为 true：压入 true
+    self.emit_byte(OpCode::True as u8, line);
+    let end_pos = self.current_offset();
+    for jump in &end_jumps {
+        self.patch_jump_at(*jump, end_pos);
     }
     Ok(())
 }
@@ -165,7 +176,7 @@ fn compile_assignment(&mut self, target: &Expr, value: &Expr, op: &Option<Compou
                 self.emit_byte(OpCode::StoreLocal as u8, line);
                 self.emit_byte(slot as u8, line);
             } else {
-                let name_idx = self.add_constant(Object::String(Gc::new(name.to_string())));
+        let name_idx = self.add_constant(alloc_string(name));
                 self.emit_byte(OpCode::StoreGlobal as u8, line);
                 self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
             }
@@ -177,7 +188,7 @@ fn compile_assignment(&mut self, target: &Expr, value: &Expr, op: &Option<Compou
         }
         Expr::Dot { object, name } => {
             self.compile_expression(object)?;
-            let name_idx = self.add_constant(Object::String(Gc::new(name.to_string())));
+            let name_idx = self.add_constant(alloc_string(name));
             self.emit_byte(OpCode::SetAttr as u8, line);
             self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
         }
@@ -224,7 +235,7 @@ fn compile_index(&mut self, object: &Expr, index: &Expr, line: usize) -> Result<
 
 fn compile_dot(&mut self, object: &Expr, name: &str, line: usize) -> Result<(), String> {
     self.compile_expression(object)?;
-    let name_idx = self.add_constant(Object::String(Gc::new(name.to_string())));
+    let name_idx = self.add_constant(alloc_string(name));
     self.emit_byte(OpCode::GetAttr as u8, line);
     self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
     Ok(())

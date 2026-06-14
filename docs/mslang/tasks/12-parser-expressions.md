@@ -578,7 +578,7 @@ mod tests {
         match expr {
             Expr::Binary { left, op: BinaryOp::Add, right } => {
                 assert!(matches!(*left, Expr::Literal(Literal::Int(1))));
-                assert!(matches!(*right, Expr::Binary { op: BinaryOp::Mul, .. }));
+                assert!(matches!(*right, Expr::Binary { op: BinaryOp::Multiply, .. }));
             }
             _ => panic!("expected add at top level"),
         }

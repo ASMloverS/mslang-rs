@@ -131,6 +131,7 @@ Phase 2.1 - 字节码编译 + VM 核心
 | `FOR_ITER` | `offset(2)` | 迭代下一步，结束则跳转 |
 | `YIELD` | — | yield 暂停 |
 | `YIELD_FROM` | — | yield from 委托 |
+| `CLOSE_GENERATOR` | — | 关闭生成器（注入 GeneratorExit，触发 defer/finally） |
 
 #### 构造器（1 字节 count）
 
@@ -248,6 +249,7 @@ pub enum OpCode {
     ForIter,
     Yield,
     YieldFrom,
+    CloseGenerator,
     BuildList,
     BuildDict,
     BuildTuple,
@@ -445,6 +447,7 @@ mod tests {
             OpCode::Call, OpCode::Return, OpCode::TailCall,
             OpCode::Closure, OpCode::CloseUpvalue,
             OpCode::Iterator, OpCode::ForIter, OpCode::Yield, OpCode::YieldFrom,
+            OpCode::CloseGenerator,
             OpCode::BuildList, OpCode::BuildDict, OpCode::BuildTuple,
             OpCode::BuildSet, OpCode::Unpack,
             OpCode::Class, OpCode::Method, OpCode::Inherit,

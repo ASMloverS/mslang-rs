@@ -68,7 +68,11 @@ not a      # 返回 bool
 impl Object {
     pub fn add(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
-            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a + b)),
+            (Object::Int(a), Object::Int(b)) => {
+                a.checked_add(*b)
+                    .map(Object::Int)
+                    .ok_or_else(|| "OverflowError: integer addition overflow".to_string())
+            }
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 + b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a + *b as f64)),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a + b)),
@@ -88,7 +92,11 @@ impl Object {
 
     pub fn subtract(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
-            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a - b)),
+            (Object::Int(a), Object::Int(b)) => {
+                a.checked_sub(*b)
+                    .map(Object::Int)
+                    .ok_or_else(|| "OverflowError: integer subtraction overflow".to_string())
+            }
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 - b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a - *b as f64)),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a - b)),
@@ -101,7 +109,11 @@ impl Object {
 
     pub fn multiply(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
-            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a * b)),
+            (Object::Int(a), Object::Int(b)) => {
+                a.checked_mul(*b)
+                    .map(Object::Int)
+                    .ok_or_else(|| "OverflowError: integer multiplication overflow".to_string())
+            }
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 * b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a * *b as f64)),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a * b)),
@@ -123,12 +135,14 @@ impl Object {
 
     pub fn divide(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
-            (_, Object::Int(0)) | (_, Object::Float(0.0)) => {
+            (_, Object::Int(0)) => {
                 Err("ZeroDivisionError: division by zero".to_string())
             }
             (Object::Int(a), Object::Int(b)) => Ok(Object::Float(*a as f64 / *b as f64)),
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 / b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a / *b as f64)),
+            // Float 除零遵循 IEEE 754：1.0/0.0 = +inf, -1.0/0.0 = -inf, 0.0/0.0 = NaN
+            // 参照 02-types.md § 特殊浮点值
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a / b)),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for /: '{}' and '{}'",
@@ -180,7 +194,9 @@ impl Object {
     pub fn power(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
             (Object::Int(a), Object::Int(b)) if *b >= 0 => {
-                Ok(Object::Int(a.pow(*b as u32)))
+                a.checked_pow(*b as u32)
+                    .map(Object::Int)
+                    .ok_or_else(|| "OverflowError: integer power overflow".to_string())
             }
             (Object::Int(a), Object::Int(b)) => {
                 Ok(Object::Float((*a as f64).powf(*b as f64)))
@@ -292,7 +308,17 @@ impl Object {
 
     pub fn left_shift(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
-            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a << b)),
+            (Object::Int(a), Object::Int(b)) if *b < 0 => {
+                Err("ValueError: negative shift count".to_string())
+            }
+            (Object::Int(a), Object::Int(b)) if *b >= 64 => {
+                Err("ValueError: shift count too large".to_string())
+            }
+            (Object::Int(a), Object::Int(b)) => {
+                a.checked_shl(*b as u32)
+                    .map(Object::Int)
+                    .ok_or_else(|| "OverflowError: integer left shift overflow".to_string())
+            }
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for <<: '{}' and '{}'",
                 self.type_name(), other.type_name()
@@ -302,6 +328,12 @@ impl Object {
 
     pub fn right_shift(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
+            (Object::Int(a), Object::Int(b)) if *b < 0 => {
+                Err("ValueError: negative shift count".to_string())
+            }
+            (Object::Int(a), Object::Int(b)) if *b >= 64 => {
+                Err("ValueError: shift count too large".to_string())
+            }
             (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a >> b)),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for >>: '{}' and '{}'",
@@ -391,7 +423,8 @@ impl Object {
 6. 位运算仅 Int 支持，其他类型报 TypeError
 7. `and`/`or` 返回实际值（非 bool），`not` 返回 bool
 8. 类型转换正确：`int("42") == 42`，`float("3.14")`，`str(42)`
-9. 除零报 ZeroDivisionError
+9. Int 除零报 ZeroDivisionError；Float 除零遵循 IEEE 754（`1.0 / 0.0` → Infinity）
+10. Int 算术溢出抛 OverflowError（`9223372036854775807 + 1` → OverflowError）
 
 ## 测试用例
 
@@ -462,7 +495,25 @@ mod tests {
 
     #[test]
     fn test_division_by_zero() {
+        // Int 除零 → ZeroDivisionError
         let result = Object::Int(10).divide(&Object::Int(0));
+        assert!(result.is_err());
+
+        // Float 除零 → IEEE 754（参照 02-types.md § 特殊浮点值）
+        let result = Object::Float(1.0).divide(&Object::Float(0.0)).unwrap();
+        assert_eq!(result, Object::Float(f64::INFINITY));
+
+        let result = Object::Float(-1.0).divide(&Object::Float(0.0)).unwrap();
+        assert_eq!(result, Object::Float(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_integer_overflow() {
+        let max_int = Object::Int(i64::MAX);
+        let result = max_int.add(&Object::Int(1));
+        assert!(result.is_err());
+
+        let result = Object::Int(2).power(&Object::Int(63));
         assert!(result.is_err());
     }
 

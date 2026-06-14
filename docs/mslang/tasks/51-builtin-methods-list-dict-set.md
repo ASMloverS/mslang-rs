@@ -113,7 +113,7 @@ fn call_list_method(
         let mapped = vm.call_function(&fn_obj, vec![item.clone()])?;
         result.push(mapped);
     }
-    Ok(Object::List(Gc::new(result)))
+    Ok(alloc_list(&result))
 }
 ```
 
@@ -129,7 +129,7 @@ fn call_list_method(
             result.push(item.clone());
         }
     }
-    Ok(Object::List(Gc::new(result)))
+    Ok(alloc_list(&result))
 }
 ```
 

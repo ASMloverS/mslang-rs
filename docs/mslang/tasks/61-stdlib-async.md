@@ -72,16 +72,13 @@ result = await async.timeout(fn() {
 pub fn register_async_module(vm: &mut VM) {
     let mut exports = HashMap::new();
 
-    exports.insert("sleep".into(), Object::BuiltinFn {
-        name: "async.sleep".into(),
-        arity: 1,
-        func: async_sleep,
-    });
-    exports.insert("timeout".into(), Object::BuiltinFn {
-        name: "async.timeout".into(),
-        arity: 2,
-        func: async_timeout,
-    });
+    // 原生函数通过 alloc_native_function 分配为堆对象（Ref + TypeTag::FUNCTION）
+    exports.insert("sleep".into(), alloc_native_function(NativeFunction {
+        name: "async.sleep".into(), arity: 1, func: async_sleep,
+    }));
+    exports.insert("timeout".into(), alloc_native_function(NativeFunction {
+        name: "async.timeout".into(), arity: 2, func: async_timeout,
+    }));
 
     vm.builtin_modules.insert("async".into(), Module { name: "async".into(), exports, globals: HashMap::new() });
 }

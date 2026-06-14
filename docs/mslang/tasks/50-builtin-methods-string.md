@@ -42,9 +42,9 @@ fn call_string_method(
 ) -> Result<Object> {
     match method {
         "length" => Ok(Object::Int(receiver.chars().count() as i64)),
-        "upper" => Ok(Object::String(Gc::new(receiver.to_uppercase()))),
-        "lower" => Ok(Object::String(Gc::new(receiver.to_lowercase()))),
-        "strip" => Ok(Object::String(Gc::new(receiver.trim().to_string()))),
+        "upper" => Ok(alloc_string(&receiver.to_uppercase())),
+        "lower" => Ok(alloc_string(&receiver.to_lowercase())),
+        "strip" => Ok(alloc_string(receiver.trim())),
         "split" => { ... }
         "join" => { ... }
         "replace" => { ... }
@@ -73,15 +73,15 @@ fn call_string_method(
 "split" => {
     if args.is_empty() {
         let parts: Vec<Object> = receiver.split_whitespace()
-            .map(|s| Object::String(Gc::new(s.to_string())))
+            .map(|s| alloc_string(s))
             .collect();
-        Ok(Object::List(Gc::new(parts)))
+        Ok(alloc_list(&parts))
     } else {
         let sep = expect_string(&args[0])?;
         let parts: Vec<Object> = receiver.split(&sep)
-            .map(|s| Object::String(Gc::new(s.to_string())))
+            .map(|s| alloc_string(s))
             .collect();
-        Ok(Object::List(Gc::new(parts)))
+        Ok(alloc_list(&parts))
     }
 }
 ```
@@ -93,7 +93,7 @@ fn call_string_method(
     let parts: Vec<String> = list.iter()
         .map(|o| o.to_string())
         .collect();
-    Ok(Object::String(Gc::new(parts.join(receiver))))
+    Ok(alloc_string(&parts.join(receiver)))
 }
 ```
 
@@ -102,7 +102,7 @@ fn call_string_method(
 "replace" => {
     let old = expect_string(&args[0])?;
     let new = expect_string(&args[1])?;
-    Ok(Object::String(Gc::new(receiver.replace(&old, &new))))
+    Ok(alloc_string(&receiver.replace(&old, &new)))
 }
 ```
 
@@ -138,7 +138,7 @@ fn call_string_method(
         chars.len()
     };
     let sliced: String = chars[start..end].iter().collect();
-    Ok(Object::String(Gc::new(sliced)))
+    Ok(alloc_string(&sliced))
 }
 ```
 

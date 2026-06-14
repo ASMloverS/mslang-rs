@@ -274,9 +274,9 @@ OpCode::CALL => {
                 let stack_len = self.stack.len();
                 let drain_start = callee_idx + 1 + total_fixed;
                 let varargs: Vec<Object> = self.stack.drain(drain_start..).collect();
-                self.stack.push(Object::List(Gc::new(varargs)));
+                self.stack.push(alloc_list(&varargs));
             } else if has_variadic {
-                self.stack.push(Object::List(Gc::new(vec![])));
+                self.stack.push(alloc_list(&[]));
             }
 
             let stack_base = callee_idx;

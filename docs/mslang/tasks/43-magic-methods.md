@@ -106,11 +106,17 @@ OpCode::ADD => {
         }
     }
     
-    // 内置类型加法
+    // 内置类型加法（通过 Ref + TypeTag 识别，参照 Task 20 对象模型）
     match (a, b) {
         (Object::Int(x), Object::Int(y)) => self.stack_push(Object::Int(x + y)),
         (Object::Float(x), Object::Float(y)) => self.stack_push(Object::Float(x + y)),
-        (Object::String(x), Object::String(y)) => self.stack_push(Object::String(x + &y)),
+        (Object::Ref(x), Object::Ref(y))
+            if unsafe { (**x).type_tag } == TypeTag::STRING as u8
+            && unsafe { (**y).type_tag } == TypeTag::STRING as u8 =>
+        {
+            let result = format!("{}{}", unsafe { read_str(*x) }, unsafe { read_str(*y) });
+            self.stack_push(alloc_string(&result));
+        }
         // ...
     }
 }

@@ -89,7 +89,8 @@ OpCode::CHANNEL => {
     let buffer_size = self.read_byte() as usize;
     // buffer_size == 0 → 无缓冲 channel（发送方和接收方同步）
     let channel = Channel::new(buffer_size);
-    self.stack.push(Object::Channel(Gc::new(channel)));
+    // 通过堆分配为 Channel 对象（Ref + TypeTag::CHANNEL），参照 Task 20 对象模型
+    self.stack.push(alloc_channel(channel));
 }
 ```
 

@@ -172,18 +172,30 @@ fn slice_object(obj: Object, start: Option<i64>, stop: Option<i64>, step: i64) -
     let (adjusted_start, adjusted_stop) = adjust_slice_bounds(len, start, stop, step);
     
     match &obj {
-        Object::List(items) => {
-            let sliced: Vec<Object> = items.iter()
-                .enumerate()
-                .filter(|(i, _)| *i >= adjusted_start && *i < adjusted_stop)
-                .skip_while(|(i, _)| (*i - adjusted_start) % step.abs() as usize != 0)
-                .map(|(_, v)| v.clone())
-                .collect();
-            Ok(Object::List(Gc::new(sliced)))
+        Object::Ref(ptr) => {
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                let items = unsafe { read_list(*ptr) };
+                let sliced: Vec<Object> = items.iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= adjusted_start && *i < adjusted_stop)
+                    .skip_while(|(i, _)| (*i - adjusted_start) % step.abs() as usize != 0)
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                Ok(alloc_list(&sliced))
+            } else if tag == TypeTag::STRING as u8 {
+                let s = unsafe { read_str(*ptr) };
+                let sliced: String = s.chars()
+                    .enumerate()
+                    .filter(|(i, _)| *i >= adjusted_start && *i < adjusted_stop)
+                    .skip_while(|(i, _)| (*i - adjusted_start) % step.abs() as usize != 0)
+                    .map(|(_, c)| c)
+                    .collect();
+                Ok(alloc_string(&sliced))
+            } else {
+                Err(MspError::TypeError("object is not sliceable".to_string()))
+            }
         }
-        // String, Tuple 类似
-        _ => Err(...)
-    }
 }
 ```
 
