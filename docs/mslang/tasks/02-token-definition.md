@@ -16,6 +16,7 @@ Phase 1.2 - 基础设施
 ### TokenKind 枚举
 
 ```rust
+// 注意：Float(f64) 使 PartialEq 执行浮点精确比较，测试中应使用容差比较而非 ==
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // 字面量
@@ -30,7 +31,7 @@ pub enum TokenKind {
     Var, Const, Fn, Return,
     If, Elif, Else,
     While, For, In, Break, Continue,
-    Class, Zelf, Super,
+    Class, Zelf, Super,  // Zelf = 'self' keyword (Self is Rust reserved word)
     True, False, Nil,
     And, Or, Not,
     Try, Except, Finally, Defer, With, Throw,
@@ -60,9 +61,9 @@ pub enum TokenKind {
     Comma, Dot, Colon, Semicolon, Arrow,
     // 特殊符号
     At, LeftArrow,
-    // 范围运算符
+    // 范围运算符（标准 01-lexical.md:184-193 定义但 TokenKind 枚举遗漏，此处补充）
     DotDot, DotDotDot,
-    // 换行（语句终止）
+    // 换行/语句终止（标准 01-lexical.md:244 定义但 TokenKind 枚举遗漏，此处补充）
     Newline,
     // EOF
     Eof,
@@ -129,7 +130,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::DoubleSlash => write!(f, "//"),
             // 关键字变体名与词素不同时需显式映射，例如：
             TokenKind::Zelf => write!(f, "self"),
-            // ... 其余变体
+            // ... 其余变体（实现时需穷尽覆盖，Rust match 保证穷尽性）
             TokenKind::Eof => write!(f, "EOF"),
         }
     }
@@ -199,7 +200,11 @@ pub fn keyword_table() -> HashMap<&'static str, TokenKind> {
 }
 ```
 
+> **性能提示**：此函数每次调用都分配新的 `HashMap`。lexer 应在初始化时缓存结果（如 `std::sync::OnceLock`），而非逐 token 调用。详见 task 06 优化说明。
+
 4. **保留字集合**：`select`, `default`, `case`, `export`, `match`（不可用作标识符）
+
+> **标准偏差说明**：`01-lexical.md:336` 要求"保留字由关键字查找表统一管理"。当前实现将保留字与关键字分离为两个独立函数。lexer（task 06）需同时检查 `keyword_table()` 和 `reserved_words()`。实现时建议在 task 06 中将两者合并为单一查找结构（如 `HashMap<&str, enum KeywordEntry { Keyword(TokenKind), Reserved }>`），以消除遗漏风险。
 
 ```rust
 pub fn reserved_words() -> &'static [&'static str] {
@@ -219,7 +224,7 @@ pub fn reserved_words() -> &'static [&'static str] {
 - [ ] 6 个比较运算符
 - [ ] 6 个位运算符
 - [ ] 14 个赋值运算符（含 = 和 :=）
-- [ ] 12 个分隔符
+- [ ] 11 个分隔符
 - [ ] 3 个特殊符号（@, <-, :=）— 注意 := 已在赋值运算符中列为 ColonEqual
 - [ ] 2 个范围运算符（.., ...）
 - [ ] Newline（语句终止）
