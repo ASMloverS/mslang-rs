@@ -19,6 +19,7 @@ mslang-rs/
 ├── src/
 │   ├── main.rs                 # CLI 入口
 │   ├── lib.rs                  # 库入口，声明所有子模块
+│   ├── error.rs                # 统一错误类型
 │   ├── lexer/
 │   │   ├── mod.rs
 │   │   └── token.rs
@@ -97,6 +98,7 @@ pub mod error;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum MspError {
     #[error("lexer error at {line}:{column}: {message}")]
     LexError { line: usize, column: usize, message: String },
@@ -107,8 +109,8 @@ pub enum MspError {
     #[error("compile error: {message}")]
     CompileError { message: String },
 
-    #[error("runtime error: {message}")]
-    RuntimeError { message: String },
+    #[error("runtime error: {0}")]
+    RuntimeError(String),
 
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
@@ -134,7 +136,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long)]
+    #[arg(long)]
     version: bool,
 }
 
@@ -157,22 +159,25 @@ fn main() {
         Some(Commands::Eval { expr }) => { /* Phase 2+ */ }
         Some(Commands::Repl) => { /* Phase 8 */ }
         Some(Commands::Check { file }) => { /* Phase 2+ */ }
-        None => { Cli::parse_from(["ms", "--help"]); }
+        None => {
+            use clap::CommandFactory;
+            Cli::command().print_help().ok();
+        }
     }
 }
 ```
 
 ### 5. 占位模块
 
-每个子模块的 `mod.rs` 初始为空或仅含 `// TODO: implement` 注释，确保编译通过。
+仅创建各一级模块目录下的 `mod.rs`（初始为空或仅含 `// TODO: implement` 注释），确保编译通过。结构树中展示的子文件（如 `token.rs`、`node.rs` 等）在后续对应 task 中创建。
 
 ## 验证标准
 
 1. `cargo build` 编译无错误、无警告
-2. `cargo test` 通过（当前无测试，应输出 0 passed）
+2. `cargo test` 通过（包含 error 类型的基础测试，应输出 2 passed）
 3. `cargo run -- --version` 输出 `mslang 0.1.0`
 4. `cargo run -- --help` 输出帮助信息
-5. 目录结构与设计文档一致
+5. 核心模块结构（`src/` 下的一级模块）与设计文档一致（`include/`、`src/capi/` 由 task 65 创建；`src/gc/` 子模块由 task 40+ 逐步添加；`stdlib/`、`tests/` 由后续 Phase 添加）
 
 ## 测试用例
 
