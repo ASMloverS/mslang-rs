@@ -56,11 +56,24 @@ fn read_number(&mut self, first: char, start: Position) -> Result<Token> {
                 self.advance();
                 return self.read_octal(start);
             }
-            Some('.') => {
+            Some('.') if self.peek_next().map_or(false, |nc| nc.is_ascii_digit()) => {
                 self.advance();
                 return self.read_float_after_dot("0".to_string(), start);
             }
+            Some('e') | Some('E') => {
+                self.advance();
+                return self.read_float_exponent("0".to_string(), start);
+            }
             _ => {
+                // decimal 语法禁止前导零：[1-9][0-9]* | 0
+                // (0e5 已由上方 e/E 分支处理，0.5 已由 . 分支处理)
+                if self.peek_char().map_or(false, |c| c.is_ascii_digit()) {
+                    return Err(MspError::LexError {
+                        line: start.line,
+                        column: start.column,
+                        message: "leading zeros are not allowed in decimal integer literal".into(),
+                    });
+                }
                 return Ok(self.make_token(TokenKind::Int(0), start, "0"));
             }
         }
@@ -71,7 +84,7 @@ fn read_number(&mut self, first: char, start: Position) -> Result<Token> {
         if c.is_ascii_digit() {
             digits.push(c);
             self.advance();
-        } else if c == '.' {
+        } else if c == '.' && self.peek_next().map_or(false, |nc| nc.is_ascii_digit()) {
             self.advance();
             return self.read_float_after_dot(digits, start);
         } else if c == 'e' || c == 'E' {
@@ -266,11 +279,12 @@ fn read_float_exponent(&mut self, int_part: String, start: Position) -> Result<T
 
 ### 注意事项
 
-- `0` 后面不跟 `x`/`b`/`o`/`.` 时，解析为十进制 `0`
+- `0` 后面不跟 `x`/`b`/`o`/`.`(数字)/`e`/`E` 时，解析为十进制 `0`
 - `0xFF` → `Int(255)`，`0b1010` → `Int(10)`，`0o755` → `Int(493)`
-- `3.14` → `Float(3.14)`，`1.5e-3` → `Float(0.0015)`，`1e10` → `Float(10000000000.0)`
-- 浮点数至少有一个小数位：`3.` 是非法的（缺少小数部分）
-- `0.` 同样非法
+- `3.14` → `Float(3.14)`，`1.5e-3` → `Float(0.0015)`，`1e10` → `Float(10000000000.0)`，`0e5` → `Float(0.0)`
+- `.` 消歧：仅当 `.` 后跟数字时才作为浮点小数点消费（需 `peek_next()` 2 字符前瞻）；否则 `.` 不被消费，留给 Dot/范围运算符。如 `42.foo` → `Int(42)` + `Dot` + `Identifier("foo")`，`1..10` → `Int(1)` + `DotDot`（task 07）
+- 浮点数至少有一个小数位：`3.` 不被当作浮点尝试，而是 `Int(3)` + `Dot`（由 parser 决定语义）
+- 前导零禁止：`07`、`00`、`0123` 报 LexError（`decimal = [1-9][0-9]* | 0`）
 - `1e10` 形式（无小数点）通过 `read_float_exponent()` 处理
 
 ## 验证标准
@@ -365,6 +379,39 @@ mod tests {
     #[test]
     fn test_invalid_hex_no_digits() {
         let result = Lexer::new("x = 0x\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_int_followed_by_dot() {
+        // 42.foo 不应被当作浮点数尝试；. 后无数字时不消费 '.'
+        let tokens = tokenize("42.foo\n");
+        assert!(find_kind(&tokens, TokenKind::Int(42)));
+        assert!(find_kind(&tokens, TokenKind::Dot));
+        assert!(find_kind(&tokens, TokenKind::Identifier("foo".into())));
+    }
+
+    #[test]
+    fn test_float_exponent_on_zero() {
+        // 0e5 是合法浮点字面量（float 语法第二分支 [0-9]+ [eE][+-]?[0-9]+）
+        let tokens = tokenize("x = 0e5\n");
+        assert!(find_kind(&tokens, TokenKind::Float(0.0)));
+    }
+
+    #[test]
+    fn test_invalid_leading_zero() {
+        // decimal = [1-9][0-9]* | 0，前导零非法
+        let result = Lexer::new("x = 07\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_large_number_and_overflow() {
+        // i64 最大值合法
+        let tokens = tokenize("x = 9223372036854775807\n");
+        assert!(find_kind(&tokens, TokenKind::Int(9223372036854775807)));
+        // i64 最大值 + 1 溢出 → LexError
+        let result = Lexer::new("x = 9223372036854775808\n").tokenize_all();
         assert!(result.is_err());
     }
 }
