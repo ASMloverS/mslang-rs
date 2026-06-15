@@ -28,7 +28,6 @@ impl Lexer {
         self.chars.get(self.pos).copied()
     }
 
-    #[allow(dead_code)]  // task 04+ 多字符前瞻将使用
     fn peek_next(&self) -> Option<char> {
         self.chars.get(self.pos + 1).copied()
     }
@@ -166,22 +165,209 @@ impl Lexer {
     }
 
     fn read_number(&mut self, first: char, start: Position) -> Result<Token> {
-        let mut lexeme = String::new();
-        lexeme.push(first);
+        if first == '0' {
+            match self.peek_char() {
+                Some('x') | Some('X') => {
+                    self.advance();
+                    return self.read_hex(start);
+                }
+                Some('b') | Some('B') => {
+                    self.advance();
+                    return self.read_binary(start);
+                }
+                Some('o') | Some('O') => {
+                    self.advance();
+                    return self.read_octal(start);
+                }
+                Some('.') if self.peek_next().is_some_and(|nc| nc.is_ascii_digit()) => {
+                    self.advance();
+                    return self.read_float_after_dot("0".to_string(), start);
+                }
+                Some('e') | Some('E') => {
+                    self.advance();
+                    return self.read_float_exponent("0".to_string(), start);
+                }
+                _ => {
+                    // decimal 语法禁止前导零：[1-9][0-9]* | 0
+                    // (0e5 已由上方 e/E 分支处理，0.5 已由 . 分支处理)
+                    if self.peek_char().is_some_and(|c| c.is_ascii_digit()) {
+                        return Err(MspError::LexError {
+                            line: start.line,
+                            column: start.column,
+                            message: "leading zeros are not allowed in decimal integer literal"
+                                .into(),
+                        });
+                    }
+                    return Ok(self.make_token(TokenKind::Int(0), start, "0"));
+                }
+            }
+        }
+        let mut digits = String::new();
+        digits.push(first);
         while let Some(c) = self.peek_char() {
             if c.is_ascii_digit() {
-                lexeme.push(c);
+                digits.push(c);
+                self.advance();
+            } else if c == '.' && self.peek_next().is_some_and(|nc| nc.is_ascii_digit()) {
+                self.advance();
+                return self.read_float_after_dot(digits, start);
+            } else if c == 'e' || c == 'E' {
+                self.advance();
+                return self.read_float_exponent(digits, start);
+            } else {
+                break;
+            }
+        }
+        let value: i64 = digits.parse().map_err(|_| MspError::LexError {
+            line: start.line,
+            column: start.column,
+            message: format!("invalid integer literal: {}", digits),
+        })?;
+        Ok(self.make_token(TokenKind::Int(value), start, &digits))
+    }
+
+    fn read_hex(&mut self, start: Position) -> Result<Token> {
+        let mut digits = String::new();
+        while let Some(c) = self.peek_char() {
+            if c.is_ascii_hexdigit() {
+                digits.push(c);
                 self.advance();
             } else {
                 break;
             }
         }
-        let value: i64 = lexeme.parse().map_err(|_| MspError::LexError {
+        if digits.is_empty() {
+            return Err(MspError::LexError {
+                line: start.line,
+                column: start.column,
+                message: "expected hex digits after '0x'".into(),
+            });
+        }
+        let value = i64::from_str_radix(&digits, 16).map_err(|_| MspError::LexError {
             line: start.line,
             column: start.column,
-            message: format!("invalid integer literal '{}'", lexeme),
+            message: format!("invalid hex literal: 0x{}", digits),
         })?;
-        Ok(self.make_token(TokenKind::Int(value), start, &lexeme))
+        Ok(self.make_token(TokenKind::Int(value), start, &format!("0x{}", digits)))
+    }
+
+    fn read_binary(&mut self, start: Position) -> Result<Token> {
+        let mut digits = String::new();
+        while let Some(c) = self.peek_char() {
+            if c == '0' || c == '1' {
+                digits.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            return Err(MspError::LexError {
+                line: start.line,
+                column: start.column,
+                message: "expected binary digits after '0b'".into(),
+            });
+        }
+        let value = i64::from_str_radix(&digits, 2).map_err(|_| MspError::LexError {
+            line: start.line,
+            column: start.column,
+            message: format!("invalid binary literal: 0b{}", digits),
+        })?;
+        Ok(self.make_token(TokenKind::Int(value), start, &format!("0b{}", digits)))
+    }
+
+    fn read_octal(&mut self, start: Position) -> Result<Token> {
+        let mut digits = String::new();
+        while let Some(c) = self.peek_char() {
+            if ('0'..='7').contains(&c) {
+                digits.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            return Err(MspError::LexError {
+                line: start.line,
+                column: start.column,
+                message: "expected octal digits after '0o'".into(),
+            });
+        }
+        let value = i64::from_str_radix(&digits, 8).map_err(|_| MspError::LexError {
+            line: start.line,
+            column: start.column,
+            message: format!("invalid octal literal: 0o{}", digits),
+        })?;
+        Ok(self.make_token(TokenKind::Int(value), start, &format!("0o{}", digits)))
+    }
+
+    fn read_float_after_dot(&mut self, int_part: String, start: Position) -> Result<Token> {
+        let mut frac = String::new();
+        while let Some(c) = self.peek_char() {
+            if c.is_ascii_digit() {
+                frac.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if frac.is_empty() {
+            return Err(MspError::LexError {
+                line: start.line,
+                column: start.column,
+                message: "expected digits after decimal point".into(),
+            });
+        }
+        let full = if matches!(self.peek_char(), Some('e') | Some('E')) {
+            self.advance();
+            let exp = self.read_exponent(start)?;
+            format!("{}.{}e{}", int_part, frac, exp)
+        } else {
+            format!("{}.{}", int_part, frac)
+        };
+        let value: f64 = full.parse().map_err(|_| MspError::LexError {
+            line: start.line,
+            column: start.column,
+            message: format!("invalid float literal: {}", full),
+        })?;
+        Ok(self.make_token(TokenKind::Float(value), start, &full))
+    }
+
+    fn read_exponent(&mut self, start: Position) -> Result<String> {
+        let mut exp = String::new();
+        if let Some(c) = self.peek_char() {
+            if c == '+' || c == '-' {
+                exp.push(c);
+                self.advance();
+            }
+        }
+        while let Some(c) = self.peek_char() {
+            if c.is_ascii_digit() {
+                exp.push(c);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if exp.is_empty() || (exp == "+" || exp == "-") {
+            return Err(MspError::LexError {
+                line: start.line,
+                column: start.column,
+                message: "expected digits in exponent".into(),
+            });
+        }
+        Ok(exp)
+    }
+
+    fn read_float_exponent(&mut self, int_part: String, start: Position) -> Result<Token> {
+        let exp = self.read_exponent(start)?;
+        let full = format!("{}e{}", int_part, exp);
+        let value: f64 = full.parse().map_err(|_| MspError::LexError {
+            line: start.line,
+            column: start.column,
+            message: format!("invalid float literal: {}", full),
+        })?;
+        Ok(self.make_token(TokenKind::Float(value), start, &full))
     }
 
     fn read_equal(&mut self, start: Position) -> Result<Token> {
@@ -278,5 +464,153 @@ mod tests {
         let kinds: Vec<_> = tokens.iter().map(|t| t.kind.clone()).collect();
         assert!(kinds.contains(&TokenKind::Var));
         assert!(kinds.contains(&TokenKind::Identifier("myvar".into())));
+    }
+
+    fn tokenize(source: &str) -> Vec<Token> {
+        Lexer::new(source).tokenize_all().unwrap()
+    }
+
+    fn find_kind(tokens: &[Token], target: TokenKind) -> bool {
+        tokens.iter().any(|t| t.kind == target)
+    }
+
+    #[test]
+    fn test_decimal() {
+        let tokens = tokenize("a = 42\n");
+        assert!(find_kind(&tokens, TokenKind::Int(42)));
+    }
+
+    #[test]
+    fn test_hex() {
+        let tokens = tokenize("b = 0xFF\n");
+        assert!(find_kind(&tokens, TokenKind::Int(255)));
+    }
+
+    #[test]
+    fn test_binary() {
+        let tokens = tokenize("c = 0b1010\n");
+        assert!(find_kind(&tokens, TokenKind::Int(10)));
+    }
+
+    #[test]
+    fn test_octal() {
+        let tokens = tokenize("d = 0o755\n");
+        assert!(find_kind(&tokens, TokenKind::Int(493)));
+    }
+
+    #[allow(clippy::approx_constant)] // 3.14 is the spec test value, not an approximation of PI
+    #[test]
+    fn test_float_decimal() {
+        let tokens = tokenize("e = 3.14\n");
+        assert!(find_kind(&tokens, TokenKind::Float(3.14)));
+    }
+
+    #[test]
+    fn test_float_exponent_negative() {
+        let tokens = tokenize("f = 1.5e-3\n");
+        assert!(find_kind(&tokens, TokenKind::Float(0.0015)));
+    }
+
+    #[test]
+    fn test_float_exponent_only() {
+        let tokens = tokenize("g = 1e10\n");
+        assert!(find_kind(&tokens, TokenKind::Float(1e10)));
+    }
+
+    #[test]
+    fn test_zero() {
+        let tokens = tokenize("z = 0\n");
+        assert!(find_kind(&tokens, TokenKind::Int(0)));
+    }
+
+    #[test]
+    fn test_float_exponent_on_zero() {
+        // 0e5 是合法浮点字面量（float 语法第二分支 [0-9]+ [eE][+-]?[0-9]+）
+        let tokens = tokenize("x = 0e5\n");
+        assert!(find_kind(&tokens, TokenKind::Float(0.0)));
+    }
+
+    #[test]
+    fn test_int_dot_no_float() {
+        // 3. 后无数字 → 不消费 '.'：Int(3) + Dot（由 parser 决定语义）
+        // spec 01-lexical 语法 float 要求小数点后至少一位；此消歧规则见 task 04 §注意事项
+        let tokens = tokenize("x = 3.\n");
+        assert!(find_kind(&tokens, TokenKind::Int(3)));
+        assert!(find_kind(&tokens, TokenKind::Dot));
+    }
+
+    #[test]
+    fn test_invalid_hex_no_digits() {
+        let result = Lexer::new("x = 0x\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_binary_no_digits() {
+        let result = Lexer::new("x = 0b\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_octal_no_digits() {
+        let result = Lexer::new("x = 0o\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_exponent_no_digits() {
+        let result = Lexer::new("x = 1e\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_int_followed_by_dot() {
+        // 42.foo 不应被当作浮点数尝试；. 后无数字时不消费 '.'
+        let tokens = tokenize("42.foo\n");
+        assert!(find_kind(&tokens, TokenKind::Int(42)));
+        assert!(find_kind(&tokens, TokenKind::Dot));
+        assert!(find_kind(&tokens, TokenKind::Identifier("foo".into())));
+    }
+
+    #[test]
+    fn test_invalid_leading_zero() {
+        // decimal = [1-9][0-9]* | 0，前导零非法
+        let result = Lexer::new("x = 07\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_double_leading_zero() {
+        let result = Lexer::new("x = 00\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_large_number_and_overflow() {
+        // i64 最大值合法
+        let tokens = tokenize("x = 9223372036854775807\n");
+        assert!(find_kind(&tokens, TokenKind::Int(9223372036854775807)));
+        // i64 最大值 + 1 溢出 → LexError
+        let result = Lexer::new("x = 9223372036854775808\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hex_uppercase_prefix() {
+        let tokens = tokenize("x = 0XFF\n");
+        assert!(find_kind(&tokens, TokenKind::Int(255)));
+    }
+
+    #[test]
+    fn test_float_with_positive_exponent() {
+        let tokens = tokenize("x = 2.0e+3\n");
+        assert!(find_kind(&tokens, TokenKind::Float(2000.0)));
+    }
+
+    #[test]
+    fn test_float_dot_after_zero() {
+        // 0.5 → Float(0.5)
+        let tokens = tokenize("x = 0.5\n");
+        assert!(find_kind(&tokens, TokenKind::Float(0.5)));
     }
 }
