@@ -483,20 +483,174 @@ impl Lexer {
         }
     }
 
-    // 以下方法在 task 03 中返回基础单字符 token。
-    // task 07 将增强为完整的多字符运算符匹配（+=, -=, **, //, <<, >>=, .., ... 等）。
-    fn read_plus(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Plus, start, "+")) }
-    fn read_minus(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Minus, start, "-")) }
-    fn read_star(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Star, start, "*")) }
-    fn read_slash(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Slash, start, "/")) }
-    fn read_percent(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Percent, start, "%")) }
-    fn read_less(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Less, start, "<")) }
-    fn read_greater(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Greater, start, ">")) }
-    fn read_ampersand(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Ampersand, start, "&")) }
-    fn read_pipe(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Pipe, start, "|")) }
-    fn read_caret(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Caret, start, "^")) }
-    fn read_dot(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Dot, start, ".")) }
-    fn read_colon(&mut self, start: Position) -> Result<Token> { Ok(self.make_token(TokenKind::Colon, start, ":")) }
+    fn read_plus(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::PlusEqual, start, "+="))
+            }
+            _ => Ok(self.make_token(TokenKind::Plus, start, "+")),
+        }
+    }
+
+    fn read_minus(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::MinusEqual, start, "-="))
+            }
+            Some('>') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::Arrow, start, "->"))
+            }
+            _ => Ok(self.make_token(TokenKind::Minus, start, "-")),
+        }
+    }
+
+    fn read_star(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::StarEqual, start, "*="))
+            }
+            Some('*') => {
+                self.advance();
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Ok(self.make_token(TokenKind::DoubleStarEqual, start, "**="))
+                } else {
+                    Ok(self.make_token(TokenKind::DoubleStar, start, "**"))
+                }
+            }
+            _ => Ok(self.make_token(TokenKind::Star, start, "*")),
+        }
+    }
+
+    fn read_slash(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::SlashEqual, start, "/="))
+            }
+            Some('/') => {
+                self.advance();
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Ok(self.make_token(TokenKind::DoubleSlashEqual, start, "//="))
+                } else {
+                    Ok(self.make_token(TokenKind::DoubleSlash, start, "//"))
+                }
+            }
+            _ => Ok(self.make_token(TokenKind::Slash, start, "/")),
+        }
+    }
+
+    fn read_percent(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::PercentEqual, start, "%="))
+            }
+            _ => Ok(self.make_token(TokenKind::Percent, start, "%")),
+        }
+    }
+
+    fn read_less(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::LessEqual, start, "<="))
+            }
+            Some('<') => {
+                self.advance();
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Ok(self.make_token(TokenKind::LeftShiftEqual, start, "<<="))
+                } else {
+                    Ok(self.make_token(TokenKind::LeftShift, start, "<<"))
+                }
+            }
+            Some('-') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::LeftArrow, start, "<-"))
+            }
+            _ => Ok(self.make_token(TokenKind::Less, start, "<")),
+        }
+    }
+
+    fn read_greater(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::GreaterEqual, start, ">="))
+            }
+            Some('>') => {
+                self.advance();
+                if self.peek_char() == Some('=') {
+                    self.advance();
+                    Ok(self.make_token(TokenKind::RightShiftEqual, start, ">>="))
+                } else {
+                    Ok(self.make_token(TokenKind::RightShift, start, ">>"))
+                }
+            }
+            _ => Ok(self.make_token(TokenKind::Greater, start, ">")),
+        }
+    }
+
+    fn read_ampersand(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::AmpersandEqual, start, "&="))
+            }
+            _ => Ok(self.make_token(TokenKind::Ampersand, start, "&")),
+        }
+    }
+
+    fn read_pipe(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::PipeEqual, start, "|="))
+            }
+            _ => Ok(self.make_token(TokenKind::Pipe, start, "|")),
+        }
+    }
+
+    fn read_caret(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::CaretEqual, start, "^="))
+            }
+            _ => Ok(self.make_token(TokenKind::Caret, start, "^")),
+        }
+    }
+
+    fn read_dot(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('.') => {
+                self.advance();
+                if self.peek_char() == Some('.') {
+                    self.advance();
+                    Ok(self.make_token(TokenKind::DotDotDot, start, "..."))
+                } else {
+                    Ok(self.make_token(TokenKind::DotDot, start, ".."))
+                }
+            }
+            _ => Ok(self.make_token(TokenKind::Dot, start, ".")),
+        }
+    }
+
+    fn read_colon(&mut self, start: Position) -> Result<Token> {
+        match self.peek_char() {
+            Some('=') => {
+                self.advance();
+                Ok(self.make_token(TokenKind::ColonEqual, start, ":="))
+            }
+            _ => Ok(self.make_token(TokenKind::Colon, start, ":")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -854,5 +1008,131 @@ mod tests {
         // 字符串内裸 \r（非 CRLF）视为跨行，与 \n 一致报错
         let result = Lexer::new("x = \"abc\rdef\"\n").tokenize_all();
         assert!(result.is_err());
+    }
+
+    // ---- task 07: 运算符与分隔符解析 ----
+
+    #[test]
+    fn test_arithmetic() {
+        let tokens = tokenize("x = 10 + 3\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Plus));
+    }
+
+    #[test]
+    fn test_floor_div() {
+        let tokens = tokenize("y = x // 3\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DoubleSlash));
+    }
+
+    #[test]
+    fn test_power() {
+        let tokens = tokenize("z = x ** 2\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DoubleStar));
+    }
+
+    #[test]
+    fn test_comparison() {
+        let tokens = tokenize("a = x >= 5\nb = x != 0\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::GreaterEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::BangEqual));
+    }
+
+    #[test]
+    fn test_bitwise() {
+        let tokens = tokenize("c = x & 0xFF\nd = x << 2\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Ampersand));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftShift));
+    }
+
+    #[test]
+    fn test_compound_assignment() {
+        let tokens = tokenize("x += 1\ny **= 2\nz <<= 3\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::PlusEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DoubleStarEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftShiftEqual));
+    }
+
+    #[test]
+    fn test_special_symbols() {
+        let tokens = tokenize("@ deco\nx := 10\nch <- val\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::At));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::ColonEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftArrow));
+    }
+
+    #[test]
+    fn test_range_operators() {
+        let tokens = tokenize("a .. b\nx ...\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DotDot));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DotDotDot));
+    }
+
+    #[test]
+    fn test_arrow() {
+        let tokens = tokenize("fn foo() -> int {}\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Arrow));
+    }
+
+    #[test]
+    fn test_bang_alone_is_error() {
+        let result = Lexer::new("x = ! y\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_comparison_full() {
+        // 注意：spec 原文 input 仅含 "<"，却断言 LessEqual —— 该断言不可能成立。
+        // 此处修正 input 同时包含 "<" 与 "<="，使 Less 与 LessEqual 断言均可验证。
+        let tokens = tokenize("a == b\nc < d\nf <= g\ne > f\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::EqualEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LessEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Less));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Greater));
+    }
+
+    #[test]
+    fn test_right_shift() {
+        let tokens = tokenize("x = a >> 2\nb >>= 3\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightShift));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightShiftEqual));
+    }
+
+    #[test]
+    fn test_tilde() {
+        let tokens = tokenize("x = ~y\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Tilde));
+    }
+
+    #[test]
+    fn test_semicolon() {
+        let tokens = tokenize("x = 1;\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Semicolon));
+    }
+
+    #[test]
+    fn test_remaining_compound_assignments() {
+        let tokens = tokenize("x -= 1\nx *= 2\nx /= 3\nx //= 4\nx %= 5\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::MinusEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::StarEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::SlashEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DoubleSlashEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::PercentEqual));
+        let tokens2 = tokenize("x &= 6\nx |= 7\nx ^= 8\n");
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::AmpersandEqual));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::PipeEqual));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::CaretEqual));
+    }
+
+    #[test]
+    fn test_dot_number_interaction() {
+        // 42.foo → Int(42) + Dot + Identifier（read_number 不消费后无数字的 .）
+        let tokens = tokenize("42.foo\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(42)));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Dot));
+        // 42..50 → Int(42) + DotDot + Int(50)
+        let tokens2 = tokenize("42..50\n");
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::Int(42)));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::DotDot));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::Int(50)));
     }
 }
