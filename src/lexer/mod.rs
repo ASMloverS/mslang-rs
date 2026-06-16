@@ -1,7 +1,7 @@
 pub mod token;
 
 use crate::error::{MspError, Result};
-use crate::lexer::token::{keyword_table, Position, Span, Token, TokenKind};
+use crate::lexer::token::{keyword_table, reserved_words, Position, Span, Token, TokenKind};
 
 pub struct Lexer {
     #[allow(dead_code)]  // 保留用于调试/错误报告；chars 用于所有字符访问
@@ -157,10 +157,20 @@ impl Lexer {
                 break;
             }
         }
-        let kind = keyword_table()
-            .get(lexeme.as_str())
-            .cloned()
-            .unwrap_or_else(|| TokenKind::Identifier(lexeme.clone()));
+        let kind = if let Some(kw) = keyword_table().get(lexeme.as_str()) {
+            kw.clone()
+        } else if reserved_words().contains(&lexeme.as_str()) {
+            return Err(MspError::LexError {
+                line: start.line,
+                column: start.column,
+                message: format!(
+                    "'{}' is a reserved word and cannot be used as identifier",
+                    lexeme
+                ),
+            });
+        } else {
+            TokenKind::Identifier(lexeme.clone())
+        };
         Ok(self.make_token(kind, start, &lexeme))
     }
 
@@ -535,6 +545,84 @@ mod tests {
         let kinds: Vec<_> = tokens.iter().map(|t| t.kind.clone()).collect();
         assert!(kinds.contains(&TokenKind::Var));
         assert!(kinds.contains(&TokenKind::Identifier("myvar".into())));
+    }
+
+    #[test]
+    fn test_keywords() {
+        let tokens = tokenize("var const fn return if elif else\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Var));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Const));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Fn));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Return));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::If));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Elif));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Else));
+    }
+
+    #[test]
+    fn test_identifier() {
+        let tokens = tokenize("myVar _foo bar123\n");
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "myVar")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_foo")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar123")));
+    }
+
+    #[test]
+    fn test_case_sensitive() {
+        let tokens = tokenize("True False NIL\n");
+        let idents: Vec<_> = tokens.iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
+            .collect();
+        assert!(idents.iter().all(|t| matches!(&t.kind, TokenKind::Identifier(_))));
+    }
+
+    #[test]
+    fn test_boolean_keywords() {
+        let tokens = tokenize("true false nil\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::True));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::False));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Nil));
+    }
+
+    #[test]
+    fn test_all_reserved_words_error() {
+        for word in &["select", "default", "case", "export", "match"] {
+            let result = Lexer::new(&format!("{} = 1\n", word)).tokenize_all();
+            assert!(result.is_err(), "reserved word '{}' should error", word);
+        }
+    }
+
+    #[test]
+    fn test_keyword_prefix_is_identifier() {
+        let tokens = tokenize("varx iffy returnx\n");
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "varx")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "iffy")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "returnx")));
+    }
+
+    #[test]
+    fn test_underscore_only_identifier() {
+        let tokens = tokenize("_ = 1\n");
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_")));
+    }
+
+    #[test]
+    fn test_is_operator() {
+        let tokens = tokenize("x is y\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Is));
+    }
+
+    #[test]
+    fn test_all_36_keywords() {
+        let source = "var const fn return if elif else while for in break continue \
+                      class self super true false nil and or not \
+                      try except finally defer with throw \
+                      async await go import from as yield nonlocal global\n";
+        let tokens = tokenize(source);
+        let keyword_tokens: Vec<_> = tokens.iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
+            .collect();
+        assert_eq!(keyword_tokens.len(), 36);
     }
 
     fn tokenize(source: &str) -> Vec<Token> {

@@ -43,6 +43,10 @@ yield      nonlocal   global
 select     default    case    export    match
 ```
 
+### `is` 身份比较运算符
+
+`is` 不是 36 个关键字之一（`01-lexical.md` 将其归为成员运算符），但它是字母型 token，词法分析器通过 `keyword_table()` 统一识别（查找表共 37 个条目：36 关键字 + `is`）。`read_identifier()` 无需特殊处理——`keyword_table().get("is")` 命中后返回 `TokenKind::Is`。
+
 ## 实现细节
 
 ### 文件位置
@@ -95,7 +99,7 @@ fn keywords() -> &'static HashMap<&'static str, TokenKind> {
         let mut m = HashMap::new();
         m.insert("var", TokenKind::Var);
         m.insert("const", TokenKind::Const);
-        // ... 全部 36 个（含 global）
+        // ... 全部 37 个（36 关键字 + is 身份比较运算符）
         m
     })
 }
@@ -112,9 +116,11 @@ fn keywords() -> &'static HashMap<&'static str, TokenKind> {
 
 1. 所有 36 个关键字正确识别为对应 TokenKind
 2. 普通标识符正确识别为 `Identifier(name)`
-3. 保留字使用时报错
+3. 所有 5 个保留字（select/default/case/export/match）使用时报错
 4. 大小写敏感：`True` 是标识符，`true` 是关键字
 5. 下划线开头合法：`_foo` 是标识符
+6. 关键字前缀标识符按最大匹配识别（`varx` → Identifier，非 `var` + `x`）
+7. `is` 经关键字表识别为 `TokenKind::Is`（身份比较运算符）
 
 ## 测试用例
 
@@ -164,7 +170,10 @@ mod tests {
     #[test]
     fn test_case_sensitive() {
         let tokens = tokenize("True False NIL\n");
-        assert!(tokens.iter().all(|t| matches!(&t.kind, TokenKind::Identifier(_))));
+        let idents: Vec<_> = tokens.iter()
+            .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
+            .collect();
+        assert!(idents.iter().all(|t| matches!(&t.kind, TokenKind::Identifier(_))));
     }
 
     #[test]
@@ -176,9 +185,34 @@ mod tests {
     }
 
     #[test]
-    fn test_reserved_word_error() {
-        let result = Lexer::new("select = 1\n").tokenize_all();
-        assert!(result.is_err());
+    fn test_all_reserved_words_error() {
+        for word in &["select", "default", "case", "export", "match"] {
+            let result = Lexer::new(&format!("{} = 1\n", word)).tokenize_all();
+            assert!(result.is_err(), "reserved word '{}' should error", word);
+        }
+    }
+
+    #[test]
+    fn test_keyword_prefix_is_identifier() {
+        // 关键字前缀标识符：最大匹配原则保证 varx 是单个标识符
+        let tokens = tokenize("varx iffy returnx\n");
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "varx")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "iffy")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "returnx")));
+    }
+
+    #[test]
+    fn test_underscore_only_identifier() {
+        // 单个下划线是合法标识符：[a-zA-Z_] 首字符 + 零后续字符
+        let tokens = tokenize("_ = 1\n");
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_")));
+    }
+
+    #[test]
+    fn test_is_operator() {
+        // is 不是关键字（36 之一）而是身份比较运算符，经 keyword_table 返回 TokenKind::Is
+        let tokens = tokenize("x is y\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Is));
     }
 
     #[test]
