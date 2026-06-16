@@ -273,7 +273,15 @@ fn read_colon(&mut self, start: Position) -> Result<Token> {
 - `<<` / `<<=` 优先于 `<`
 - `<-` 优先于 `<`
 
-当前实现中 `<` 先检查 `=` 和 `<`，再检查 `-`。`<-` 是三字符运算符中最长的匹配，符合最大匹配原则。
+当前实现中 `read_less` 的 `match self.peek_char()` 各分支以**第二个字符**互斥（`=`、`<`、`-` 各不相同），分支排列顺序不影响结果。`<<=` 是以 `<` 开头的最长匹配（三字符），`<-` 是两字符运算符。所有分支经 `peek_char()` 互斥匹配，符合最大匹配原则。
+
+### `.` 与数值交互
+
+`read_dot()` 处理 `.`、`..`、`...`，但**不负责**区分 `42.5`（浮点）与 `42.foo`（属性访问）。此消歧由 task 04 的 `read_number()` 完成：`read_number` 仅在 `.` 后跟数字时消费小数点，否则将 `.` 留给 `read_dot`。因此：
+
+- `42.5` → `Float(42.5)`（`read_number` 消费整个字面量）
+- `42.foo` → `Int(42)` + `Dot` + `Identifier("foo")`（`read_number` 在 `.` 处停止）
+- `42..50` → `Int(42)` + `DotDot` + `Int(50)`（第二个 `.` 非数字，`read_number` 不消费）
 
 ## 验证标准
 
@@ -373,6 +381,61 @@ mod tests {
     fn test_bang_alone_is_error() {
         let result = Lexer::new("x = ! y\n").tokenize_all();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_comparison_full() {
+        let tokens = tokenize("a == b\nc < d\ne > f\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::EqualEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LessEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Less));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Greater));
+    }
+
+    #[test]
+    fn test_right_shift() {
+        let tokens = tokenize("x = a >> 2\nb >>= 3\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightShift));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightShiftEqual));
+    }
+
+    #[test]
+    fn test_tilde() {
+        let tokens = tokenize("x = ~y\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Tilde));
+    }
+
+    #[test]
+    fn test_semicolon() {
+        let tokens = tokenize("x = 1;\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Semicolon));
+    }
+
+    #[test]
+    fn test_remaining_compound_assignments() {
+        let tokens = tokenize("x -= 1\nx *= 2\nx /= 3\nx //= 4\nx %= 5\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::MinusEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::StarEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::SlashEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::DoubleSlashEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::PercentEqual));
+        let tokens2 = tokenize("x &= 6\nx |= 7\nx ^= 8\n");
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::AmpersandEqual));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::PipeEqual));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::CaretEqual));
+    }
+
+    #[test]
+    fn test_dot_number_interaction() {
+        // 42.foo → Int(42) + Dot + Identifier（read_number 不消费后无数字的 .）
+        let tokens = tokenize("42.foo\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(42)));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Dot));
+        // 42..50 → Int(42) + DotDot + Int(50)
+        let tokens2 = tokenize("42..50\n");
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::Int(42)));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::DotDot));
+        assert!(tokens2.iter().any(|t| t.kind == TokenKind::Int(50)));
     }
 }
 ```
