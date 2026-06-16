@@ -381,11 +381,82 @@ impl Lexer {
     }
 
     fn read_string(&mut self, start: Position) -> Result<Token> {
-        Err(MspError::LexError {
-            line: start.line,
-            column: start.column,
-            message: "string literals not yet implemented (task 05)".into(),
-        })
+        let mut value = String::new();
+        let mut lexeme = String::from("\"");
+
+        loop {
+            match self.advance() {
+                None => {
+                    return Err(MspError::LexError {
+                        line: start.line,
+                        column: start.column,
+                        message: "unterminated string".into(),
+                    });
+                }
+                Some('"') => {
+                    lexeme.push('"');
+                    break;
+                }
+                Some('\n') | Some('\r') => {
+                    // 裸 \n 与裸 \r 均视为跨行（\r\n 已在 Lexer::new 归一化为 \n，
+                    // 此处的 \r 为非 CRLF 的孤立回车，与词法器整体将其视为行终止一致）
+                    return Err(MspError::LexError {
+                        line: start.line,
+                        column: start.column,
+                        message: "unterminated string (newline in string literal)".into(),
+                    });
+                }
+                Some('\\') => {
+                    lexeme.push('\\');
+                    match self.advance() {
+                        Some('"') => {
+                            value.push('"');
+                            lexeme.push('"');
+                        }
+                        Some('\\') => {
+                            value.push('\\');
+                            lexeme.push('\\');
+                        }
+                        Some('n') => {
+                            value.push('\n');
+                            lexeme.push('n');
+                        }
+                        Some('t') => {
+                            value.push('\t');
+                            lexeme.push('t');
+                        }
+                        Some('r') => {
+                            value.push('\r');
+                            lexeme.push('r');
+                        }
+                        Some('0') => {
+                            value.push('\0');
+                            lexeme.push('0');
+                        }
+                        Some(c) => {
+                            return Err(MspError::LexError {
+                                line: start.line,
+                                column: start.column,
+                                message: format!("unknown escape sequence: \\{}", c),
+                            });
+                        }
+                        None => {
+                            return Err(MspError::LexError {
+                                line: start.line,
+                                column: start.column,
+                                message: "unterminated string (end of file in escape)".into(),
+                            });
+                        }
+                    }
+                }
+                Some(c) => {
+                    value.push(c);
+                    lexeme.push(c);
+                }
+            }
+        }
+
+        Ok(self.make_token(TokenKind::String(value), start, &lexeme))
     }
 
     fn read_bang(&mut self, start: Position) -> Result<Token> {
@@ -612,5 +683,88 @@ mod tests {
         // 0.5 → Float(0.5)
         let tokens = tokenize("x = 0.5\n");
         assert!(find_kind(&tokens, TokenKind::Float(0.5)));
+    }
+
+    #[test]
+    fn test_simple_string() {
+        let tokens = tokenize("a = \"hello world\"\n");
+        assert!(find_kind(&tokens, TokenKind::String("hello world".into())));
+    }
+
+    #[test]
+    fn test_newline_escape() {
+        let tokens = tokenize("b = \"line1\\nline2\"\n");
+        assert!(find_kind(&tokens, TokenKind::String("line1\nline2".into())));
+    }
+
+    #[test]
+    fn test_backslash_escape() {
+        let tokens = tokenize("c = \"path: C:\\\\Users\"\n");
+        assert!(find_kind(
+            &tokens,
+            TokenKind::String("path: C:\\Users".into())
+        ));
+    }
+
+    #[test]
+    fn test_quote_escape() {
+        let tokens = tokenize("d = \"quotes: \\\"hello\\\"\"\n");
+        assert!(find_kind(
+            &tokens,
+            TokenKind::String("quotes: \"hello\"".into())
+        ));
+    }
+
+    #[test]
+    fn test_empty_string() {
+        let tokens = tokenize("e = \"\"\n");
+        assert!(find_kind(&tokens, TokenKind::String("".into())));
+    }
+
+    #[test]
+    fn test_unterminated_string() {
+        // 未转义换行路径
+        let result = Lexer::new("x = \"unterminated\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unterminated_string_eof() {
+        // 纯 EOF 路径：无换行、无闭合引号
+        let result = Lexer::new("x = \"abc").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_eof_in_escape() {
+        // '\' 后立即 EOF（转义序列未完成）
+        let result = Lexer::new("x = \"abc\\").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_unknown_escape() {
+        let result = Lexer::new("x = \"\\x\"\n").tokenize_all();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tab_and_null_escape() {
+        let tokens = tokenize("x = \"\\t\\0\"\n");
+        assert!(find_kind(&tokens, TokenKind::String("\t\0".into())));
+    }
+
+    #[test]
+    fn test_carriage_return_escape() {
+        // \r 转义 → 回车符（验证标准 #2 的第 5 种转义，此前遗漏）
+        let tokens = tokenize("x = \"a\\rb\"\n");
+        assert!(find_kind(&tokens, TokenKind::String("a\rb".into())));
+    }
+
+    #[test]
+    fn test_bare_carriage_return_error() {
+        // 字符串内裸 \r（非 CRLF）视为跨行，与 \n 一致报错
+        let result = Lexer::new("x = \"abc\rdef\"\n").tokenize_all();
+        assert!(result.is_err());
     }
 }

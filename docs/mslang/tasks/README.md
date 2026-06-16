@@ -10,7 +10,7 @@
 | 02 | [Token 类型定义](02-token-definition.md) | ✅ |
 | 03 | [词法分析器核心框架](03-lexer-core.md) | ✅ |
 | 04 | [数值字面量解析](04-lexer-number-literals.md) | ✅ |
-| 05 | [字符串字面量解析](05-lexer-string-literals.md) | ⬜ |
+| 05 | [字符串字面量解析](05-lexer-string-literals.md) | ✅ |
 | 06 | [标识符与关键字解析](06-lexer-identifiers-keywords.md) | ⬜ |
 | 07 | [运算符与分隔符解析](07-lexer-operators-delimiters.md) | ⬜ |
 | 08 | [换行与语句终止规则](08-lexer-statement-termination.md) | ⬜ |
