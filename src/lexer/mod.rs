@@ -10,6 +10,10 @@ pub struct Lexer {
     pos: usize,
     line: usize,
     column: usize,
+    paren_depth: usize,    // () 深度
+    bracket_depth: usize,  // [] 深度
+    brace_depth: usize,    // {} 深度
+    prev_token_kind: Option<TokenKind>,  // 最近发出的真实 token（注释跳过时不更新）
 }
 
 impl Lexer {
@@ -21,6 +25,10 @@ impl Lexer {
             pos: 0,
             line: 1,
             column: 1,
+            paren_depth: 0,
+            bracket_depth: 0,
+            brace_depth: 0,
+            prev_token_kind: None,
         }
     }
 
@@ -58,61 +66,125 @@ impl Lexer {
 
     fn skip_comment(&mut self) {
         // 注意：此方法在 '\n' 处停止但不消费换行符。
-        // next_token() 中注释后递归调用会处理该换行。
-        // 大量连续注释行会导致递归深度增加（已知限制）。
+        // next_token() 的循环以 continue 重新进入，由其换行分支处理该换行。
         while let Some(c) = self.peek_char() {
             if c == '\n' { break; }
             self.advance();
         }
     }
 
-    pub fn next_token(&mut self) -> Result<Token> {
-        self.skip_whitespace();
-
-        let start = self.current_position();
-
-        let ch = match self.advance() {
-            Some(c) => c,
-            None => return Ok(self.make_token(TokenKind::Eof, start, "")),
+    /// 续行判断：当前行尾 token 是否期待后续操作数/元素，使得换行不终止语句。
+    fn is_continuation(&self) -> bool {
+        let prev = match &self.prev_token_kind {
+            Some(k) => k,
+            None => return false,
         };
 
-        match ch {
-            '\n' => Ok(self.make_token(TokenKind::Newline, start, "\n")),
-            '#' => { self.skip_comment(); self.next_token() }
-            c if c.is_ascii_digit() => self.read_number(c, start),
-            '"' => self.read_string(start),
-            c if c.is_ascii_alphabetic() || c == '_' => self.read_identifier(c, start),
-            '+' => self.read_plus(start),
-            '-' => self.read_minus(start),
-            '*' => self.read_star(start),
-            '/' => self.read_slash(start),
-            '%' => self.read_percent(start),
-            '=' => self.read_equal(start),
-            '!' => self.read_bang(start),
-            '<' => self.read_less(start),
-            '>' => self.read_greater(start),
-            '&' => self.read_ampersand(start),
-            '|' => self.read_pipe(start),
-            '^' => self.read_caret(start),
-            '~' => Ok(self.make_token(TokenKind::Tilde, start, "~")),
-            '(' => Ok(self.make_token(TokenKind::LeftParen, start, "(")),
-            ')' => Ok(self.make_token(TokenKind::RightParen, start, ")")),
-            '[' => Ok(self.make_token(TokenKind::LeftBracket, start, "[")),
-            ']' => Ok(self.make_token(TokenKind::RightBracket, start, "]")),
-            '{' => Ok(self.make_token(TokenKind::LeftBrace, start, "{")),
-            '}' => Ok(self.make_token(TokenKind::RightBrace, start, "}")),
-            ',' => Ok(self.make_token(TokenKind::Comma, start, ",")),
-            '.' => self.read_dot(start),
-            ':' => self.read_colon(start),
-            ';' => Ok(self.make_token(TokenKind::Semicolon, start, ";")),
-            '@' => Ok(self.make_token(TokenKind::At, start, "@")),
-            _ => {
-                Err(MspError::LexError {
-                    line: start.line,
-                    column: start.column,
-                    message: format!("unexpected character '{}'", ch),
-                })
-            }
+        // 规则 1: 行尾是运算符
+        if is_binary_operator(prev) {
+            return true;
+        }
+
+        // 规则 2: 行尾是逗号
+        if matches!(prev, TokenKind::Comma) {
+            return true;
+        }
+
+        // 规则 3: 行尾是左括号（与括号深度跟踪互补）
+        if matches!(
+            prev,
+            TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace
+        ) {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn next_token(&mut self) -> Result<Token> {
+        loop {
+            self.skip_whitespace();
+
+            let start = self.current_position();
+
+            let ch = match self.advance() {
+                Some(c) => c,
+                None => return Ok(self.make_token(TokenKind::Eof, start, "")),
+            };
+
+            let token = match ch {
+                '\n' => {
+                    // 空行合并：前一 token 已是 Newline 时跳过（连续空行只产生一个 Newline）
+                    if self.prev_token_kind.as_ref() == Some(&TokenKind::Newline) {
+                        continue;
+                    }
+                    // 括号内换行直接跳过（不产生 token）
+                    if self.paren_depth > 0 || self.bracket_depth > 0 || self.brace_depth > 0 {
+                        continue;
+                    }
+                    // 隐式续行：行尾运算符/逗号/左括号
+                    if self.is_continuation() {
+                        continue;
+                    }
+                    self.make_token(TokenKind::Newline, start, "\n")
+                }
+                '#' => { self.skip_comment(); continue; }
+                '(' => {
+                    self.paren_depth += 1;
+                    self.make_token(TokenKind::LeftParen, start, "(")
+                }
+                ')' => {
+                    self.paren_depth = self.paren_depth.saturating_sub(1);
+                    self.make_token(TokenKind::RightParen, start, ")")
+                }
+                '[' => {
+                    self.bracket_depth += 1;
+                    self.make_token(TokenKind::LeftBracket, start, "[")
+                }
+                ']' => {
+                    self.bracket_depth = self.bracket_depth.saturating_sub(1);
+                    self.make_token(TokenKind::RightBracket, start, "]")
+                }
+                '{' => {
+                    self.brace_depth += 1;
+                    self.make_token(TokenKind::LeftBrace, start, "{")
+                }
+                '}' => {
+                    self.brace_depth = self.brace_depth.saturating_sub(1);
+                    self.make_token(TokenKind::RightBrace, start, "}")
+                }
+                c if c.is_ascii_digit() => self.read_number(c, start)?,
+                '"' => self.read_string(start)?,
+                c if c.is_ascii_alphabetic() || c == '_' => self.read_identifier(c, start)?,
+                '+' => self.read_plus(start)?,
+                '-' => self.read_minus(start)?,
+                '*' => self.read_star(start)?,
+                '/' => self.read_slash(start)?,
+                '%' => self.read_percent(start)?,
+                '=' => self.read_equal(start)?,
+                '!' => self.read_bang(start)?,
+                '<' => self.read_less(start)?,
+                '>' => self.read_greater(start)?,
+                '&' => self.read_ampersand(start)?,
+                '|' => self.read_pipe(start)?,
+                '^' => self.read_caret(start)?,
+                '~' => self.make_token(TokenKind::Tilde, start, "~"),
+                ',' => self.make_token(TokenKind::Comma, start, ","),
+                '.' => self.read_dot(start)?,
+                ':' => self.read_colon(start)?,
+                ';' => self.make_token(TokenKind::Semicolon, start, ";"),
+                '@' => self.make_token(TokenKind::At, start, "@"),
+                _ => {
+                    return Err(MspError::LexError {
+                        line: start.line,
+                        column: start.column,
+                        message: format!("unexpected character '{}'", ch),
+                    });
+                }
+            };
+
+            self.prev_token_kind = Some(token.kind.clone());
+            return Ok(token);
         }
     }
 
@@ -653,6 +725,35 @@ impl Lexer {
     }
 }
 
+/// 判断 token 是否为二元/复合运算符（行尾时期待后续操作数，触发隐式续行）。
+fn is_binary_operator(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        // 算术
+        TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
+        | TokenKind::DoubleSlash | TokenKind::Percent | TokenKind::DoubleStar
+        // 赋值（含复合赋值与海象运算符 :=）
+        | TokenKind::Equal | TokenKind::ColonEqual
+        | TokenKind::PlusEqual | TokenKind::MinusEqual | TokenKind::StarEqual
+        | TokenKind::SlashEqual | TokenKind::DoubleSlashEqual | TokenKind::PercentEqual
+        | TokenKind::DoubleStarEqual
+        | TokenKind::AmpersandEqual | TokenKind::PipeEqual | TokenKind::CaretEqual
+        | TokenKind::LeftShiftEqual | TokenKind::RightShiftEqual
+        // 比较
+        | TokenKind::EqualEqual | TokenKind::BangEqual
+        | TokenKind::Less | TokenKind::Greater | TokenKind::LessEqual | TokenKind::GreaterEqual
+        // 位运算
+        | TokenKind::Ampersand | TokenKind::Pipe | TokenKind::Caret
+        | TokenKind::LeftShift | TokenKind::RightShift
+        // 逻辑关键字
+        | TokenKind::And | TokenKind::Or | TokenKind::Not
+        // 成员/身份
+        | TokenKind::In | TokenKind::Is
+        // 成员访问 / 箭头（行尾时期待后续操作数）
+        | TokenKind::Dot | TokenKind::Arrow
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1134,5 +1235,81 @@ mod tests {
         assert!(tokens2.iter().any(|t| t.kind == TokenKind::Int(42)));
         assert!(tokens2.iter().any(|t| t.kind == TokenKind::DotDot));
         assert!(tokens2.iter().any(|t| t.kind == TokenKind::Int(50)));
+    }
+
+    // ---- task 08: 换行与语句终止规则 ----
+
+    fn newline_count(tokens: &[Token]) -> usize {
+        tokens.iter().filter(|t| t.kind == TokenKind::Newline).count()
+    }
+
+    #[test]
+    fn test_basic_newline() {
+        let tokens = tokenize("x = 1\ny = 2\n");
+        assert_eq!(newline_count(&tokens), 2);
+    }
+
+    #[test]
+    fn test_operator_continuation() {
+        let tokens = tokenize("total = a +\n        b +\n        c\n");
+        // + 后的换行被跳过，只有末尾换行
+        let operators: Vec<_> = tokens.iter()
+            .filter(|t| t.kind == TokenKind::Plus)
+            .collect();
+        assert_eq!(operators.len(), 2);
+    }
+
+    #[test]
+    fn test_list_continuation() {
+        let tokens = tokenize("names = [\n    \"Alice\",\n    \"Bob\"\n]\n");
+        // [] 内换行被跳过
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftBracket));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightBracket));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::String(s) if s == "Alice")));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::String(s) if s == "Bob")));
+    }
+
+    #[test]
+    fn test_function_call_continuation() {
+        let tokens = tokenize("result = fn(\n    arg1,\n    arg2\n)\n");
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "arg1")));
+    }
+
+    #[test]
+    fn test_bracket_depth_balanced() {
+        let lexer = Lexer::new("x = [\n1\n]\n");
+        let tokens = lexer.tokenize_all().unwrap();
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(1)));
+    }
+
+    #[test]
+    fn test_comma_continuation() {
+        // 行尾逗号后的换行被跳过
+        let tokens = tokenize("x = foo,\n    bar\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Comma));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar")));
+    }
+
+    #[test]
+    fn test_brace_continuation() {
+        // {} 内换行被跳过
+        let tokens = tokenize("d = {\n    key: 1\n}\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftBrace));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightBrace));
+    }
+
+    #[test]
+    fn test_compound_assignment_continuation() {
+        // += 后的换行被跳过（复合赋值也是续行运算符）
+        let tokens = tokenize("x +=\n    5\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::PlusEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(5)));
+    }
+
+    #[test]
+    fn test_consecutive_blank_lines() {
+        // 连续空行只产生一个 Newline
+        let tokens = tokenize("x = 1\n\n\ny = 2\n");
+        assert_eq!(newline_count(&tokens), 2);
     }
 }

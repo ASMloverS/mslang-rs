@@ -13,7 +13,7 @@
 | 05 | [字符串字面量解析](05-lexer-string-literals.md) | ✅ |
 | 06 | [标识符与关键字解析](06-lexer-identifiers-keywords.md) | ✅ |
 | 07 | [运算符与分隔符解析](07-lexer-operators-delimiters.md) | ✅ |
-| 08 | [换行与语句终止规则](08-lexer-statement-termination.md) | ⬜ |
+| 08 | [换行与语句终止规则](08-lexer-statement-termination.md) | ✅ |
 | 09 | [AST 表达式节点定义](09-ast-expression-nodes.md) | ⬜ |
 | 10 | [AST 语句节点定义](10-ast-statement-nodes.md) | ⬜ |
 | 11 | [语法分析器核心框架](11-parser-core.md) | ⬜ |
