@@ -17,7 +17,7 @@ Phase 1.3f - 基础设施
 
 1. 换行符终止当前语句
 2. **续行规则** — 以下情况换行不终止语句：
-   - 行尾是运算符（`+`, `-`, `*`, `/`, `//`, `%`, `**`, `=`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&`, `|`, `^`, `<<`, `>>`, `and`, `or`, `not`, `in`, `is`）
+   - 行尾是运算符（`+`, `-`, `*`, `/`, `//`, `%`, `**`, `=`, `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `**=`, `&=`, `|=`, `^=`, `<<=`, `>>=`, `:=`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `&`, `|`, `^`, `<<`, `>>`, `.`, `->`, `and`, `or`, `not`, `in`, `is`）
    - 行尾是逗号 `,`
    - 行尾是左括号 `(`, `[`, `{`
    - 字符串字面量内（已由引号界定，不允许跨行）
@@ -104,14 +104,27 @@ fn is_continuation(&self) -> bool {
 fn is_binary_operator(kind: &TokenKind) -> bool {
     matches!(
         kind,
+        // 算术
         TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
         | TokenKind::DoubleSlash | TokenKind::Percent | TokenKind::DoubleStar
-        | TokenKind::Equal | TokenKind::EqualEqual | TokenKind::BangEqual
+        // 赋值（含复合赋值）
+        | TokenKind::Equal | TokenKind::ColonEqual
+        | TokenKind::PlusEqual | TokenKind::MinusEqual | TokenKind::StarEqual
+        | TokenKind::SlashEqual | TokenKind::DoubleSlashEqual | TokenKind::PercentEqual
+        | TokenKind::DoubleStarEqual
+        | TokenKind::AmpersandEqual | TokenKind::PipeEqual | TokenKind::CaretEqual
+        | TokenKind::LeftShiftEqual | TokenKind::RightShiftEqual
+        // 比较
+        | TokenKind::EqualEqual | TokenKind::BangEqual
         | TokenKind::Less | TokenKind::Greater | TokenKind::LessEqual | TokenKind::GreaterEqual
+        // 位运算
         | TokenKind::Ampersand | TokenKind::Pipe | TokenKind::Caret
         | TokenKind::LeftShift | TokenKind::RightShift
+        // 逻辑关键字
         | TokenKind::And | TokenKind::Or | TokenKind::Not
+        // 成员/身份
         | TokenKind::In | TokenKind::Is
+        // 成员访问 / 箭头（行尾时期待后续操作数）
         | TokenKind::Dot | TokenKind::Arrow
     )
 }
@@ -135,6 +148,10 @@ pub struct Lexer {
 
 ```rust
 '\n' => {
+    // 空行合并：前一 token 已是 Newline 时跳过（连续空行只产生一个 Newline）
+    if self.prev_token_kind.as_ref() == Some(&TokenKind::Newline) {
+        continue;
+    }
     if self.paren_depth > 0 || self.bracket_depth > 0 || self.brace_depth > 0 {
         continue;  // 括号内换行直接跳过
     }
@@ -145,7 +162,13 @@ pub struct Lexer {
 }
 ```
 
-遇到 `(`、`[`、`{` 时递增深度，遇到 `)`、`]`、`}` 时递减深度。
+遇到 `(`、`[`、`{` 时递增深度，遇到 `)`、`]`、`}` 时递减深度。**递减时使用 `saturating_sub(1)`** 防止不匹配的右括号导致下溢（debug 模式 panic / release 模式 wrap 为 `usize::MAX`）：
+
+```rust
+')' => { self.paren_depth = self.paren_depth.saturating_sub(1); ... }
+']' => { self.bracket_depth = self.bracket_depth.saturating_sub(1); ... }
+'}' => { self.brace_depth = self.brace_depth.saturating_sub(1); ... }
+```
 
 ### 注意事项
 
@@ -204,7 +227,7 @@ mod tests {
     #[test]
     fn test_basic_newline() {
         let tokens = tokenize("x = 1\ny = 2\n");
-        assert!(newline_count(&tokens) >= 2);
+        assert_eq!(newline_count(&tokens), 2);
     }
 
     #[test]
@@ -230,7 +253,7 @@ mod tests {
     #[test]
     fn test_function_call_continuation() {
         let tokens = tokenize("result = fn(\n    arg1,\n    arg2\n)\n");
-        assert!(tokens.iter().any(|t| t.kind == TokenKind::Identifier(s) if s == "arg1" => true));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "arg1")));
     }
 
     #[test]
@@ -238,6 +261,37 @@ mod tests {
         let lexer = Lexer::new("x = [\n1\n]\n");
         let tokens = lexer.tokenize_all().unwrap();
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(1)));
+    }
+
+    #[test]
+    fn test_comma_continuation() {
+        // 行尾逗号后的换行被跳过
+        let tokens = tokenize("x = foo,\n    bar\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Comma));
+        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar")));
+    }
+
+    #[test]
+    fn test_brace_continuation() {
+        // {} 内换行被跳过
+        let tokens = tokenize("d = {\n    key: 1\n}\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftBrace));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::RightBrace));
+    }
+
+    #[test]
+    fn test_compound_assignment_continuation() {
+        // += 后的换行被跳过（复合赋值也是续行运算符）
+        let tokens = tokenize("x +=\n    5\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::PlusEqual));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Int(5)));
+    }
+
+    #[test]
+    fn test_consecutive_blank_lines() {
+        // 连续空行只产生一个 Newline
+        let tokens = tokenize("x = 1\n\n\ny = 2\n");
+        assert_eq!(newline_count(&tokens), 2);
     }
 }
 ```
