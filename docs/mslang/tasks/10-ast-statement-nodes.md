@@ -308,28 +308,9 @@ impl std::fmt::Display for Program {
         write!(f, "{}", stmts.join("\n"))
     }
 }
-
-impl std::fmt::Display for AssignOp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            AssignOp::Assign => "=",
-            AssignOp::PlusAssign => "+=",
-            AssignOp::MinusAssign => "-=",
-            AssignOp::StarAssign => "*=",
-            AssignOp::SlashAssign => "/=",
-            AssignOp::DoubleSlashAssign => "//=",
-            AssignOp::PercentAssign => "%=",
-            AssignOp::DoubleStarAssign => "**=",
-            AssignOp::BitAndAssign => "&=",
-            AssignOp::BitOrAssign => "|=",
-            AssignOp::BitXorAssign => "^=",
-            AssignOp::LeftShiftAssign => "<<=",
-            AssignOp::RightShiftAssign => ">>=",
-        };
-        write!(f, "{}", s)
-    }
-}
 ```
+
+> **注**：`Display for AssignOp` 已在 [09-ast-expression-nodes](09-ast-expression-nodes.md) 中定义（AssignOp 枚举亦定义于该 task）。
 
 ## 验证标准
 

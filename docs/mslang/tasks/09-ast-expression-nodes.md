@@ -167,6 +167,28 @@ pub enum Expr {
 }
 ```
 
+### 复合表达式的 AST 表示约定
+
+**多目标赋值**（`a, b = 1, 2`，见 `03-syntax.md:140-145`）：target 和 value 均使用 `TupleLiteral` 包装：
+
+```
+Assign {
+    target: TupleLiteral { elements: [Identifier("a"), Identifier("b")] },
+    op: Assign,
+    value: TupleLiteral { elements: [Int(1), Int(2)] },
+}
+```
+
+**链式比较**（`1 < x < 10`，见 `03-syntax.md:401-405`）：在解析阶段反糖为 `and` 表达式，不使用专门节点：
+
+```
+Binary {
+    left: Binary { left: Int(1), op: Less, right: Identifier("x") },
+    op: And,
+    right: Binary { left: Identifier("x"), op: Less, right: Int(10) },
+}
+```
+
 ### Literal 枚举
 
 ```rust
@@ -291,8 +313,58 @@ impl std::fmt::Display for Expr {
             Expr::YieldFrom { iterable } => write!(f, "yield from {}", iterable),
             Expr::Go { expr } => write!(f, "go {}", expr),
             Expr::Grouping { expr } => write!(f, "({})", expr),
-            // ... 其他变体
-            _ => write!(f, "<expr>"),
+            Expr::Slice { object, start, stop, step } => {
+                let s = start.as_ref().map(|e| format!("{}", e)).unwrap_or_default();
+                let e = stop.as_ref().map(|e| format!("{}", e)).unwrap_or_default();
+                let sp = step.as_ref().map(|e| format!(":{}", e)).unwrap_or_default();
+                write!(f, "{}[{}:{}{}]", object, s, e, sp)
+            }
+            Expr::SetLiteral { elements } => {
+                let els: Vec<_> = elements.iter().map(|e| format!("{}", e)).collect();
+                write!(f, "{{{}}}", els.join(", "))
+            }
+            Expr::TupleLiteral { elements } => {
+                let els: Vec<_> = elements.iter().map(|e| format!("{}", e)).collect();
+                let trailing = if elements.len() == 1 { "," } else { "" };
+                write!(f, "({}{})", els.join(", "), trailing)
+            }
+            Expr::FnLiteral { params, body: _ } => {
+                let ps: Vec<_> = params.iter().map(|p| {
+                    if p.is_variadic { format!("{}...", p.name) }
+                    else if let Some(d) = &p.default { format!("{} = {}", p.name, d) }
+                    else { p.name.clone() }
+                }).collect();
+                write!(f, "fn({}) {{ ... }}", ps.join(", "))
+            }
+            Expr::ListComprehension { expr, for_clauses, condition } => {
+                let fcs: Vec<_> = for_clauses.iter()
+                    .map(|c| format!("for {} in {}", c.targets.join(", "), c.iterable))
+                    .collect();
+                let cond = condition.as_ref().map(|c| format!(" if {}", c)).unwrap_or_default();
+                write!(f, "[{} {}{}]", expr, fcs.join(" "), cond)
+            }
+            Expr::DictComprehension { key_expr, value_expr, for_clauses, condition } => {
+                let fcs: Vec<_> = for_clauses.iter()
+                    .map(|c| format!("for {} in {}", c.targets.join(", "), c.iterable))
+                    .collect();
+                let cond = condition.as_ref().map(|c| format!(" if {}", c)).unwrap_or_default();
+                write!(f, "{{{}: {} {}{}}}", key_expr, value_expr, fcs.join(" "), cond)
+            }
+            Expr::SetComprehension { expr, for_clauses, condition } => {
+                let fcs: Vec<_> = for_clauses.iter()
+                    .map(|c| format!("for {} in {}", c.targets.join(", "), c.iterable))
+                    .collect();
+                let cond = condition.as_ref().map(|c| format!(" if {}", c)).unwrap_or_default();
+                write!(f, "{{{} {}{}}}", expr, fcs.join(" "), cond)
+            }
+            Expr::GeneratorExpression { expr, for_clauses, condition } => {
+                let fcs: Vec<_> = for_clauses.iter()
+                    .map(|c| format!("for {} in {}", c.targets.join(", "), c.iterable))
+                    .collect();
+                let cond = condition.as_ref().map(|c| format!(" if {}", c)).unwrap_or_default();
+                write!(f, "({} {}{})", expr, fcs.join(" "), cond)
+            }
+            Expr::SuperAccess { name } => write!(f, "super.{}", name),
         }
     }
 }
@@ -334,6 +406,27 @@ impl std::fmt::Display for UnaryOp {
             UnaryOp::BitNot => write!(f, "~"),
             UnaryOp::ChannelReceive => write!(f, "<-"),
         }
+    }
+}
+
+impl std::fmt::Display for AssignOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            AssignOp::Assign => "=",
+            AssignOp::PlusAssign => "+=",
+            AssignOp::MinusAssign => "-=",
+            AssignOp::StarAssign => "*=",
+            AssignOp::SlashAssign => "/=",
+            AssignOp::DoubleSlashAssign => "//=",
+            AssignOp::PercentAssign => "%=",
+            AssignOp::DoubleStarAssign => "**=",
+            AssignOp::BitAndAssign => "&=",
+            AssignOp::BitOrAssign => "|=",
+            AssignOp::BitXorAssign => "^=",
+            AssignOp::LeftShiftAssign => "<<=",
+            AssignOp::RightShiftAssign => ">>=",
+        };
+        write!(f, "{}", s)
     }
 }
 ```
