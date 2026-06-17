@@ -15,7 +15,7 @@
 | 07 | [运算符与分隔符解析](07-lexer-operators-delimiters.md) | ✅ |
 | 08 | [换行与语句终止规则](08-lexer-statement-termination.md) | ✅ |
 | 09 | [AST 表达式节点定义](09-ast-expression-nodes.md) | ✅ |
-| 10 | [AST 语句节点定义](10-ast-statement-nodes.md) | ⬜ |
+| 10 | [AST 语句节点定义](10-ast-statement-nodes.md) | ✅ |
 | 11 | [语法分析器核心框架](11-parser-core.md) | ⬜ |
 | 12 | [表达式解析（优先级爬升）](12-parser-expressions.md) | ⬜ |
 | 13 | [语句解析](13-parser-statements.md) | ⬜ |
