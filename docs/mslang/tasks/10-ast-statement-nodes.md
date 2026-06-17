@@ -51,6 +51,8 @@ program = statement*
 
 `src/ast/node.rs`（与表达式节点同文件，或 `src/ast/statement.rs` 单独文件）
 
+> **替换 task 09 占位**：task 09 在 `src/ast/node.rs` 引入了最小占位 `enum Stmt { Placeholder }` 以保证 `Expr::FnLiteral { body: Vec<Stmt> }` 可独立编译。本 task 需用上述完整 `Stmt` 枚举**替换**该占位——删除 `Placeholder` 变体，并保持 `Expr::FnLiteral` 的 `body: Vec<Stmt>` 与其 Display（`body: _`）不变。
+
 ### Stmt 枚举
 
 ```rust
@@ -72,10 +74,6 @@ pub enum Stmt {
         target: Expr,
         op: AssignOp,
         value: Expr,
-    },
-    MultiAssign {
-        targets: Vec<Expr>,
-        values: Vec<Expr>,
     },
     ExprStmt {
         expr: Expr,
@@ -151,12 +149,16 @@ pub enum Stmt {
 }
 ```
 
+> **多目标赋值表示约定**：`a, b = 1, 2`（`03-syntax.md:140-145`）**不使用**专门变体，而是复用 `Stmt::Assign`——target 与 value 均以 `Expr::TupleLiteral` 包装。详见 [09-ast-expression-nodes](09-ast-expression-nodes.md) § 复合表达式的 AST 表示约定。此约定与 task 13 的 `parse_expr_or_assignment()` 一致。
+
+> **ClassDecl 字段说明**：`methods` 中每个元素均为 `Stmt::FnDecl`（由 parser 保证）；`class_vars` 存储 `(name, initializer)`，06-oop.md 中 `class_var = "var"? IDENTIFIER "=" expression` 的可选 `var` 前缀在此表示下与省略语义等价，故不单独保留标志。
+
 ### ExceptClause 结构体
 
 ```rust
 #[derive(Debug, Clone)]
 pub struct ExceptClause {
-    pub type_name: Option<String>,
+    pub type_name: Option<Vec<String>>,
     pub alias: Option<String>,
     pub body: Vec<Stmt>,
 }
@@ -189,13 +191,11 @@ impl std::fmt::Display for Stmt {
             Stmt::Assign { target, op, value } => {
                 write!(f, "{} {} {}", target, op, value)
             }
-            Stmt::MultiAssign { targets, values } => {
-                let ts: Vec<_> = targets.iter().map(|t| format!("{}", t)).collect();
-                let vs: Vec<_> = values.iter().map(|v| format!("{}", v)).collect();
-                write!(f, "{} = {}", ts.join(", "), vs.join(", "))
-            }
             Stmt::ExprStmt { expr } => write!(f, "{}", expr),
             Stmt::Block { statements } => {
+                if statements.is_empty() {
+                    return write!(f, "{{}}");
+                }
                 let stmts: Vec<_> = statements.iter().map(|s| format!("{}", s)).collect();
                 write!(f, "{{\n{}\n}}", stmts.join("\n"))
             }
@@ -254,8 +254,8 @@ impl std::fmt::Display for Stmt {
                 for clause in except_clauses {
                     let cb: Vec<_> = clause.body.iter().map(|s| format!("{}", s)).collect();
                     match (&clause.type_name, &clause.alias) {
-                        (Some(t), Some(a)) => write!(f, " except {} as {} {{\n{}\n}}", t, a, cb.join("\n"))?,
-                        (Some(t), None) => write!(f, " except {} {{\n{}\n}}", t, cb.join("\n"))?,
+                        (Some(t), Some(a)) => write!(f, " except {} as {} {{\n{}\n}}", t.join("."), a, cb.join("\n"))?,
+                        (Some(t), None) => write!(f, " except {} {{\n{}\n}}", t.join("."), cb.join("\n"))?,
                         (None, Some(a)) => write!(f, " except as {} {{\n{}\n}}", a, cb.join("\n"))?,
                         (None, None) => write!(f, " except {{\n{}\n}}", cb.join("\n"))?,
                     }
@@ -318,6 +318,7 @@ impl std::fmt::Display for Program {
 2. Stmt 枚举覆盖 [03-syntax](../03-syntax.md) 所有语句类型
 3. Display 可正确输出语句
 4. Program 作为顶层节点正确聚合
+5. AST 层不做语义校验：多目标赋值两侧 `TupleLiteral` 的元素数量匹配（`03-syntax.md:140`，不符抛 `ValueError`）由编译期/运行期负责，AST 允许二者长度不一致
 
 ## 测试用例
 
