@@ -63,7 +63,7 @@ fn peek(&self) -> &Token {
 }
 
 fn previous(&self) -> &Token {
-    &self.tokens[self.current - 1]
+    &self.tokens[self.current.saturating_sub(1)]
 }
 
 fn is_at_end(&self) -> bool {
@@ -229,6 +229,8 @@ fn synchronize(&mut self) {
             TokenKind::Var | TokenKind::Const | TokenKind::Fn
             | TokenKind::If | TokenKind::While | TokenKind::For
             | TokenKind::Class | TokenKind::Return | TokenKind::Import
+            | TokenKind::From | TokenKind::Nonlocal | TokenKind::Global
+            | TokenKind::Async
             | TokenKind::Try | TokenKind::With | TokenKind::Defer
             | TokenKind::Break | TokenKind::Continue | TokenKind::Throw
             => return,
@@ -255,12 +257,62 @@ fn parse_statement_safe(&mut self) -> Option<Stmt> {
 }
 ```
 
+> **错误恢复策略**：入口 `parse()` 采用**严格模式**——通过 `parse_statement()?` 在首个语法错误即返回 `Err`，适合一次性编译/执行场景。`synchronize()` 与 `parse_statement_safe()` 作为**原语**提供，供 REPL、IDE、LSP 等需要继续解析以收集多个错误的上下文调用（例如把 `parse()` 主循环改为调用 `parse_statement_safe()` 并聚合错误）。本 task 只提供原语，不在 `parse()` 中强制启用 panic mode。
+
+### 占位方法（stubs）
+
+`parse_statement()` 分发引用的子解析器（`parse_var_decl`、`parse_const_decl`、`parse_fn_or_expr`、`parse_if`、`parse_while`、`parse_for`、`parse_return`、`parse_import`、`parse_from_import`、`parse_class`、`parse_defer`、`parse_try`、`parse_with`、`parse_throw`、`parse_expr_or_assignment`）**不在本 task 范围内**——它们由 task 12（`parse_expression`）、task 13（变量/控制流/import/赋值）、task 14（匿名函数）、task 15（class/defer/try/with/throw/async）实现。
+
+为保证 task 11 可**独立编译**（遵循 task 03 `read_string`、task 09 `Stmt::Placeholder` 的前置占位模式），本 task 需为上述每个方法提供 stub，由后续 task 替换：
+
+```rust
+// 占位：由 task 13 替换
+fn parse_var_decl(&mut self) -> Result<Stmt> {
+    self.unimplemented("parse_var_decl")
+}
+// ... parse_const_decl / parse_fn_or_expr / parse_if / parse_while / parse_for /
+//     parse_return / parse_import / parse_from_import / parse_expr_or_assignment
+//     同样返回 self.unimplemented(...)，分别由 task 13/14 替换。
+
+// 占位：由 task 15 替换
+fn parse_class(&mut self) -> Result<Stmt> {
+    self.unimplemented("parse_class")
+}
+// ... parse_defer / parse_try / parse_with / parse_throw 同上。
+
+// 占位：由 task 12 替换（被 parse_expr_or_assignment 调用）
+fn parse_expression(&mut self) -> Result<Expr> {
+    self.unimplemented_expr("parse_expression")
+}
+
+fn unimplemented(&mut self, name: &str) -> Result<Stmt> {
+    let tok = self.peek();
+    Err(MspError::ParseError {
+        line: tok.span.start.line,
+        column: tok.span.start.column,
+        message: format!("{} not yet implemented", name),
+    })
+}
+
+fn unimplemented_expr(&mut self, name: &str) -> Result<Expr> {
+    let tok = self.peek();
+    Err(MspError::ParseError {
+        line: tok.span.start.line,
+        column: tok.span.start.column,
+        message: format!("{} not yet implemented", name),
+    })
+}
+```
+
+> **测试归属**：因 stub 在 task 11 阶段对所有非空输入返回 `ParseError`，依赖实际解析的测试（`test_simple_program`、`test_block`、`test_newline_handling`）**在 task 13 完成后方可通过**；本 task 验证范围仅覆盖框架原语（空程序、错误路径不 panic、块边界）。这些解析测试的断言保留于此作为 task 13 的回归基线。
+
 ## 验证标准
 
-1. `cargo build` 编译通过
-2. 能解析简单程序（变量赋值 + 表达式语句）
-3. 错误输入不 panic，返回 `ParseError`
-4. 块语句正确解析 `{ }` 内的语句列表
+1. `cargo build` 编译通过（含上述 stub 方法）
+2. 框架原语可用：`parse("")` 返回空 `Program`，错误输入返回 `ParseError` 且不 panic
+3. `parse_block()` 正确解析 `{ }` 边界（缺 `}` 时报错）
+4. `skip_newlines` / `consume_newline` / `synchronize` 行为正确
+5. 实际语句/表达式解析（`test_simple_program`、`test_block`、`test_newline_handling`）由 task 12-15 接管 stub 后通过
 
 ## 测试用例
 
@@ -270,13 +322,13 @@ y = 20
 print(x + y)
 ```
 
-预期 AST：
+预期 AST（变体以 task 13 为准；裸 `=` + 标识符 target 由 task 13 转为 `Stmt::VarDecl`）：
 
 ```
 Program {
     statements: [
-        Assign(x, =, Literal(10)),
-        Assign(y, =, Literal(20)),
+        VarDecl(x, Literal(10)),
+        VarDecl(y, Literal(20)),
         ExprStmt(Call(print, [Binary(x, +, y)])),
     ]
 }
