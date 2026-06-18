@@ -16,7 +16,7 @@
 | 08 | [换行与语句终止规则](08-lexer-statement-termination.md) | ✅ |
 | 09 | [AST 表达式节点定义](09-ast-expression-nodes.md) | ✅ |
 | 10 | [AST 语句节点定义](10-ast-statement-nodes.md) | ✅ |
-| 11 | [语法分析器核心框架](11-parser-core.md) | ⬜ |
+| 11 | [语法分析器核心框架](11-parser-core.md) | ✅ |
 | 12 | [表达式解析（优先级爬升）](12-parser-expressions.md) | ⬜ |
 | 13 | [语句解析](13-parser-statements.md) | ⬜ |
 | 14 | [集合字面量与匿名函数解析](14-parser-collection-literals.md) | ⬜ |
