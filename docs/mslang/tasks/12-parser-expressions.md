@@ -85,24 +85,9 @@ fn parse_assignment(&mut self) -> Result<Expr> {
         }
     }
 
-    // 检查 := 短声明
-    if self.check(&TokenKind::ColonEqual) {
-        self.advance();
-        let value = self.parse_assignment()?;
-        if let Expr::Identifier(name) = &expr {
-            return Ok(Expr::Assign {
-                target: Box::new(expr.clone()),
-                op: AssignOp::Assign,
-                value: Box::new(value),
-            });
-        }
-        return Err(MspError::ParseError {
-            line: self.previous().span.start.line,
-            column: self.previous().span.start.column,
-            message: "invalid assignment target for :=".into(),
-        });
-    }
-
+    // `:=` 短声明为语句级构造（03-syntax.md:48 short_var），由 task 13
+    // parse_expr_or_assignment 在语句层检测 ColonEqual 并产出 Stmt::ShortVarDecl，
+    // 不在表达式层消费——此处若处理会使 task 13 的 := 分支成为死代码。
     Ok(expr)
 }
 ```
@@ -203,29 +188,60 @@ fn parse_comparison(&mut self) -> Result<Expr> {
         (TokenKind::Is, BinaryOp::Is),
     ];
 
-    let mut found_op = true;
-    while found_op {
-        found_op = false;
+    // 匹配首个比较运算符；无则直接返回（单初等表达式）
+    let mut first_op = None;
+    for (token_kind, op) in &comp_ops {
+        if self.check(token_kind) {
+            first_op = Some(*op);
+            break;
+        }
+    }
+    let first_op = match first_op {
+        Some(op) => op,
+        None => return Ok(expr),
+    };
+    self.advance();
+    let mut right = self.parse_bit_or()?;
+    let mut result = Expr::Binary {
+        left: Box::new(expr),
+        op: first_op,
+        right: Box::new(right.clone()),
+    };
+
+    // 后续比较运算符：在解析阶段反糖为 and 链（见 task 09 § 链式比较）
+    // a < b < c  =>  (a < b) and (b < c)，中间操作数 clone 复用到两侧
+    loop {
+        let mut next_op = None;
         for (token_kind, op) in &comp_ops {
             if self.check(token_kind) {
-                self.advance();
-                let right = self.parse_bit_or()?;
-                expr = Expr::Binary {
-                    left: Box::new(expr),
-                    op: op.clone(),
-                    right: Box::new(right),
-                };
-                found_op = true;
+                next_op = Some(*op);
                 break;
             }
         }
+        match next_op {
+            Some(op) => {
+                self.advance();
+                let next = self.parse_bit_or()?;
+                result = Expr::Binary {
+                    left: Box::new(result),
+                    op: BinaryOp::And,
+                    right: Box::new(Expr::Binary {
+                        left: Box::new(right),
+                        op,
+                        right: Box::new(next.clone()),
+                    }),
+                };
+                right = next;
+            }
+            None => break,
+        }
     }
 
-    Ok(expr)
+    Ok(result)
 }
 ```
 
-链式比较 `1 < x < 10` 解析为嵌套的 `Binary(Binary(1, <, x), and, Binary(x, <, 10))`，此转换可在编译阶段完成，Parser 层保持原始嵌套即可。
+链式比较 `1 < x < 10` 在解析阶段即反糖为 `(1 < x) and (x < 10)`（见 [09-ast-expression-nodes](09-ast-expression-nodes.md) § 链式比较），中间操作数 `x` 被 clone 复用到两侧比较中。单比较 `a < b` 仍为普通 `Binary(a, Less, b)`。此反糖**必须在解析阶段完成**：若保留原始左结合嵌套 `Binary(Binary(a, op, b), op, c)`，其 AST 形状与合法左结合链 `(a op b) op c` 完全相同，编译器无法区分二者，且按字面执行会把布尔结果再次比较（按 `02-types.md` 触发 TypeError）。
 
 ### parse_bit_or() — 优先级 7
 
@@ -311,7 +327,7 @@ fn parse_addition(&mut self) -> Result<Expr> {
         let op = if self.match_token(&[TokenKind::Plus]) {
             BinaryOp::Add
         } else if self.match_token(&[TokenKind::Minus]) {
-            BinaryOp::Sub
+            BinaryOp::Subtract
         } else {
             break;
         };
@@ -333,13 +349,13 @@ fn parse_multiplication(&mut self) -> Result<Expr> {
     let mut expr = self.parse_unary()?;
     loop {
         let op = if self.match_token(&[TokenKind::Star]) {
-            BinaryOp::Mul
+            BinaryOp::Multiply
         } else if self.match_token(&[TokenKind::Slash]) {
-            BinaryOp::Div
+            BinaryOp::Divide
         } else if self.match_token(&[TokenKind::DoubleSlash]) {
             BinaryOp::FloorDiv
         } else if self.match_token(&[TokenKind::Percent]) {
-            BinaryOp::Mod
+            BinaryOp::Modulo
         } else {
             break;
         };
@@ -400,26 +416,7 @@ fn parse_power(&mut self) -> Result<Expr> {
 }
 ```
 
-注意：`**` 的右侧调用 `parse_unary()` 而非 `parse_power()`，因为一元运算符优先级低于幂运算。但实际上 `2 ** -3` 应该是合法的（`2 ** (-3)`），所以右侧应调用 `parse_unary()`。然而为了实现右结合 `2 ** 3 ** 2` = `2 ** (3 ** 2)`，右侧实际上应该调用 `parse_power()` 或自身。
-
-正确实现：
-
-```rust
-fn parse_power(&mut self) -> Result<Expr> {
-    let base = self.parse_postfix()?;
-    if self.match_token(&[TokenKind::DoubleStar]) {
-        let exponent = self.parse_unary()?;
-        return Ok(Expr::Binary {
-            left: Box::new(base),
-            op: BinaryOp::Power,
-            right: Box::new(exponent),
-        });
-    }
-    Ok(base)
-}
-```
-
-`2 ** 3 ** 2` 的解析过程：`parse_power()` 解析 `2`，遇到 `**`，递归调用 `parse_unary()`，`parse_unary()` 调用 `parse_power()` 解析 `3 ** 2`，实现右结合。
+`**` 的右侧调用 `parse_unary()`：既允许 `2 ** -3`（一元负号作为指数），又通过 `parse_unary() → parse_power()` 的递归实现右结合 `2 ** 3 ** 2` = `2 ** (3 ** 2)`。解析过程：`parse_power()` 解析 `2`，遇到 `**`，右侧调用 `parse_unary()`；`parse_unary()` 在无前缀运算符时落入 `parse_power()`，从而继续解析 `3 ** 2`，实现右结合。
 
 ### parse_postfix() — 优先级 15
 
@@ -447,12 +444,23 @@ fn parse_postfix(&mut self) -> Result<Expr> {
                 };
             }
         } else if self.match_token(&[TokenKind::Dot]) {
-            let name = self.expect(TokenKind::Identifier(String::new()), "expected property name")?;
-            if let TokenKind::Identifier(n) = &name.kind {
+            // 注意：不可用 expect(TokenKind::Identifier(String::new())) —— TokenKind 派生的
+            // PartialEq（task 02）按内层 String 比较，与 check 的 ==（task 11）配合会使任意
+            // 真实标识符都不匹配 Identifier("")。改用模式匹配。
+            let tok = self.peek();
+            if let TokenKind::Identifier(n) = &tok.kind {
+                let name = n.clone();
+                self.advance();
                 expr = Expr::Dot {
                     object: Box::new(expr),
-                    name: n.clone(),
+                    name,
                 };
+            } else {
+                return Err(MspError::ParseError {
+                    line: tok.span.start.line,
+                    column: tok.span.start.column,
+                    message: "expected property name after '.'".into(),
+                });
             }
         } else {
             break;
@@ -506,16 +514,26 @@ fn parse_primary(&mut self) -> Result<Expr> {
             self.advance();
             Ok(Expr::Identifier(name))
         }
+        TokenKind::Zelf => {
+            // `self` 是关键字（task 02 Zelf），但在方法体内作为初等表达式使用。
+            // 按 task 13 parse_param_name 的约定映射为 Expr::Identifier("self")，
+            // 使 self.attr 的解析路径与普通标识符一致（06-oop.md:48-58）。
+            self.advance();
+            Ok(Expr::Identifier("self".into()))
+        }
         TokenKind::Super => {
             self.advance();
             self.expect(TokenKind::Dot, "expected '.' after 'super'")?;
-            let name_tok = self.expect(TokenKind::Identifier(String::new()), "expected method name")?;
+            // 用模式匹配而非 expect(Identifier(""))，原因见 parse_postfix 的 . 分支注释
+            let name_tok = self.peek();
             if let TokenKind::Identifier(n) = &name_tok.kind {
-                return Ok(Expr::SuperAccess { name: n.clone() });
+                let name = n.clone();
+                self.advance();
+                return Ok(Expr::SuperAccess { name });
             }
             Err(MspError::ParseError {
-                line: tok.span.start.line,
-                column: tok.span.start.column,
+                line: name_tok.span.start.line,
+                column: name_tok.span.start.column,
                 message: "expected method name after 'super.'".into(),
             })
         }
@@ -529,6 +547,14 @@ fn parse_primary(&mut self) -> Result<Expr> {
             let expr = self.parse_power()?;
             Ok(Expr::Await { expr: Box::new(expr) })
         }
+        TokenKind::Go => {
+            // go 表达式（08-concurrency.md:88 go_expr = "go" expression）。
+            // 与 await/yield 同属前缀表达式族，操作数取 parse_unary()，
+            // 使 `go f(x)`、`go fn(){...}` 正确解析为 Expr::Go（09-ast-expression-nodes.md）。
+            self.advance();
+            let expr = self.parse_unary()?;
+            Ok(Expr::Go { expr: Box::new(expr) })
+        }
         _ => Err(MspError::ParseError {
             line: tok.span.start.line,
             column: tok.span.start.column,
@@ -537,6 +563,21 @@ fn parse_primary(&mut self) -> Result<Expr> {
     }
 }
 ```
+
+> **辅助方法归属**：`parse_primary` 与 `parse_postfix` 调用的下列方法不在本 task 实现，由后续 task 提供并替换（遵循 task 11 的占位模式，归属 task 完成前以 stub 返回 `ParseError`，集成后由对应 task 替换）：
+>
+> | 方法 | 归属 | 说明 |
+> |---|---|---|
+> | `parse_arguments` | task 13（或本 task 同期的语句解析） | 函数调用参数列表 |
+> | `is_slice` / `parse_slice` | Phase 4.3（切片） | 切片语法检测与解析 |
+> | `parse_grouping_or_tuple` | 集合字面量解析 task | `(...)` 分组或元组 |
+> | `parse_list_literal` | 集合字面量解析 task | `[...]` 列表字面量 |
+> | `parse_dict_or_set` | 集合字面量解析 task | `{...}` dict 或 set |
+> | `parse_fn_literal` | task 14（匿名函数） | `fn(...){...}` 字面量 |
+> | `parse_yield_expr` | Phase 4.7（生成器） | `yield` / `yield from` 表达式 |
+> | `is_fn_literal` | task 13（建议下沉至 task 11 核心原语） | 区分 `fn name(` 声明与 `fn(` 字面量 |
+>
+> 本 task 仅提供上述方法的**分发调用点**与 15 级优先级爬升主体；这些方法的最终实现需在 [12-implementation-plan](../12-implementation-plan.md) 中明确对应 task，避免归属悬空。
 
 ## 验证标准
 
@@ -616,11 +657,25 @@ mod tests {
     #[test]
     fn test_chained_comparison() {
         let expr = parse_expr("1 < a < 10").unwrap();
+        // 解析阶段反糖为 (1 < a) and (a < 10)（见 task 09 § 链式比较）
         match expr {
-            Expr::Binary { left, op: BinaryOp::Less, right: _ } => {
+            Expr::Binary { left, op: BinaryOp::And, right } => {
                 assert!(matches!(*left, Expr::Binary { op: BinaryOp::Less, .. }));
+                assert!(matches!(*right, Expr::Binary { op: BinaryOp::Less, .. }));
             }
-            _ => panic!("expected chained less-than"),
+            _ => panic!("expected and-desugared chained comparison"),
+        }
+    }
+
+    #[test]
+    fn test_postfix_chain() {
+        // 验证后缀表达式正确链接：obj.method(args)[index]（验证标准 5）
+        let expr = parse_expr("obj.method(42)[0]").unwrap();
+        match expr {
+            Expr::Index { object, .. } => {
+                assert!(matches!(*object, Expr::Call { .. }));
+            }
+            _ => panic!("expected index over call"),
         }
     }
 }
