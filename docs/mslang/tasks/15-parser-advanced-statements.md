@@ -7,7 +7,7 @@ Phase 1.5e - 基础设施
 13-parser-statements
 
 ## 目标
-实现高级语句解析：defer、try/except/finally、throw、with、class 定义、async 函数、go 表达式、yield 表达式。
+实现高级语句解析：defer、try/except/finally、throw、with、class 定义、import 语句、async 函数、go 表达式、yield 表达式。
 
 ## 设计规格
 
@@ -78,11 +78,30 @@ yield_expr = "yield" expression?
            | "yield" "from" expression
 ```
 
+### import 语句
+
+参照 [09-modules](../09-modules.md) § import 语法：
+
+```
+import_stmt = "import" module_path ("as" IDENTIFIER)?
+            | "from" module_path "import" import_targets
+
+module_path = IDENTIFIER ("." IDENTIFIER)*
+import_targets = import_target ("," import_target)*
+import_target = IDENTIFIER ("as" IDENTIFIER)?
+```
+
+`@std` 前缀（`09-modules.md:60-61`）：`import @std math` 强制加载标准库模块（跳过当前目录搜索）。`@` 后必须跟 `std` 标识符。
+
 ## 实现细节
 
 ### 文件位置
 
-`src/parser/statement.rs` 中添加相应解析方法。
+涉及三个文件：
+
+- **`src/parser/statement.rs`** — 新增 `parse_defer`、`parse_try`、`parse_throw`、`parse_with`、`parse_class`、`parse_class_method`、`parse_async_fn`、`parse_import`、`parse_from_import`、`parse_module_path`。
+- **`src/parser/expression.rs`** — 替换 `parse_yield_expr` stub（第 819-820 行）；替换 `parse_primary` 中 `TokenKind::Go` 分支（第 475-481 行，`parse_unary` → `parse_postfix`）。
+- **`src/parser/mod.rs`** — 删除 7 个 stub（`parse_import`、`parse_from_import`、`parse_class`、`parse_defer`、`parse_try`、`parse_with`、`parse_throw`）；在 `parse_statement` 分发中添加 `TokenKind::Async` 分支。
 
 ### parse_defer()
 
@@ -108,12 +127,11 @@ fn parse_try(&mut self) -> Result<Stmt> {
         let type_name = if self.peek().is_identifier() {
             match &self.peek().kind {
                 TokenKind::Identifier(name) => {
-                    let mut path = name.clone();
+                    let mut path = vec![name.clone()];
                     self.advance();
                     while self.match_token(&[TokenKind::Dot]) {
                         if let TokenKind::Identifier(n) = &self.peek().kind {
-                            path.push('.');
-                            path.push_str(n);
+                            path.push(n.clone());
                             self.advance();
                         }
                     }
@@ -250,54 +268,119 @@ fn parse_class_method(&mut self) -> Result<Stmt> {
 }
 ```
 
+### parse_import()
+
+```rust
+fn parse_import(&mut self) -> Result<Stmt> {
+    self.advance(); // consume 'import'
+    let is_stdlib = self.match_token(&[TokenKind::At]);
+    if is_stdlib {
+        let std_tok = self.peek();
+        match &std_tok.kind {
+            TokenKind::Identifier(name) if name == "std" => {
+                self.advance();
+            }
+            _ => {
+                return Err(MspError::ParseError {
+                    line: std_tok.span.start.line,
+                    column: std_tok.span.start.column,
+                    message: "expected 'std' after '@' in import".into(),
+                });
+            }
+        }
+    }
+    let module_path = self.parse_module_path()?;
+    let alias = if self.match_token(&[TokenKind::As]) {
+        Some(self.expect_identifier("expected alias name")?)
+    } else {
+        None
+    };
+    self.consume_newline();
+    Ok(Stmt::Import { module_path, alias, is_stdlib })
+}
+```
+
+### parse_from_import()
+
+```rust
+fn parse_from_import(&mut self) -> Result<Stmt> {
+    self.advance(); // consume 'from'
+    let is_stdlib = self.match_token(&[TokenKind::At]);
+    if is_stdlib {
+        let std_tok = self.peek();
+        match &std_tok.kind {
+            TokenKind::Identifier(name) if name == "std" => {
+                self.advance();
+            }
+            _ => {
+                return Err(MspError::ParseError {
+                    line: std_tok.span.start.line,
+                    column: std_tok.span.start.column,
+                    message: "expected 'std' after '@' in from-import".into(),
+                });
+            }
+        }
+    }
+    let module_path = self.parse_module_path()?;
+    self.expect(TokenKind::Import, "expected 'import' after module path")?;
+
+    let mut targets = Vec::new();
+    loop {
+        let name = self.expect_identifier("expected import name")?;
+        let alias = if self.match_token(&[TokenKind::As]) {
+            Some(self.expect_identifier("expected alias name")?)
+        } else {
+            None
+        };
+        targets.push((name, alias));
+        if !self.match_token(&[TokenKind::Comma]) {
+            break;
+        }
+    }
+
+    self.consume_newline();
+    Ok(Stmt::FromImport { module_path, targets, is_stdlib })
+}
+```
+
+### parse_module_path()
+
+```rust
+fn parse_module_path(&mut self) -> Result<Vec<String>> {
+    let mut path = vec![self.expect_identifier("expected module name")?];
+    while self.match_token(&[TokenKind::Dot]) {
+        path.push(self.expect_identifier("expected module name after '.'")?);
+    }
+    Ok(path)
+}
+```
+
 ### parse_yield_expr()
 
-参照 [07-advanced](../07-advanced.md) § yield from 消歧规则：
-
-> `yield from` 中的 `from` 作为关键字解析，仅在 `yield` 紧后跟 `from` 时触发。`yield from_module.import_name` 等场景中 `from` 后不跟表达式，仍解析为 `yield` 后跟标识符表达式。解析器通过检查 `from` 后是否跟随表达式来区分。
+> **替换** `src/parser/expression.rs` 中的 `parse_yield_expr` stub（当前返回 `unimplemented_expr`）。此方法留在 expression.rs（被 `parse_primary` 调用）。
+>
+> **简化说明**：`from` 是关键字（`TokenKind::From`，由词法分析器 `keyword_table()` 映射），不可能作为标识符出现。`yield from_module.import_name` 中的 `from_module` 被词法分析器整体识别为 `Identifier("from_module")`，而非 `From` + 后续 token。因此 `Yield` 后跟 `From` token 时**始终**为 `yield from`（委托），无需消歧逻辑（`is_expression_start` / `backup`）。`07-advanced.md:185` 的消歧规则是针对 `from_module`（单个标识符）而非 `From` 关键字。
 
 ```rust
 fn parse_yield_expr(&mut self) -> Result<Expr> {
     self.advance(); // consume 'yield'
 
-    // 消歧：yield from vs yield <identifier starting with "from">
-    // from 是关键字 token，词法分析器已将其识别为 TokenKind::From
-    // 需要检查 From 后面是否跟随表达式（而非 . 或换行）
+    // yield from expr — From 是关键字，始终为委托语义
     if self.match_token(&[TokenKind::From]) {
-        // 检查 from 后是否跟随表达式开始符号
-        // 如果不是表达式开始，说明是 yield 后跟了 from 变量（理论上不可能，因为 from 是关键字）
-        // 但设计文档的消歧场景是：from 后的 token 决定语义
-        // 如果 from 后紧跟表达式 → yield from（委托生成器）
-        // 如果 from 后不跟表达式 → 回退，按 yield 处理
-        if self.is_expression_start() {
-            let iterable = self.parse_expression()?;
-            return Ok(Expr::YieldFrom {
-                iterable: Box::new(iterable),
-            });
-        } else {
-            // from 后不是表达式，回退 From token
-            self.backup();
-        }
+        let iterable = self.parse_expression()?;
+        return Ok(Expr::YieldFrom {
+            iterable: Box::new(iterable),
+        });
     }
 
-    if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) {
+    // bare yield
+    if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) || self.is_at_end() {
         return Ok(Expr::Yield { value: None });
     }
 
+    // yield expr
     let value = self.parse_expression()?;
     Ok(Expr::Yield { value: Some(Box::new(value)) })
-}
-
-fn is_expression_start(&self) -> bool {
-    matches!(
-        self.peek().kind,
-        TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::String(_) |
-        TokenKind::Identifier(_) | TokenKind::True | TokenKind::False |
-        TokenKind::Nil | TokenKind::LeftParen | TokenKind::LeftBracket |
-        TokenKind::LeftBrace | TokenKind::Super | TokenKind::Await |
-        TokenKind::Fn | TokenKind::Minus | TokenKind::Tilde |
-        TokenKind::LeftArrow | TokenKind::Not
-    )
 }
 ```
 
@@ -325,7 +408,7 @@ fn parse_async_fn(&mut self) -> Result<Stmt> {
 }
 ```
 
-对于 `go` 表达式，在 `parse_primary()` 中添加：
+对于 `go` 表达式，**替换** `expression.rs:475-481` 中 task 12 的 `Go` 分支（当前使用 `parse_unary`，改为 `parse_postfix` 以限制 `go` 后只能跟函数调用 / 匿名函数，不允许一元前缀运算符）：
 
 ```rust
 TokenKind::Go => {
@@ -348,6 +431,7 @@ TokenKind::Go => {
 5. class 定义（含继承、方法、类属性）正确解析
 6. async fn 正确解析
 7. yield 和 yield from 正确解析
+8. `import` 和 `from...import` 正确解析（含 `@std` 前缀）
 
 ## 测试用例
 
@@ -446,7 +530,7 @@ mod tests {
             Stmt::Try { try_block, except_clauses, finally_block } => {
                 assert_eq!(try_block.len(), 1);
                 assert_eq!(except_clauses.len(), 1);
-                assert_eq!(except_clauses[0].type_name.as_deref(), Some("ValueError"));
+                assert_eq!(except_clauses[0].type_name.as_ref().unwrap(), &vec!["ValueError".to_string()]);
                 assert_eq!(except_clauses[0].alias.as_deref(), Some("e"));
                 assert!(finally_block.is_some());
             }
@@ -508,6 +592,79 @@ mod tests {
                 assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::Yield { value: Some(_) } }));
             }
             _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_yield_from() {
+        let prog = parse("fn gen() {\n    yield from items\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::YieldFrom { .. } }));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_bare_yield() {
+        let prog = parse("fn gen() {\n    yield\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::Yield { value: None } }));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_async_fn() {
+        let prog = parse("async fn fetch(url) {\n    return url\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { name, is_async, .. } => {
+                assert_eq!(name, "fetch");
+                assert!(*is_async);
+            }
+            _ => panic!("expected async fn"),
+        }
+    }
+
+    #[test]
+    fn test_go_expr() {
+        let prog = parse("go worker()\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::ExprStmt { expr: Expr::Go { .. } } => {}
+            _ => panic!("expected go expression"),
+        }
+    }
+
+    #[test]
+    fn test_class_var_with_var_keyword() {
+        let prog = parse("class C {\n    var count = 0\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::ClassDecl { class_vars, .. } => {
+                assert_eq!(class_vars.len(), 1);
+                assert_eq!(class_vars[0].0, "count");
+            }
+            _ => panic!("expected class"),
+        }
+    }
+
+    #[test]
+    fn test_import() {
+        let prog = parse("import math\nimport os.path as pathutil\n").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+    }
+
+    #[test]
+    fn test_from_import() {
+        let prog = parse("from os import path\nfrom io import open, print as log\n").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[1] {
+            Stmt::FromImport { targets, .. } => {
+                assert_eq!(targets.len(), 2);
+            }
+            _ => panic!("expected from import"),
         }
     }
 }
