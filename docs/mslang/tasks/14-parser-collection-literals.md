@@ -4,7 +4,7 @@
 Phase 1.5d - 基础设施
 
 ## 前置任务
-12-parser-expressions
+12-parser-expressions, 13-parser-statements
 
 ## 目标
 实现列表、Dict、Set、元组字面量、匿名函数和推导式的解析。
@@ -92,6 +92,12 @@ for_clause = "for" IDENTIFIER "in" expression
 
 `src/parser/expression.rs` 中添加相应解析方法。
 
+> **替换 vs 新增说明**：
+> - **替换** task 12 的 `parse_grouping_or_tuple` 最小实现（`expression.rs:516-544`，标注为"完整归属集合字面量解析 task"）——删除原实现，写入下方完整版本。
+> - **复用** task 12 的 `is_fn_literal`（`expression.rs:548`），**不重复定义**。
+> - **填充 stub** `parse_list_literal`、`parse_dict_or_set`、`parse_fn_literal`（当前为 `unimplemented_expr`）。
+> - **新增可见性**：将 `parse_or` 从 `fn` 提升为 `pub(super) fn`，供推导式 iterable 解析使用（排除三元 `if...else`，避免与推导式过滤条件冲突）。
+
 ### parse_list_literal()
 
 ```rust
@@ -140,6 +146,8 @@ fn parse_for_targets(&mut self) -> Result<Vec<String>> {
 
 ### parse_list_comprehension()
 
+> **iterable 使用 `parse_or()` 而非 `parse_expression()`**：推导式 iterable 必须在 `or` 优先级层解析（优先级 3），排除三元 `if...else`（优先级 2）和赋值（优先级 1）。否则 `[x for x in items if x > 0]` 中的 `if` 会被 `parse_ternary` 误消费为三元条件，导致 "expected 'else'" 错误。需将 `expression.rs` 中 `parse_or` 提升为 `pub(super) fn`。dict/set 推导式同理。
+
 ```rust
 fn parse_list_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     let mut for_clauses = Vec::new();
@@ -147,12 +155,12 @@ fn parse_list_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     while self.match_token(&[TokenKind::For]) {
         let targets = self.parse_for_targets()?;
         self.expect(TokenKind::In, "expected 'in' in comprehension")?;
-        let iterable = self.parse_expression()?;
+        let iterable = Box::new(self.parse_or()?);
         for_clauses.push(ForClause { targets, iterable });
     }
 
     let condition = if self.match_token(&[TokenKind::If]) {
-        Some(Box::new(self.parse_expression()?))
+        Some(Box::new(self.parse_or()?))
     } else {
         None
     };
@@ -205,7 +213,7 @@ fn parse_dict_or_set(&mut self) -> Result<Expr> {
         self.expect(TokenKind::RightBrace, "expected '}'")?;
         Ok(Expr::DictLiteral { pairs })
     } else {
-        // Set: {elem, ...}
+        // Set: {elem, ...}（需要至少两元素或尾部逗号，见 03-syntax.md:544-545）
 
         // 检查是否是 set 推导式
         if self.check(&TokenKind::For) {
@@ -213,7 +221,9 @@ fn parse_dict_or_set(&mut self) -> Result<Expr> {
         }
 
         let mut elements = vec![first];
+        let mut has_comma = false;
         while self.match_token(&[TokenKind::Comma]) {
+            has_comma = true;
             self.skip_newlines();
             if self.check(&TokenKind::RightBrace) { break; }
             elements.push(self.parse_expression()?);
@@ -221,6 +231,14 @@ fn parse_dict_or_set(&mut self) -> Result<Expr> {
         }
         self.skip_newlines();
         self.expect(TokenKind::RightBrace, "expected '}'")?;
+
+        // {expr}（无逗号）不匹配 set 语法，按 03-syntax.md:553 解析为分组表达式。
+        // 编译器后续可对 {single_value} 形式发出警告。
+        if elements.len() == 1 && !has_comma {
+            let inner = elements.pop().unwrap();
+            return Ok(Expr::Grouping { expr: Box::new(inner) });
+        }
+
         Ok(Expr::SetLiteral { elements })
     }
 }
@@ -235,12 +253,12 @@ fn parse_dict_comprehension(&mut self, key_expr: Expr, value_expr: Expr) -> Resu
     while self.match_token(&[TokenKind::For]) {
         let targets = self.parse_for_targets()?;
         self.expect(TokenKind::In, "expected 'in'")?;
-        let iterable = self.parse_expression()?;
+        let iterable = Box::new(self.parse_or()?);
         for_clauses.push(ForClause { targets, iterable });
     }
 
     let condition = if self.match_token(&[TokenKind::If]) {
-        Some(Box::new(self.parse_expression()?))
+        Some(Box::new(self.parse_or()?))
     } else {
         None
     };
@@ -265,12 +283,12 @@ fn parse_set_comprehension(&mut self, expr: Expr) -> Result<Expr> {
     while self.match_token(&[TokenKind::For]) {
         let targets = self.parse_for_targets()?;
         self.expect(TokenKind::In, "expected 'in'")?;
-        let iterable = self.parse_expression()?;
+        let iterable = Box::new(self.parse_or()?);
         for_clauses.push(ForClause { targets, iterable });
     }
 
     let condition = if self.match_token(&[TokenKind::If]) {
-        Some(Box::new(self.parse_expression()?))
+        Some(Box::new(self.parse_or()?))
     } else {
         None
     };
@@ -287,9 +305,12 @@ fn parse_set_comprehension(&mut self, expr: Expr) -> Result<Expr> {
 
 ### parse_grouping_or_tuple()
 
+> **替换** task 12 在 `expression.rs:516-544` 的最小实现。增加生成器表达式检测与 `skip_newlines` 支持。
+
 ```rust
 fn parse_grouping_or_tuple(&mut self) -> Result<Expr> {
     self.advance(); // consume '('
+    self.skip_newlines();
 
     if self.check(&TokenKind::RightParen) {
         self.advance();
@@ -297,13 +318,21 @@ fn parse_grouping_or_tuple(&mut self) -> Result<Expr> {
     }
 
     let first = self.parse_expression()?;
+    self.skip_newlines();
+
+    // 生成器表达式：(expr for x in iter ...）
+    if self.check(&TokenKind::For) {
+        return self.parse_generator_expression(first);
+    }
 
     if self.check(&TokenKind::Comma) {
         // Tuple: (expr, expr, ...)
         let mut elements = vec![first];
         while self.match_token(&[TokenKind::Comma]) {
+            self.skip_newlines();
             if self.check(&TokenKind::RightParen) { break; } // trailing comma
             elements.push(self.parse_expression()?);
+            self.skip_newlines();
         }
         self.expect(TokenKind::RightParen, "expected ')'")?;
         return Ok(Expr::TupleLiteral { elements });
@@ -312,6 +341,35 @@ fn parse_grouping_or_tuple(&mut self) -> Result<Expr> {
     // Grouping: (expr)
     self.expect(TokenKind::RightParen, "expected ')'")?;
     Ok(Expr::Grouping { expr: Box::new(first) })
+}
+```
+
+### parse_generator_expression()
+
+```rust
+fn parse_generator_expression(&mut self, expr: Expr) -> Result<Expr> {
+    let mut for_clauses = Vec::new();
+
+    while self.match_token(&[TokenKind::For]) {
+        let targets = self.parse_for_targets()?;
+        self.expect(TokenKind::In, "expected 'in'")?;
+        let iterable = Box::new(self.parse_or()?);
+        for_clauses.push(ForClause { targets, iterable });
+    }
+
+    let condition = if self.match_token(&[TokenKind::If]) {
+        Some(Box::new(self.parse_or()?))
+    } else {
+        None
+    };
+
+    self.skip_newlines();
+    self.expect(TokenKind::RightParen, "expected ')'")?;
+    Ok(Expr::GeneratorExpression {
+        expr: Box::new(expr),
+        for_clauses,
+        condition,
+    })
 }
 ```
 
@@ -326,18 +384,6 @@ fn parse_fn_literal(&mut self) -> Result<Expr> {
     let body = self.parse_block()?;
 
     Ok(Expr::FnLiteral { params, body })
-}
-```
-
-### is_fn_literal()
-
-判断 `fn` 后面跟的是 `(`（匿名函数）还是标识符（函数声明）：
-
-```rust
-fn is_fn_literal(&self) -> bool {
-    if !self.check(&TokenKind::Fn) { return false; }
-    let next = self.tokens.get(self.current + 1);
-    matches!(next.map(|t| &t.kind), Some(TokenKind::LeftParen))
 }
 ```
 
@@ -505,6 +551,72 @@ mod tests {
         match expr {
             Expr::TupleLiteral { elements } => assert!(elements.is_empty()),
             _ => panic!("expected empty tuple"),
+        }
+    }
+
+    #[test]
+    fn test_dict_comprehension() {
+        let expr = parse_expr("{k: v for k in keys if k > 0}").unwrap();
+        match expr {
+            Expr::DictComprehension { for_clauses, condition, .. } => {
+                assert_eq!(for_clauses.len(), 1);
+                assert!(condition.is_some());
+            }
+            _ => panic!("expected dict comprehension"),
+        }
+    }
+
+    #[test]
+    fn test_set_comprehension() {
+        let expr = parse_expr("{x * x for x in nums if x > 2}").unwrap();
+        match expr {
+            Expr::SetComprehension { for_clauses, condition, .. } => {
+                assert_eq!(for_clauses.len(), 1);
+                assert!(condition.is_some());
+            }
+            _ => panic!("expected set comprehension"),
+        }
+    }
+
+    #[test]
+    fn test_generator_expression() {
+        let expr = parse_expr("(x * x for x in range(10))").unwrap();
+        match expr {
+            Expr::GeneratorExpression { for_clauses, .. } => {
+                assert_eq!(for_clauses.len(), 1);
+                assert_eq!(for_clauses[0].targets, vec!["x".to_string()]);
+            }
+            _ => panic!("expected generator expression"),
+        }
+    }
+
+    #[test]
+    fn test_generator_expression_with_filter() {
+        let expr = parse_expr("(x for x in items if x > 0)").unwrap();
+        match expr {
+            Expr::GeneratorExpression { condition, .. } => {
+                assert!(condition.is_some());
+            }
+            _ => panic!("expected generator expression with filter"),
+        }
+    }
+
+    #[test]
+    fn test_single_element_set_trailing_comma() {
+        let expr = parse_expr("{1,}").unwrap();
+        match expr {
+            Expr::SetLiteral { elements } => assert_eq!(elements.len(), 1),
+            _ => panic!("expected single-element set"),
+        }
+    }
+
+    #[test]
+    fn test_single_brace_is_grouping() {
+        // {1} 不匹配 set 语法，应解析为分组表达式（03-syntax.md:553）
+        let expr = parse_expr("{1}").unwrap();
+        match expr {
+            Expr::Grouping { .. } => {}
+            _ => panic!("expected grouping, got set or other"),
         }
     }
 }
