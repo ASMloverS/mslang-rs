@@ -59,7 +59,7 @@ impl Parser {
 
     // ---- 优先级 2：三元（右结合）----
 
-    fn parse_ternary(&mut self) -> Result<Expr> {
+    pub(super) fn parse_ternary(&mut self) -> Result<Expr> {
         let expr = self.parse_or()?;
 
         if self.check(&TokenKind::If) {
@@ -545,7 +545,8 @@ impl Parser {
 
     /// 区分 `fn name(` 声明与 `fn(` 字面量：
     /// 当前为 Fn 且下一个 token 为 LeftParen 则为字面量。
-    fn is_fn_literal(&self) -> bool {
+    /// task 13 的 parse_fn_or_expr 复用此方法。
+    pub(super) fn is_fn_literal(&self) -> bool {
         if !self.check(&TokenKind::Fn) {
             return false;
         }

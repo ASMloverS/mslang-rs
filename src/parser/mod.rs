@@ -9,6 +9,8 @@ use crate::lexer::token::{Token, TokenKind};
 
 // 表达式解析（task 12）——为 Parser 追加 parse_expression 及优先级爬升方法。
 mod expression;
+// 语句解析（task 13）——为 Parser 追加声明/赋值/控制流/函数等语句方法。
+mod statement;
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -119,6 +121,10 @@ impl Parser {
             Ok(Stmt::Continue)
         } else if self.check(&TokenKind::Return) {
             self.parse_return()
+        } else if self.check(&TokenKind::Nonlocal) {
+            self.parse_nonlocal()
+        } else if self.check(&TokenKind::Global) {
+            self.parse_global()
         } else if self.check(&TokenKind::Import) {
             self.parse_import()
         } else if self.check(&TokenKind::From) {
@@ -213,42 +219,7 @@ impl Parser {
         }
     }
 
-    // ---- 占位 stubs：由 task 12-15 替换 ----
-
-    // 占位：由 task 13 替换
-    fn parse_var_decl(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_var_decl")
-    }
-
-    // 占位：由 task 13 替换
-    fn parse_const_decl(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_const_decl")
-    }
-
-    // 占位：由 task 14 替换
-    fn parse_fn_or_expr(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_fn_or_expr")
-    }
-
-    // 占位：由 task 13 替换
-    fn parse_if(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_if")
-    }
-
-    // 占位：由 task 13 替换
-    fn parse_while(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_while")
-    }
-
-    // 占位：由 task 13 替换
-    fn parse_for(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_for")
-    }
-
-    // 占位：由 task 13 替换
-    fn parse_return(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_return")
-    }
+    // ---- 占位 stubs：由 task 15 替换 ----
 
     // 占位：由 task 15 替换
     fn parse_import(&mut self) -> Result<Stmt> {
@@ -258,11 +229,6 @@ impl Parser {
     // 占位：由 task 15 替换
     fn parse_from_import(&mut self) -> Result<Stmt> {
         self.unimplemented("parse_from_import")
-    }
-
-    // 占位：由 task 13 替换（裸表达式/赋值）
-    fn parse_expr_or_assignment(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_expr_or_assignment")
     }
 
     // 占位：由 task 15 替换
@@ -332,17 +298,15 @@ mod tests {
         Parser::new(tokens)
     }
 
-    // ---- task 13 回归基线：依赖实际解析，stub 阶段返回错误故暂忽略 ----
+    // ---- task 13 回归基线：task 13 接入实际语句解析后全部通过 ----
 
     #[test]
-    #[ignore = "task 13: requires parse_expr_or_assignment/parse_expression"]
     fn test_simple_program() {
         let prog = parse("x = 10\ny = 20\nprint(x + y)\n").unwrap();
         assert_eq!(prog.statements.len(), 3);
     }
 
     #[test]
-    #[ignore = "task 13: requires parse_if/parse_block with real statement parsing"]
     fn test_block() {
         let prog = parse("if true {\n    x = 1\n}\n").unwrap();
         assert_eq!(prog.statements.len(), 1);
@@ -355,7 +319,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "task 13: requires parse_expr_or_assignment/parse_expression"]
     fn test_newline_handling() {
         let prog = parse("x = 1\n\n\ny = 2\n").unwrap();
         assert_eq!(prog.statements.len(), 2);
