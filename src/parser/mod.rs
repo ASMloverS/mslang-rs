@@ -7,6 +7,9 @@ use crate::ast::{Expr, Program, Stmt};
 use crate::error::{MspError, Result};
 use crate::lexer::token::{Token, TokenKind};
 
+// 表达式解析（task 12）——为 Parser 追加 parse_expression 及优先级爬升方法。
+mod expression;
+
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
@@ -287,11 +290,8 @@ impl Parser {
         self.unimplemented("parse_throw")
     }
 
-    // 占位：由 task 12 替换（被 parse_expr_or_assignment 调用）
-    #[allow(dead_code)]
-    fn parse_expression(&mut self) -> Result<Expr> {
-        self.unimplemented_expr("parse_expression")
-    }
+    // parse_expression 已由 task 12（expression.rs）实现。
+    // parse_expr_or_assignment（task 13）将在语句层调用它。
 
     fn unimplemented(&mut self, name: &str) -> Result<Stmt> {
         let tok = self.peek();
@@ -316,8 +316,8 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::Parser;
-    use crate::ast::{Program, Stmt};
-    use crate::error::{MspError, Result};
+    use crate::ast::{Expr, Program, Stmt};
+    use crate::error::Result;
     use crate::lexer::token::TokenKind;
     use crate::lexer::Lexer;
 
@@ -444,13 +444,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_expression_stub() {
+    fn test_parse_expression_wired() {
+        // task 12：parse_expression 已由 expression.rs 实现，不再是 stub。
+        // 此处仅验证模块接线（mod expression）与基本可达性；优先级/结合性细节
+        // 由 expression::tests 覆盖。
         let mut p = parser_from("x\n");
-        match p.parse_expression() {
-            Err(MspError::ParseError { message, .. }) => {
-                assert!(message.contains("parse_expression not yet implemented"));
-            }
-            _ => panic!("expected ParseError from parse_expression stub"),
-        }
+        let expr = p.parse_expression().unwrap();
+        assert!(matches!(&expr, Expr::Identifier(s) if s == "x"));
     }
 }
