@@ -5,7 +5,7 @@
 //! 分发目标方法（parse_var_decl 等供 parse_statement 调用）声明为 pub(super)；
 //! 内部辅助方法保持私有。is_fn_literal 由 task 12（expression.rs）提供，此处复用。
 
-use crate::ast::{AssignOp, Expr, Param, Stmt};
+use crate::ast::{AssignOp, ExceptClause, Expr, Param, Stmt};
 use crate::error::{MspError, Result};
 use crate::lexer::token::TokenKind;
 
@@ -349,6 +349,252 @@ impl Parser {
             }
         }
     }
+
+    // ---- 高级语句（task 15）----
+
+    pub(super) fn parse_defer(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'defer'
+        let expr = self.parse_expression()?;
+        self.consume_newline();
+        Ok(Stmt::Defer { expr })
+    }
+
+    pub(super) fn parse_try(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'try'
+        let try_block = self.parse_block()?;
+        self.skip_newlines();
+
+        let mut except_clauses = Vec::new();
+        while self.match_token(&[TokenKind::Except]) {
+            let type_name = if self.peek().is_identifier() {
+                match &self.peek().kind {
+                    TokenKind::Identifier(name) => {
+                        let mut path = vec![name.clone()];
+                        self.advance();
+                        while self.match_token(&[TokenKind::Dot]) {
+                            if let TokenKind::Identifier(n) = &self.peek().kind {
+                                path.push(n.clone());
+                                self.advance();
+                            }
+                        }
+                        Some(path)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let alias = if self.match_token(&[TokenKind::As]) {
+                Some(self.expect_identifier("expected variable name after 'as'")?)
+            } else {
+                None
+            };
+
+            let body = self.parse_block()?;
+            self.skip_newlines();
+
+            except_clauses.push(ExceptClause {
+                type_name,
+                alias,
+                body,
+            });
+        }
+
+        let finally_block = if self.match_token(&[TokenKind::Finally]) {
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+
+        Ok(Stmt::Try {
+            try_block,
+            except_clauses,
+            finally_block,
+        })
+    }
+
+    pub(super) fn parse_throw(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'throw'
+
+        // 支持 bare throw（重新抛出当前异常）
+        if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) {
+            self.consume_newline();
+            return Ok(Stmt::Throw { expr: None });
+        }
+
+        let expr = self.parse_expression()?;
+        self.consume_newline();
+        Ok(Stmt::Throw { expr: Some(expr) })
+    }
+
+    pub(super) fn parse_with(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'with'
+        let expression = self.parse_expression()?;
+
+        let alias = if self.match_token(&[TokenKind::As]) {
+            Some(self.expect_identifier("expected variable name after 'as'")?)
+        } else {
+            None
+        };
+
+        let body = self.parse_block()?;
+        Ok(Stmt::With {
+            expression,
+            alias,
+            body,
+        })
+    }
+
+    pub(super) fn parse_class(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'class'
+        let name = self.expect_identifier("expected class name")?;
+
+        let parent = if self.match_token(&[TokenKind::Less]) {
+            Some(self.expect_identifier("expected parent class name")?)
+        } else {
+            None
+        };
+
+        self.expect(TokenKind::LeftBrace, "expected '{' after class name")?;
+        self.skip_newlines();
+
+        let mut methods = Vec::new();
+        let mut class_vars = Vec::new();
+
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            self.skip_newlines();
+            if self.check(&TokenKind::RightBrace) {
+                break;
+            }
+
+            if self.check(&TokenKind::Fn) {
+                methods.push(self.parse_class_method()?);
+            } else {
+                let _is_var = self.match_token(&[TokenKind::Var]);
+                let var_name = self.expect_identifier("expected class variable or method name")?;
+                self.expect(TokenKind::Equal, "expected '=' in class variable")?;
+                let value = self.parse_expression()?;
+                class_vars.push((var_name, value));
+            }
+            self.skip_newlines();
+        }
+
+        self.expect(TokenKind::RightBrace, "expected '}'")?;
+        Ok(Stmt::ClassDecl {
+            name,
+            parent,
+            methods,
+            class_vars,
+        })
+    }
+
+    fn parse_class_method(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'fn'
+        let name = self.expect_identifier("expected method name")?;
+        self.expect(TokenKind::LeftParen, "expected '(' after method name")?;
+        let params = self.parse_param_list()?;
+        self.expect(TokenKind::RightParen, "expected ')'")?;
+        let body = self.parse_block()?;
+        Ok(Stmt::FnDecl {
+            name,
+            params,
+            body,
+            is_async: false,
+        })
+    }
+
+    pub(super) fn parse_async_fn(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'async'
+        let mut fn_decl = self.parse_fn_decl()?;
+        if let Stmt::FnDecl { is_async, .. } = &mut fn_decl {
+            *is_async = true;
+        }
+        Ok(fn_decl)
+    }
+
+    pub(super) fn parse_import(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'import'
+        let is_stdlib = self.match_token(&[TokenKind::At]);
+        if is_stdlib {
+            let std_tok = self.peek();
+            match &std_tok.kind {
+                TokenKind::Identifier(name) if name == "std" => {
+                    self.advance();
+                }
+                _ => {
+                    return Err(MspError::ParseError {
+                        line: std_tok.span.start.line,
+                        column: std_tok.span.start.column,
+                        message: "expected 'std' after '@' in import".into(),
+                    });
+                }
+            }
+        }
+        let module_path = self.parse_module_path()?;
+        let alias = if self.match_token(&[TokenKind::As]) {
+            Some(self.expect_identifier("expected alias name")?)
+        } else {
+            None
+        };
+        self.consume_newline();
+        Ok(Stmt::Import {
+            module_path,
+            alias,
+            is_stdlib,
+        })
+    }
+
+    pub(super) fn parse_from_import(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'from'
+        let is_stdlib = self.match_token(&[TokenKind::At]);
+        if is_stdlib {
+            let std_tok = self.peek();
+            match &std_tok.kind {
+                TokenKind::Identifier(name) if name == "std" => {
+                    self.advance();
+                }
+                _ => {
+                    return Err(MspError::ParseError {
+                        line: std_tok.span.start.line,
+                        column: std_tok.span.start.column,
+                        message: "expected 'std' after '@' in from-import".into(),
+                    });
+                }
+            }
+        }
+        let module_path = self.parse_module_path()?;
+        self.expect(TokenKind::Import, "expected 'import' after module path")?;
+
+        let mut targets = Vec::new();
+        loop {
+            let name = self.expect_identifier("expected import name")?;
+            let alias = if self.match_token(&[TokenKind::As]) {
+                Some(self.expect_identifier("expected alias name")?)
+            } else {
+                None
+            };
+            targets.push((name, alias));
+            if !self.match_token(&[TokenKind::Comma]) {
+                break;
+            }
+        }
+
+        self.consume_newline();
+        Ok(Stmt::FromImport {
+            module_path,
+            targets,
+            is_stdlib,
+        })
+    }
+
+    fn parse_module_path(&mut self) -> Result<Vec<String>> {
+        let mut path = vec![self.expect_identifier("expected module name")?];
+        while self.match_token(&[TokenKind::Dot]) {
+            path.push(self.expect_identifier("expected module name after '.'")?);
+        }
+        Ok(path)
+    }
 }
 
 #[cfg(test)]
@@ -574,5 +820,191 @@ mod tests {
         assert!(matches!(&prog.statements[0], Stmt::ConstDecl { name, .. } if name == "PI"));
         assert!(matches!(&prog.statements[2], Stmt::VarDecl { name, .. } if name == "area"));
         assert!(matches!(&prog.statements[4], Stmt::ForIn { body, .. } if body.len() == 2));
+    }
+
+    // ---- task 15：高级语句 ----
+
+    #[test]
+    fn test_class_basic() {
+        let prog = parse("class Animal {\n    kingdom = \"Animalia\"\n    fn speak(self) {\n        return self.name\n    }\n}\n").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        match &prog.statements[0] {
+            Stmt::ClassDecl { name, parent, methods, class_vars } => {
+                assert_eq!(name, "Animal");
+                assert!(parent.is_none());
+                assert_eq!(methods.len(), 1);
+                assert_eq!(class_vars.len(), 1);
+            }
+            _ => panic!("expected class"),
+        }
+    }
+
+    #[test]
+    fn test_class_inheritance() {
+        let prog = parse("class Dog < Animal {\n    fn speak(self) {\n        return \"bark\"\n    }\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::ClassDecl { name, parent, methods, .. } => {
+                assert_eq!(name, "Dog");
+                assert_eq!(parent.as_deref(), Some("Animal"));
+                assert_eq!(methods.len(), 1);
+            }
+            _ => panic!("expected class"),
+        }
+    }
+
+    #[test]
+    fn test_defer() {
+        let prog = parse("fn f() {\n    defer print(\"done\")\n    x = 1\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(body[0], Stmt::Defer { .. }));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_try_except_finally() {
+        let prog = parse("try {\n    x()\n} except ValueError as e {\n    print(e)\n} finally {\n    cleanup()\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Try { try_block, except_clauses, finally_block } => {
+                assert_eq!(try_block.len(), 1);
+                assert_eq!(except_clauses.len(), 1);
+                assert_eq!(except_clauses[0].type_name.as_ref().unwrap(), &vec!["ValueError".to_string()]);
+                assert_eq!(except_clauses[0].alias.as_deref(), Some("e"));
+                assert!(finally_block.is_some());
+            }
+            _ => panic!("expected try"),
+        }
+    }
+
+    #[test]
+    fn test_try_catch_all() {
+        let prog = parse("try {\n    x()\n} except {\n    print(\"error\")\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Try { except_clauses, .. } => {
+                assert_eq!(except_clauses.len(), 1);
+                assert!(except_clauses[0].type_name.is_none());
+                assert!(except_clauses[0].alias.is_none());
+            }
+            _ => panic!("expected try"),
+        }
+    }
+
+    #[test]
+    fn test_throw() {
+        let prog = parse("throw ValueError(\"bad\")\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Throw { .. } => {}
+            _ => panic!("expected throw"),
+        }
+    }
+
+    #[test]
+    fn test_with() {
+        let prog = parse("with open(\"file.txt\") as f {\n    f.read()\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::With { expression: _, alias, body } => {
+                assert!(alias.as_deref() == Some("f"));
+                assert_eq!(body.len(), 1);
+            }
+            _ => panic!("expected with"),
+        }
+    }
+
+    #[test]
+    fn test_with_no_alias() {
+        let prog = parse("with lock.acquire() {\n    work()\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::With { alias, .. } => {
+                assert!(alias.is_none());
+            }
+            _ => panic!("expected with"),
+        }
+    }
+
+    #[test]
+    fn test_yield() {
+        let prog = parse("fn gen() {\n    yield 1\n    yield 2\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert_eq!(body.len(), 2);
+                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::Yield { value: Some(_) } }));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_yield_from() {
+        let prog = parse("fn gen() {\n    yield from items\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::YieldFrom { .. } }));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_bare_yield() {
+        let prog = parse("fn gen() {\n    yield\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::Yield { value: None } }));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_async_fn() {
+        let prog = parse("async fn fetch(url) {\n    return url\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { name, is_async, .. } => {
+                assert_eq!(name, "fetch");
+                assert!(*is_async);
+            }
+            _ => panic!("expected async fn"),
+        }
+    }
+
+    #[test]
+    fn test_go_expr() {
+        let prog = parse("go worker()\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::ExprStmt { expr: Expr::Go { .. } } => {}
+            _ => panic!("expected go expression"),
+        }
+    }
+
+    #[test]
+    fn test_class_var_with_var_keyword() {
+        let prog = parse("class C {\n    var count = 0\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::ClassDecl { class_vars, .. } => {
+                assert_eq!(class_vars.len(), 1);
+                assert_eq!(class_vars[0].0, "count");
+            }
+            _ => panic!("expected class"),
+        }
+    }
+
+    #[test]
+    fn test_import() {
+        let prog = parse("import math\nimport os.path as pathutil\n").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+    }
+
+    #[test]
+    fn test_from_import() {
+        let prog = parse("from os import path\nfrom io import open, print as log\n").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[1] {
+            Stmt::FromImport { targets, .. } => {
+                assert_eq!(targets.len(), 2);
+            }
+            _ => panic!("expected from import"),
+        }
     }
 }

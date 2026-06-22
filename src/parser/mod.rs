@@ -103,6 +103,8 @@ impl Parser {
             self.parse_var_decl()
         } else if self.check(&TokenKind::Const) {
             self.parse_const_decl()
+        } else if self.check(&TokenKind::Async) {
+            self.parse_async_fn()
         } else if self.check(&TokenKind::Fn) {
             self.parse_fn_or_expr()
         } else if self.check(&TokenKind::If) {
@@ -219,54 +221,8 @@ impl Parser {
         }
     }
 
-    // ---- 占位 stubs：由 task 15 替换 ----
-
-    // 占位：由 task 15 替换
-    fn parse_import(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_import")
-    }
-
-    // 占位：由 task 15 替换
-    fn parse_from_import(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_from_import")
-    }
-
-    // 占位：由 task 15 替换
-    fn parse_class(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_class")
-    }
-
-    // 占位：由 task 15 替换
-    fn parse_defer(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_defer")
-    }
-
-    // 占位：由 task 15 替换
-    fn parse_try(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_try")
-    }
-
-    // 占位：由 task 15 替换
-    fn parse_with(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_with")
-    }
-
-    // 占位：由 task 15 替换
-    fn parse_throw(&mut self) -> Result<Stmt> {
-        self.unimplemented("parse_throw")
-    }
-
     // parse_expression 已由 task 12（expression.rs）实现。
     // parse_expr_or_assignment（task 13）将在语句层调用它。
-
-    fn unimplemented(&mut self, name: &str) -> Result<Stmt> {
-        let tok = self.peek();
-        Err(MspError::ParseError {
-            line: tok.span.start.line,
-            column: tok.span.start.column,
-            message: format!("{} not yet implemented", name),
-        })
-    }
 
     #[allow(dead_code)]
     fn unimplemented_expr(&mut self, name: &str) -> Result<Expr> {

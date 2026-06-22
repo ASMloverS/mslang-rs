@@ -474,10 +474,8 @@ impl Parser {
             }
             TokenKind::Go => {
                 self.advance();
-                let expr = self.parse_unary()?;
-                Ok(Expr::Go {
-                    expr: Box::new(expr),
-                })
+                let expr = self.parse_postfix()?;
+                Ok(Expr::Go { expr: Box::new(expr) })
             }
             _ => {
                 let tok = self.peek();
@@ -817,7 +815,29 @@ impl Parser {
     // ---- 以下初等表达式由后续 task 实现，当前为占位 ----
 
     fn parse_yield_expr(&mut self) -> Result<Expr> {
-        self.unimplemented_expr("parse_yield_expr")
+        self.advance(); // consume 'yield'
+
+        // yield from expr — From 是关键字，始终为委托语义
+        if self.match_token(&[TokenKind::From]) {
+            let iterable = self.parse_expression()?;
+            return Ok(Expr::YieldFrom {
+                iterable: Box::new(iterable),
+            });
+        }
+
+        // bare yield
+        if self.check(&TokenKind::Newline)
+            || self.check(&TokenKind::RightBrace)
+            || self.is_at_end()
+        {
+            return Ok(Expr::Yield { value: None });
+        }
+
+        // yield expr
+        let value = self.parse_expression()?;
+        Ok(Expr::Yield {
+            value: Some(Box::new(value)),
+        })
     }
 
     fn parse_slice(&mut self, _object: Expr) -> Result<Expr> {

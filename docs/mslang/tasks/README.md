@@ -20,7 +20,7 @@
 | 12 | [表达式解析（优先级爬升）](12-parser-expressions.md) | ✅ |
 | 13 | [语句解析](13-parser-statements.md) | ✅ |
 | 14 | [集合字面量与匿名函数解析](14-parser-collection-literals.md) | ✅ |
-| 15 | [高级语句解析（defer/try/with/class/import）](15-parser-advanced-statements.md) | ⬜ |
+| 15 | [高级语句解析（defer/try/with/class/import）](15-parser-advanced-statements.md) | ✅ |
 
 ## Phase 2 — 字节码编译 + VM 核心
 
