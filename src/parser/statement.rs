@@ -244,7 +244,7 @@ impl Parser {
         })
     }
 
-    fn parse_param_list(&mut self) -> Result<Vec<Param>> {
+    pub(super) fn parse_param_list(&mut self) -> Result<Vec<Param>> {
         let mut params = Vec::new();
         if self.check(&TokenKind::RightParen) {
             return Ok(params);
@@ -331,7 +331,7 @@ impl Parser {
 
     // ---- 辅助 ----
 
-    fn expect_identifier(&mut self, msg: &str) -> Result<String> {
+    pub(super) fn expect_identifier(&mut self, msg: &str) -> Result<String> {
         let kind = self.peek().kind.clone();
         match &kind {
             TokenKind::Identifier(name) => {
