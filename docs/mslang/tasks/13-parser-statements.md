@@ -7,7 +7,9 @@ Phase 1.5c - 基础设施
 11-parser-core
 
 ## 目标
-实现核心语句的解析：变量声明、常量声明、赋值、控制流、函数声明、import 语句。
+实现核心语句的解析：变量声明、常量声明、赋值（含多目标赋值）、控制流、函数声明、nonlocal/global 声明。
+
+> **范围说明**：`import` / `from...import` 语句归属于 task 15（高级语句解析），见 `tasks/README.md:23`。task 13 不实现 import 解析。
 
 ## 设计规格
 
@@ -32,15 +34,26 @@ const_stmt = "const" IDENTIFIER "=" expression
 ### 赋值语句
 
 ```
-assign_stmt = target ("=" | "+=" | ...) expression
-target = IDENTIFIER | target "." IDENTIFIER | target "[" expression "]"
+assign_stmt = target ("=" | "+=" | "-=" | "*=" | "/=" | "//=" | "%=" | "**=" |
+              "&=" | "|=" | "^=" | "<<=" | ">>=") expression
+
+target = IDENTIFIER
+       | target "." IDENTIFIER          // 属性赋值
+       | target "[" expression "]"      // 下标赋值
 ```
+
+赋值 target 必须是合法 lvalue（标识符、属性访问、下标访问）。其他表达式形式（如 `1 + 2 = 3`）解析期拒绝。
 
 ### 多目标赋值
 
 ```
 multi_assign = target_list "=" expression_list
+target_list = target ("," target)*
 ```
+
+右侧表达式先全部求值，构造元组，再按位置解包到左侧各目标。解包数量必须匹配（`03-syntax.md:140`）。
+
+在 AST 中表示为 `Stmt::Assign`，target 与 value 均为 `Expr::TupleLiteral`。
 
 ### 条件语句
 
@@ -68,14 +81,6 @@ return_stmt   = "return" expression_list?
 
 ```
 fn_def = "fn" IDENTIFIER "(" param_list? ")" block
-```
-
-### import 语句
-
-```
-import_stmt = "import" module_path ("as" IDENTIFIER)?
-            | "from" module_path "import" import_list
-module_path = IDENTIFIER ("." IDENTIFIER)*
 ```
 
 ## 实现细节
@@ -118,6 +123,15 @@ fn parse_const_decl(&mut self) -> Result<Stmt> {
 fn parse_expr_or_assignment(&mut self) -> Result<Stmt> {
     let expr = self.parse_expression()?;
 
+    // 多目标赋值：a, b = 1, 2  （03-syntax.md:140-151）
+    // 首个表达式后跟逗号即进入多目标路径。
+    // 注意：parse_expression 不消费逗号（逗号不是二元运算符），
+    // 因此 expr 是第一个 target，逗号仍在流中。
+    if self.check(&TokenKind::Comma) {
+        return self.parse_multi_assign(expr);
+    }
+
+    // 短声明：IDENTIFIER := expression
     if self.check(&TokenKind::ColonEqual) {
         self.advance();
         let value = self.parse_expression()?;
@@ -132,7 +146,18 @@ fn parse_expr_or_assignment(&mut self) -> Result<Stmt> {
         });
     }
 
+    // 赋值表达式（含复合赋值）：由 parse_assignment 产出 Expr::Assign
     if let Expr::Assign { target, op, value } = expr {
+        // lvalue 校验：target 必须是标识符、属性访问或下标访问
+        // （03-syntax.md:128-131）
+        if !Self::is_valid_lvalue(&target) {
+            let tok = self.previous();
+            return Err(MspError::ParseError {
+                line: tok.span.start.line,
+                column: tok.span.start.column,
+                message: "invalid assignment target".into(),
+            });
+        }
         self.consume_newline();
         if op == AssignOp::Assign {
             if let Expr::Identifier(name) = *target {
@@ -149,9 +174,53 @@ fn parse_expr_or_assignment(&mut self) -> Result<Stmt> {
     self.consume_newline();
     Ok(Stmt::ExprStmt { expr })
 }
+
+/// 多目标赋值解析：expr 为已解析的第一个 target。
+fn parse_multi_assign(&mut self, first_target: Expr) -> Result<Stmt> {
+    let mut targets = vec![first_target];
+    while self.match_token(&[TokenKind::Comma]) {
+        targets.push(self.parse_expression()?);
+    }
+    self.expect(TokenKind::Equal, "expected '=' in multi-assignment")?;
+
+    let mut values = vec![self.parse_expression()?];
+    while self.match_token(&[TokenKind::Comma]) {
+        values.push(self.parse_expression()?);
+    }
+    self.consume_newline();
+
+    // 校验所有 target 均为合法 lvalue
+    for t in &targets {
+        if !Self::is_valid_lvalue(t) {
+            let tok = self.previous();
+            return Err(MspError::ParseError {
+                line: tok.span.start.line,
+                column: tok.span.start.column,
+                message: "invalid assignment target in multi-assignment".into(),
+            });
+        }
+    }
+
+    Ok(Stmt::Assign {
+        target: Expr::TupleLiteral { elements: targets },
+        op: AssignOp::Assign,
+        value: Expr::TupleLiteral { elements: values },
+    })
+}
+
+/// 判断表达式是否为合法赋值目标（03-syntax.md:128-131）。
+fn is_valid_lvalue(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Identifier(_) | Expr::Dot { .. } | Expr::Index { .. }
+    )
+}
 ```
 
-注意：需要区分 `Expr::Assign` 和 `Stmt::Assign`。在 `parse_expression()` 中赋值表达式已经被构建为 `Expr::Assign`，这里需要将其转换为对应的 `Stmt`。
+注意：
+- 需要区分 `Expr::Assign` 和 `Stmt::Assign`。在 `parse_expression()` 中赋值表达式已经被构建为 `Expr::Assign`，这里需要将其转换为对应的 `Stmt`。
+- 多目标赋值 `a, b = 1, 2` 在 AST 中表示为 `Stmt::Assign`，target 与 value 均为 `Expr::TupleLiteral`。编译期需校验两侧元素数量匹配（`03-syntax.md:140`，抛出 `ValueError`）。
+- 裸 `=` 赋值（`x = 5`）当前归一化为 `Stmt::VarDecl`，与显式 `var x = 5` 同构。两者语义差异（`var`/`:=` 强制新建绑定 vs `=` 先查再建，见 `03-syntax.md:59-60`）需在编译期通过作用域查找顺序处理。
 
 ### parse_if()
 
@@ -257,6 +326,8 @@ fn parse_fn_decl(&mut self) -> Result<Stmt> {
 }
 ```
 
+> **async fn 推迟**：`is_async` 当前硬编码为 `false`。`async fn name() { }` 声明的解析推迟至 Phase 7（并发，task 53-55）。届时需在 `parse_statement` 增加 `TokenKind::Async` 分支：消费 `async` 后调用 `parse_fn_decl`，并将结果 `is_async` 置为 `true`。
+
 ### parse_param_list()
 
 ```rust
@@ -317,77 +388,9 @@ fn parse_param_name(&mut self) -> Result<String> {
 }
 ```
 
-### parse_import()
+### parse_import() / parse_from_import()
 
-```rust
-fn parse_import(&mut self) -> Result<Stmt> {
-    self.advance(); // consume 'import'
-    let is_stdlib = self.match_token(&[TokenKind::At]);
-    let module_path = self.parse_module_path()?;
-    let alias = if self.match_token(&[TokenKind::As]) {
-        Some(self.expect_identifier("expected alias name")?)
-    } else {
-        None
-    };
-    self.consume_newline();
-    Ok(Stmt::Import { module_path, alias, is_stdlib })
-}
-```
-
-### parse_from_import()
-
-```rust
-fn parse_from_import(&mut self) -> Result<Stmt> {
-    self.advance(); // consume 'from'
-    let is_stdlib = self.match_token(&[TokenKind::At]);
-    if is_stdlib {
-        let std_tok = self.peek();
-        match &std_tok.kind {
-            TokenKind::Identifier(name) if name == "std" => {
-                self.advance();
-            }
-            _ => {
-                return Err(MspError::ParseError {
-                    line: std_tok.span.start.line,
-                    column: std_tok.span.start.column,
-                    message: "expected 'std' after '@' in from-import".into(),
-                });
-            }
-        }
-    }
-    let module_path = self.parse_module_path()?;
-    self.expect(TokenKind::Import, "expected 'import' after module path")?;
-
-    let mut targets = Vec::new();
-    loop {
-        let name = self.expect_identifier("expected import name")?;
-        let alias = if self.match_token(&[TokenKind::As]) {
-            Some(self.expect_identifier("expected alias name")?)
-        } else {
-            None
-        };
-        targets.push((name, alias));
-        if !self.match_token(&[TokenKind::Comma]) {
-            break;
-        }
-    }
-
-    self.consume_newline();
-    Ok(Stmt::FromImport { module_path, targets, is_stdlib })
-}
-```
-
-### parse_module_path()
-
-```rust
-fn parse_module_path(&mut self) -> Result<Vec<String>> {
-    let mut path = vec![self.expect_identifier("expected module name")?];
-    while self.match_token(&[TokenKind::Dot]) {
-        path.push(self.expect_identifier("expected module name after '.'")?);
-    }
-    Ok(path)
-}
-```
+> **归属 task 15**，task 13 不实现。参见 `tasks/README.md:23`。
 
 ### 辅助方法
 
@@ -411,7 +414,13 @@ fn expect_identifier(&mut self, msg: &str) -> Result<String> {
 
 ### parse_fn_or_expr()
 
-区分 `fn name(...)` 函数声明和 `fn(...)` 匿名函数：
+区分 `fn name(...)` 函数声明和 `fn(...)` 匿名函数。
+
+> **Task 边界说明**：task 13 拥有 `parse_fn_or_expr`（语句分发）与 `parse_fn_decl`（命名函数声明）。
+> task 14 仅拥有 `parse_fn_literal`（匿名函数表达式，当前为 expression.rs stub）。
+> 实施时需将 `src/parser/mod.rs` 中 `parse_fn_or_expr` stub 注释从"由 task 14 替换"改为"由 task 13 替换"。
+>
+> `is_fn_literal` 已由 task 12 在 `src/parser/expression.rs:548` 实现，task 13 直接复用，不可重复定义。
 
 ```rust
 fn parse_fn_or_expr(&mut self) -> Result<Stmt> {
@@ -422,12 +431,6 @@ fn parse_fn_or_expr(&mut self) -> Result<Stmt> {
     } else {
         self.parse_fn_decl()
     }
-}
-
-fn is_fn_literal(&self) -> bool {
-    if !self.check(&TokenKind::Fn) { return false; }
-    let next = self.tokens.get(self.current + 1);
-    matches!(next.map(|t| &t.kind), Some(TokenKind::LeftParen))
 }
 ```
 
@@ -471,14 +474,17 @@ fn parse_global(&mut self) -> Result<Stmt> {
 
 1. `var`, `:=`, `=` 三种声明方式正确解析
 2. `const` 声明正确解析
-3. 复合赋值运算符正确解析
+3. 复合赋值运算符正确解析（`+=` `-=` `*=` 等）
 4. `if/elif/else` 正确解析多个分支
 5. `while` 和 `for..in`（单变量和双变量）正确解析
 6. `break`, `continue`, `return` 正确解析
 7. 函数声明（含默认参数和可变参数）正确解析
-8. `import` 和 `from...import` 正确解析
-9. `nonlocal` 声明正确解析（含多个变量名）
-10. `global` 声明正确解析（含多个变量名）
+8. 多目标赋值正确解析（`a, b = 1, 2`，AST 表示为 TupleLiteral 赋值）
+9. 非法赋值目标被拒绝（`1 + 2 = 3` 返回 ParseError）
+10. `nonlocal` 声明正确解析（含多个变量名）
+11. `global` 声明正确解析（含多个变量名）
+
+> **注**：`import` / `from...import` 解析归属于 task 15，不在本 task 验证范围内。
 
 ## 测试用例
 
@@ -564,7 +570,7 @@ mod tests {
     fn test_fn_decl() {
         let prog = parse("fn add(a, b) {\n    return a + b\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::FnDecl { name, params, body } => {
+            Stmt::FnDecl { name, params, body, .. } => {
                 assert_eq!(name, "add");
                 assert_eq!(params.len(), 2);
                 assert_eq!(body.len(), 1);
@@ -582,24 +588,6 @@ mod tests {
                 assert!(params[1].default.is_some());
             }
             _ => panic!("expected fn"),
-        }
-    }
-
-    #[test]
-    fn test_import() {
-        let prog = parse("import math\nimport os.path as pathutil\n").unwrap();
-        assert_eq!(prog.statements.len(), 2);
-    }
-
-    #[test]
-    fn test_from_import() {
-        let prog = parse("from os import path\nfrom io import open, print as log\n").unwrap();
-        assert_eq!(prog.statements.len(), 2);
-        match &prog.statements[1] {
-            Stmt::FromImport { targets, .. } => {
-                assert_eq!(targets.len(), 2);
-            }
-            _ => panic!("expected from import"),
         }
     }
 
@@ -623,6 +611,57 @@ mod tests {
                     Stmt::Return { values } => assert_eq!(values.len(), 3),
                     _ => panic!("expected return"),
                 }
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_compound_assign() {
+        let prog = parse("x += 5\ny *= 3\n").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+        assert!(matches!(
+            &prog.statements[0],
+            Stmt::Assign { op: AssignOp::PlusAssign, .. }
+        ));
+    }
+
+    #[test]
+    fn test_multi_assign() {
+        let prog = parse("a, b = 1, 2\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Assign { target, op: AssignOp::Assign, value } => {
+                assert!(matches!(target, Expr::TupleLiteral { elements } if elements.len() == 2));
+                assert!(matches!(value, Expr::TupleLiteral { elements } if elements.len() == 2));
+            }
+            _ => panic!("expected multi-assign"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_lvalue() {
+        // 1 + 2 = 3 不是合法赋值，应在解析期拒绝
+        let result = parse("1 + 2 = 3\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nonlocal() {
+        let prog = parse("fn f() {\n    nonlocal x, y\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(&body[0], Stmt::Nonlocal { names } if names.len() == 2));
+            }
+            _ => panic!("expected fn"),
+        }
+    }
+
+    #[test]
+    fn test_global() {
+        let prog = parse("fn f() {\n    global counter\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(&body[0], Stmt::Global { names } if names.len() == 1));
             }
             _ => panic!("expected fn"),
         }
