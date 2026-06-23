@@ -5,6 +5,7 @@ Phase 2.2b - 字节码编译 + VM 核心
 
 ## 前置任务
 - 17-compiler-core
+- 20-object-system-basic
 
 ## 目标
 
@@ -39,15 +40,14 @@ Phase 2.2b - 字节码编译 + VM 核心
 ### 编译字面量
 
 ```rust
-fn compile_literal(&mut self, expr: &Expr, line: usize) -> Result<(), String> {
-    match expr {
-        Expr::Int(n) => self.emit_constant(Object::Int(*n), line),
-        Expr::Float(f) => self.emit_constant(Object::Float(*f), line),
-        Expr::String(s) => self.emit_constant(alloc_string(s), line),
-        Expr::Bool(true) => self.emit_byte(OpCode::True as u8, line),
-        Expr::Bool(false) => self.emit_byte(OpCode::False as u8, line),
-        Expr::Nil => self.emit_byte(OpCode::Nil as u8, line),
-        _ => return Err("Not a literal".to_string()),
+fn compile_literal(&mut self, lit: &Literal, line: usize) -> Result<(), String> {
+    match lit {
+        Literal::Int(n) => self.emit_constant(Object::Int(*n), line),
+        Literal::Float(f) => self.emit_constant(Object::Float(*f), line),
+        Literal::String(s) => self.emit_constant(alloc_string(s), line),
+        Literal::Bool(true) => self.emit_byte(OpCode::True as u8, line),
+        Literal::Bool(false) => self.emit_byte(OpCode::False as u8, line),
+        Literal::Nil => self.emit_byte(OpCode::Nil as u8, line),
     }
     Ok(())
 }
@@ -76,8 +76,8 @@ fn compile_identifier(&mut self, name: &str, line: usize) -> Result<(), String> 
 
 ```rust
 fn compile_binary(&mut self, left: &Expr, op: &BinaryOp, right: &Expr, line: usize) -> Result<(), String> {
-    self.compile_expression(left)?;
-    self.compile_expression(right)?;
+    self.compile_expression(left, line)?;
+    self.compile_expression(right, line)?;
     let opcode = match op {
         BinaryOp::Add => OpCode::Add,
         BinaryOp::Subtract => OpCode::Subtract,
@@ -110,11 +110,12 @@ fn compile_binary(&mut self, left: &Expr, op: &BinaryOp, right: &Expr, line: usi
 
 ```rust
 fn compile_unary(&mut self, op: &UnaryOp, operand: &Expr, line: usize) -> Result<(), String> {
-    self.compile_expression(operand)?;
+    self.compile_expression(operand, line)?;
     let opcode = match op {
         UnaryOp::Negate => OpCode::Negate,
         UnaryOp::Not => OpCode::Not,
         UnaryOp::BitNot => OpCode::BitNot,
+        UnaryOp::ChannelReceive => OpCode::Receive,
     };
     self.emit_byte(opcode as u8, line);
     Ok(())
@@ -128,11 +129,26 @@ fn compile_unary(&mut self, op: &UnaryOp, operand: &Expr, line: usize) -> Result
 编译策略：对每个中间操作数生成额外加载，避免依赖 Swap 指令。
 
 ```rust
+/// 将 BinaryOp 比较运算符映射到 OpCode。
+fn comparison_opcode(&self, op: &BinaryOp) -> OpCode {
+    match op {
+        BinaryOp::Equal => OpCode::Equal,
+        BinaryOp::NotEqual => OpCode::NotEqual,
+        BinaryOp::Less => OpCode::Less,
+        BinaryOp::Greater => OpCode::Greater,
+        BinaryOp::LessEqual => OpCode::LessEqual,
+        BinaryOp::GreaterEqual => OpCode::GreaterEqual,
+        _ => unreachable!("non-comparison op in chain"),
+    }
+}
+
+/// 编译链式比较：`1 < x < 10` 等价于 `(1 < x) and (x < 10)`。
+/// comparisons 为 (op, right_expr) 对列表。
 fn compile_comparison(&mut self, first: &Expr, comparisons: &[(BinaryOp, Expr)], line: usize) -> Result<(), String> {
-    self.compile_expression(first)?;
+    self.compile_expression(first, line)?;
     if comparisons.len() == 1 {
         let (op, right) = &comparisons[0];
-        self.compile_expression(right)?;
+        self.compile_expression(right, line)?;
         self.emit_byte(self.comparison_opcode(op) as u8, line);
         return Ok(());
     }
@@ -142,9 +158,9 @@ fn compile_comparison(&mut self, first: &Expr, comparisons: &[(BinaryOp, Expr)],
     for (i, (op, right)) in comparisons.iter().enumerate() {
         if i > 0 {
             // 重新加载上一个操作数作为本次左操作数
-            self.compile_expression(&comparisons[i - 1].1)?;
+            self.compile_expression(&comparisons[i - 1].1, line)?;
         }
-        self.compile_expression(right)?;
+        self.compile_expression(right, line)?;
         self.emit_byte(self.comparison_opcode(op) as u8, line);
         // 如果比较结果为 false，短路到结束（合并为 and）
         let jump = self.emit_jump(OpCode::JumpIfFalse, line);
@@ -153,9 +169,8 @@ fn compile_comparison(&mut self, first: &Expr, comparisons: &[(BinaryOp, Expr)],
     }
     // 所有比较都为 true：压入 true
     self.emit_byte(OpCode::True as u8, line);
-    let end_pos = self.current_offset();
     for jump in &end_jumps {
-        self.patch_jump_at(*jump, end_pos);
+        self.patch_jump(*jump)?;
     }
     Ok(())
 }
@@ -163,34 +178,94 @@ fn compile_comparison(&mut self, first: &Expr, comparisons: &[(BinaryOp, Expr)],
 
 ### 编译赋值表达式
 
+引用 [03-syntax.md](../03-syntax.md) 赋值语句产生式。
+
+赋值是表达式，返回被赋的值。编译时在 STORE 前发射 `DUP` 以保留结果值在栈顶。
+
 ```rust
-fn compile_assignment(&mut self, target: &Expr, value: &Expr, op: &Option<CompoundOp>, line: usize) -> Result<(), String> {
-    self.compile_expression(value)?;
-    if let Some(_compound) = op {
-        // 复合赋值需要先加载当前值再运算
-        // x += 5 => x = x + 5
+fn compile_assignment(&mut self, target: &Expr, op: &AssignOp, value: &Expr, line: usize) -> Result<(), String> {
+    use AssignOp::*;
+    // 判断是否复合赋值（x += y 等）
+    let is_compound = !matches!(op, Assign);
+
+    if is_compound {
+        // 复合赋值：x += 5 => 先加载 x 的当前值，再编译右值，执行运算，最后存储
+        // 1. 加载当前值到栈顶
+        self.compile_load_target(target, line)?;
+        // 2. 编译右值
+        self.compile_expression(value, line)?;
+        // 3. 发射运算 opcode
+        let arith_op = match op {
+            PlusAssign => OpCode::Add,
+            MinusAssign => OpCode::Subtract,
+            StarAssign => OpCode::Multiply,
+            SlashAssign => OpCode::Divide,
+            DoubleSlashAssign => OpCode::FloorDiv,
+            PercentAssign => OpCode::Modulo,
+            DoubleStarAssign => OpCode::Power,
+            BitAndAssign => OpCode::BitAnd,
+            BitOrAssign => OpCode::BitOr,
+            BitXorAssign => OpCode::BitXor,
+            LeftShiftAssign => OpCode::LeftShift,
+            RightShiftAssign => OpCode::RightShift,
+            Assign => unreachable!(),
+        };
+        self.emit_byte(arith_op as u8, line);
+    } else {
+        // 简单赋值：仅编译右值
+        self.compile_expression(value, line)?;
     }
+    // DUP：保留赋值结果值在栈顶（赋值表达式返回被赋的值）
+    self.emit_byte(OpCode::Dup as u8, line);
+    // 存储到目标
+    self.compile_store_target(target, line)?;
+    Ok(())
+}
+
+/// 加载赋值目标的当前值（用于复合赋值的读取）。
+fn compile_load_target(&mut self, target: &Expr, line: usize) -> Result<(), String> {
+    match target {
+        Expr::Identifier(name) => self.compile_identifier(name, line),
+        Expr::Index { object, index } => self.compile_index(object, index, line),
+        Expr::Dot { object, name } => self.compile_dot(object, name, line),
+        _ => Err("Invalid assignment target".to_string()),
+    }
+}
+
+/// 将栈顶值存储到赋值目标。
+fn compile_store_target(&mut self, target: &Expr, line: usize) -> Result<(), String> {
     match target {
         Expr::Identifier(name) => {
             if let Some(slot) = self.resolve_local(name) {
                 self.emit_byte(OpCode::StoreLocal as u8, line);
                 self.emit_byte(slot as u8, line);
+            } else if let Some(idx) = self.resolve_upvalue(name) {
+                self.emit_byte(OpCode::StoreUpvalue as u8, line);
+                self.emit_byte(idx as u8, line);
             } else {
-        let name_idx = self.add_constant(alloc_string(name));
+                let name_idx = self.add_constant(alloc_string(name));
+                let name_idx = u16::try_from(name_idx)
+                    .map_err(|_| "constant pool overflow".to_string())?;
                 self.emit_byte(OpCode::StoreGlobal as u8, line);
-                self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
+                self.emit_bytes(&name_idx.to_be_bytes(), line);
             }
         }
         Expr::Index { object, index } => {
-            self.compile_expression(object)?;
-            self.compile_expression(index)?;
+            // 栈顶布局（DUP 后）：[value]
+            // 需要变为：[object, index, value] → SET_INDEX
+            // 先弹出 value，编译 object/index，再重新压入 value
+            // 简化：编译 object、index，然后从栈布局调整（VM 层面 SET_INDEX 从栈弹出 value, index, object）
+            self.compile_expression(object, line)?;
+            self.compile_expression(index, line)?;
             self.emit_byte(OpCode::SetIndex as u8, line);
         }
         Expr::Dot { object, name } => {
-            self.compile_expression(object)?;
             let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow".to_string())?;
+            self.compile_expression(object, line)?;
             self.emit_byte(OpCode::SetAttr as u8, line);
-            self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
         }
         _ => return Err("Invalid assignment target".to_string()),
     }
@@ -202,13 +277,13 @@ fn compile_assignment(&mut self, target: &Expr, value: &Expr, op: &Option<Compou
 
 ```rust
 fn compile_ternary(&mut self, condition: &Expr, then_expr: &Expr, else_expr: &Expr, line: usize) -> Result<(), String> {
-    self.compile_expression(condition)?;
+    self.compile_expression(condition, line)?;
     let else_jump = self.emit_jump(OpCode::JumpIfFalse, line);
-    self.compile_expression(then_expr)?;
+    self.compile_expression(then_expr, line)?;
     let end_jump = self.emit_jump(OpCode::Jump, line);
-    self.patch_jump(else_jump);
-    self.compile_expression(else_expr)?;
-    self.patch_jump(end_jump);
+    self.patch_jump(else_jump)?;
+    self.compile_expression(else_expr, line)?;
+    self.patch_jump(end_jump)?;
     Ok(())
 }
 ```
@@ -217,27 +292,31 @@ fn compile_ternary(&mut self, condition: &Expr, then_expr: &Expr, else_expr: &Ex
 
 ```rust
 fn compile_call(&mut self, callee: &Expr, args: &[Expr], line: usize) -> Result<(), String> {
-    self.compile_expression(callee)?;
+    self.compile_expression(callee, line)?;
     for arg in args {
-        self.compile_expression(arg)?;
+        self.compile_expression(arg, line)?;
     }
+    let argc = u8::try_from(args.len())
+        .map_err(|_| format!("too many arguments (max 255, got {})", args.len()))?;
     self.emit_byte(OpCode::Call as u8, line);
-    self.emit_byte(args.len() as u8, line);
+    self.emit_byte(argc, line);
     Ok(())
 }
 
 fn compile_index(&mut self, object: &Expr, index: &Expr, line: usize) -> Result<(), String> {
-    self.compile_expression(object)?;
-    self.compile_expression(index)?;
+    self.compile_expression(object, line)?;
+    self.compile_expression(index, line)?;
     self.emit_byte(OpCode::GetIndex as u8, line);
     Ok(())
 }
 
 fn compile_dot(&mut self, object: &Expr, name: &str, line: usize) -> Result<(), String> {
-    self.compile_expression(object)?;
+    self.compile_expression(object, line)?;
     let name_idx = self.add_constant(alloc_string(name));
+    let name_idx = u16::try_from(name_idx)
+        .map_err(|_| "constant pool overflow".to_string())?;
     self.emit_byte(OpCode::GetAttr as u8, line);
-    self.emit_bytes(&(name_idx as u16).to_be_bytes(), line);
+    self.emit_bytes(&name_idx.to_be_bytes(), line);
     Ok(())
 }
 ```
@@ -248,21 +327,175 @@ fn compile_dot(&mut self, object: &Expr, name: &str, line: usize) -> Result<(), 
 
 ```rust
 fn compile_logical_and(&mut self, left: &Expr, right: &Expr, line: usize) -> Result<(), String> {
-    self.compile_expression(left)?;
+    self.compile_expression(left, line)?;
     let end_jump = self.emit_jump(OpCode::JumpIfFalse, line);
     self.emit_byte(OpCode::Pop as u8, line);
-    self.compile_expression(right)?;
-    self.patch_jump(end_jump);
+    self.compile_expression(right, line)?;
+    self.patch_jump(end_jump)?;
     Ok(())
 }
 
 fn compile_logical_or(&mut self, left: &Expr, right: &Expr, line: usize) -> Result<(), String> {
-    self.compile_expression(left)?;
+    self.compile_expression(left, line)?;
     let end_jump = self.emit_jump(OpCode::JumpIfTrue, line);
     self.emit_byte(OpCode::Pop as u8, line);
-    self.compile_expression(right)?;
-    self.patch_jump(end_jump);
+    self.compile_expression(right, line)?;
+    self.patch_jump(end_jump)?;
     Ok(())
+}
+```
+
+### 表达式编译分发器
+
+核心入口方法，根据 `Expr` 变体路由到对应编译方法。未实现的类型返回错误。
+
+```rust
+/// 获取当前字节码偏移量。
+pub fn current_offset(&self) -> usize {
+    self.unit.chunk.code.len()
+}
+
+/// 编译表达式。编译后栈顶留下一个结果值。
+pub fn compile_expression(&mut self, expr: &Expr, line: usize) -> Result<(), String> {
+    match expr {
+        Expr::Literal(lit) => self.compile_literal(lit, line),
+        Expr::Identifier(name) => self.compile_identifier(name, line),
+        Expr::Binary { left, op, right } => {
+            match op {
+                // 逻辑运算符短路求值（不走 compile_binary）
+                BinaryOp::And => {
+                    self.compile_logical_and(left, right, line)
+                }
+                BinaryOp::Or => {
+                    self.compile_logical_or(left, right, line)
+                }
+                _ => self.compile_binary(left, op, right, line),
+            }
+        }
+        Expr::Unary { op, operand } => self.compile_unary(op, operand, line),
+        Expr::Assign { target, op, value } => self.compile_assignment(target, op, value, line),
+        Expr::Ternary { condition, then_expr, else_expr } => {
+            self.compile_ternary(condition, then_expr, else_expr, line)
+        }
+        Expr::Call { callee, args } => self.compile_call(callee, args, line),
+        Expr::Index { object, index } => self.compile_index(object, index, line),
+        Expr::Dot { object, name } => self.compile_dot(object, name, line),
+        Expr::Slice { object, start, stop, step } => {
+            self.compile_slice(object, start.as_deref(), stop.as_deref(), step.as_deref(), line)
+        }
+        Expr::ListLiteral { elements } => self.compile_list_literal(elements, line),
+        Expr::DictLiteral { pairs } => self.compile_dict_literal(pairs, line),
+        Expr::SetLiteral { elements } => self.compile_set_literal(elements, line),
+        Expr::TupleLiteral { elements } => self.compile_tuple_literal(elements, line),
+        Expr::Grouping { expr } => self.compile_expression(expr, line),
+        // 以下类型由后续 task 实现
+        Expr::FnLiteral { .. } => Err("fn literal compilation not yet implemented (task 29)".to_string()),
+        Expr::ListComprehension { .. } | Expr::DictComprehension { .. }
+        | Expr::SetComprehension { .. } | Expr::GeneratorExpression { .. } => {
+            Err("comprehension compilation not yet implemented (task 33/34)".to_string())
+        }
+        Expr::SuperAccess { .. } => Err("super compilation not yet implemented (task 42)".to_string()),
+        Expr::Yield { .. } | Expr::YieldFrom { .. } => {
+            Err("yield compilation not yet implemented (task 39)".to_string())
+        }
+        Expr::Await { .. } => Err("await compilation not yet implemented (task 53)".to_string()),
+        Expr::Go { .. } => Err("go compilation not yet implemented (task 55)".to_string()),
+    }
+}
+```
+
+### 编译切片
+
+引用 [03-syntax.md](../03-syntax.md) 切片语法：`obj[start:stop:step]`。
+
+```rust
+fn compile_slice(
+    &mut self,
+    object: &Expr,
+    start: Option<&Expr>,
+    stop: Option<&Expr>,
+    step: Option<&Expr>,
+    line: usize,
+) -> Result<(), String> {
+    self.compile_expression(object, line)?;
+    // flags 位域：bit 0 = has_start, bit 1 = has_stop, bit 2 = has_step
+    let mut flags: u8 = 0;
+    if let Some(s) = start {
+        flags |= 0b001;
+        self.compile_expression(s, line)?;
+    }
+    if let Some(s) = stop {
+        flags |= 0b010;
+        self.compile_expression(s, line)?;
+    }
+    if let Some(s) = step {
+        flags |= 0b100;
+        self.compile_expression(s, line)?;
+    }
+    self.emit_byte(OpCode::GetSlice as u8, line);
+    self.emit_byte(flags, line);
+    Ok(())
+}
+```
+
+### 编译集合字面量
+
+引用 [11-bytecode-vm.md](../11-bytecode-vm.md) BUILD_LIST/BUILD_DICT/BUILD_TUPLE/BUILD_SET 指令。count 为单字节（0-255），超过需分段构建。
+
+```rust
+fn compile_list_literal(&mut self, elements: &[Expr], line: usize) -> Result<(), String> {
+    for elem in elements {
+        self.compile_expression(elem, line)?;
+    }
+    let count = u8::try_from(elements.len())
+        .map_err(|_| format!("too many list elements (max 255, got {})", elements.len()))?;
+    self.emit_byte(OpCode::BuildList as u8, line);
+    self.emit_byte(count, line);
+    Ok(())
+}
+
+fn compile_dict_literal(&mut self, pairs: &[(Expr, Expr)], line: usize) -> Result<(), String> {
+    for (key, val) in pairs {
+        self.compile_expression(key, line)?;
+        self.compile_expression(val, line)?;
+    }
+    let count = u8::try_from(pairs.len())
+        .map_err(|_| format!("too many dict entries (max 255, got {})", pairs.len()))?;
+    self.emit_byte(OpCode::BuildDict as u8, line);
+    self.emit_byte(count, line);
+    Ok(())
+}
+
+fn compile_set_literal(&mut self, elements: &[Expr], line: usize) -> Result<(), String> {
+    for elem in elements {
+        self.compile_expression(elem, line)?;
+    }
+    let count = u8::try_from(elements.len())
+        .map_err(|_| format!("too many set elements (max 255, got {})", elements.len()))?;
+    self.emit_byte(OpCode::BuildSet as u8, line);
+    self.emit_byte(count, line);
+    Ok(())
+}
+
+fn compile_tuple_literal(&mut self, elements: &[Expr], line: usize) -> Result<(), String> {
+    for elem in elements {
+        self.compile_expression(elem, line)?;
+    }
+    let count = u8::try_from(elements.len())
+        .map_err(|_| format!("too many tuple elements (max 255, got {})", elements.len()))?;
+    self.emit_byte(OpCode::BuildTuple as u8, line);
+    self.emit_byte(count, line);
+    Ok(())
+}
+```
+
+### chunk 访问器
+
+测试用。Compiler 内部通过 `self.unit.chunk` 访问。
+
+```rust
+pub fn chunk(&self) -> &Chunk {
+    &self.unit.chunk
 }
 ```
 
@@ -311,11 +544,12 @@ b = "yes" if a else "no"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::node::{Expr, Literal, BinaryOp};
 
     #[test]
     fn test_compile_int_literal() {
         let mut compiler = Compiler::new();
-        let expr = Expr::Int(42);
+        let expr = Expr::Literal(Literal::Int(42));
         compiler.compile_expression(&expr, 1).unwrap();
         assert_eq!(compiler.chunk().code[0], OpCode::Constant as u8);
     }
@@ -324,9 +558,9 @@ mod tests {
     fn test_compile_binary_add() {
         let mut compiler = Compiler::new();
         let expr = Expr::Binary {
-            left: Box::new(Expr::Int(1)),
+            left: Box::new(Expr::Literal(Literal::Int(1))),
             op: BinaryOp::Add,
-            right: Box::new(Expr::Int(2)),
+            right: Box::new(Expr::Literal(Literal::Int(2))),
         };
         compiler.compile_expression(&expr, 1).unwrap();
         let code = &compiler.chunk().code;
@@ -339,9 +573,9 @@ mod tests {
     fn test_compile_ternary() {
         let mut compiler = Compiler::new();
         let expr = Expr::Ternary {
-            condition: Box::new(Expr::Bool(true)),
-            then_expr: Box::new(Expr::String("yes".to_string())),
-            else_expr: Box::new(Expr::String("no".to_string())),
+            condition: Box::new(Expr::Literal(Literal::Bool(true))),
+            then_expr: Box::new(Expr::Literal(Literal::String("yes".to_string()))),
+            else_expr: Box::new(Expr::Literal(Literal::String("no".to_string()))),
         };
         compiler.compile_expression(&expr, 1).unwrap();
         let code = &compiler.chunk().code;
