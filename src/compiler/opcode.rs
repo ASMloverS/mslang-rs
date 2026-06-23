@@ -5,7 +5,7 @@
 //! - 指令格式：1 字节操作码 + 可变长度操作数
 //! - 常量池：字符串、数字等常量存储在独立的常量池中，通过索引引用
 
-use crate::compiler::CompilationUnit;
+use crate::compiler::Chunk;
 
 /// 字节码操作码。
 ///
@@ -186,40 +186,40 @@ impl TryFrom<u8> for OpCode {
 }
 
 /// 将字节码反汇编到标准输出（调试用）。
-pub fn disassemble(unit: &CompilationUnit, name: &str) {
+pub fn disassemble(chunk: &Chunk, name: &str) {
     println!("== {} ==", name);
     let mut offset = 0;
-    while offset < unit.code.len() {
-        offset = disassemble_instruction(unit, offset);
+    while offset < chunk.code.len() {
+        offset = disassemble_instruction(chunk, offset);
     }
 }
 
 /// 反汇编偏移量 `offset` 处的单条指令并打印，返回下一条指令的偏移量。
-fn disassemble_instruction(unit: &CompilationUnit, offset: usize) -> usize {
-    let (line, next) = format_instruction(unit, offset);
+fn disassemble_instruction(chunk: &Chunk, offset: usize) -> usize {
+    let (line, next) = format_instruction(chunk, offset);
     println!("{}", line);
     next
 }
 
 /// 格式化偏移量 `offset` 处的单条指令为一行文本，
 /// 返回 `(该行文本, 下一条指令偏移量)`。
-fn format_instruction(unit: &CompilationUnit, offset: usize) -> (String, usize) {
-    let opcode = OpCode::from_byte(unit.code[offset]).expect("invalid opcode in bytecode");
+fn format_instruction(chunk: &Chunk, offset: usize) -> (String, usize) {
+    let opcode = OpCode::from_byte(chunk.code[offset]).expect("invalid opcode in bytecode");
     match opcode.operand_size() {
         0 => (format!("{:04} {:?}", offset, opcode), offset + 1),
         1 => {
-            let operand = unit.code[offset + 1];
+            let operand = chunk.code[offset + 1];
             (
                 format!("{:04} {:?} {}", offset, opcode, operand),
                 offset + 2,
             )
         }
         2 => {
-            let operand = u16::from_be_bytes([unit.code[offset + 1], unit.code[offset + 2]]);
+            let operand = u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
             // 带常量池索引的指令额外显示常量内容（如 CONSTANT / 全局变量名）
             let constant_display = match opcode {
                 OpCode::Constant | OpCode::LoadGlobal | OpCode::StoreGlobal => {
-                    format!(" {:?}", unit.constants[operand as usize])
+                    format!(" {}", chunk.constants[operand as usize])
                 }
                 _ => String::new(),
             };
@@ -229,8 +229,8 @@ fn format_instruction(unit: &CompilationUnit, offset: usize) -> (String, usize) 
             )
         }
         3 => {
-            let name_idx = u16::from_be_bytes([unit.code[offset + 1], unit.code[offset + 2]]);
-            let argc = unit.code[offset + 3];
+            let name_idx = u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
+            let argc = chunk.code[offset + 3];
             (
                 format!("{:04} {:?} {} {}", offset, opcode, name_idx, argc),
                 offset + 4,
@@ -394,7 +394,8 @@ mod tests {
 
     #[test]
     fn test_disassemble() {
-        let unit = CompilationUnit {
+        use crate::vm::object::Object;
+        let chunk = Chunk {
             code: vec![
                 OpCode::Constant as u8,
                 0x00,
@@ -411,30 +412,31 @@ mod tests {
                 OpCode::Add as u8,  // ADD
                 OpCode::Halt as u8, // HALT
             ],
-            constants: vec!["hello".to_string(), "world".to_string()],
+            constants: vec![Object::Int(42), Object::Int(99)],
+            lines: vec![],
         };
 
-        let (line, next) = format_instruction(&unit, 0);
-        assert_eq!(line, r#"0000 Constant 0 "hello""#);
+        let (line, next) = format_instruction(&chunk, 0);
+        assert_eq!(line, "0000 Constant 0 42");
         assert_eq!(next, 3);
 
-        let (line, next) = format_instruction(&unit, 3);
-        assert_eq!(line, r#"0003 Constant 1 "world""#);
+        let (line, next) = format_instruction(&chunk, 3);
+        assert_eq!(line, "0003 Constant 1 99");
         assert_eq!(next, 6);
 
-        let (line, next) = format_instruction(&unit, 6);
+        let (line, next) = format_instruction(&chunk, 6);
         assert_eq!(line, "0006 LoadLocal 2");
         assert_eq!(next, 8);
 
-        let (line, next) = format_instruction(&unit, 8);
+        let (line, next) = format_instruction(&chunk, 8);
         assert_eq!(line, "0008 Invoke 5 1");
         assert_eq!(next, 12);
 
-        let (line, next) = format_instruction(&unit, 12);
+        let (line, next) = format_instruction(&chunk, 12);
         assert_eq!(line, "0012 Add");
         assert_eq!(next, 13);
 
-        let (line, next) = format_instruction(&unit, 13);
+        let (line, next) = format_instruction(&chunk, 13);
         assert_eq!(line, "0013 Halt");
         assert_eq!(next, 14);
     }
