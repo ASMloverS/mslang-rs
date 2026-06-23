@@ -4,16 +4,16 @@ use crate::error::{MspError, Result};
 use crate::lexer::token::{keyword_table, reserved_words, Position, Span, Token, TokenKind};
 
 pub struct Lexer {
-    #[allow(dead_code)]  // 保留用于调试/错误报告；chars 用于所有字符访问
+    #[allow(dead_code)] // 保留用于调试/错误报告；chars 用于所有字符访问
     source: String,
     chars: Vec<char>,
     pos: usize,
     line: usize,
     column: usize,
-    paren_depth: usize,    // () 深度
-    bracket_depth: usize,  // [] 深度
-    brace_depth: usize,    // {} 深度
-    prev_token_kind: Option<TokenKind>,  // 最近发出的真实 token（注释跳过时不更新）
+    paren_depth: usize,                 // () 深度
+    bracket_depth: usize,               // [] 深度
+    brace_depth: usize,                 // {} 深度
+    prev_token_kind: Option<TokenKind>, // 最近发出的真实 token（注释跳过时不更新）
 }
 
 impl Lexer {
@@ -56,7 +56,8 @@ impl Lexer {
 
     fn skip_whitespace(&mut self) {
         while let Some(c) = self.peek_char() {
-            if c == ' ' || c == '\t' || c == '\r' {  // \r: 防御性处理裸 \r（标准仅定义 \r\n 归一化）
+            if c == ' ' || c == '\t' || c == '\r' {
+                // \r: 防御性处理裸 \r（标准仅定义 \r\n 归一化）
                 self.advance();
             } else {
                 break;
@@ -68,7 +69,9 @@ impl Lexer {
         // 注意：此方法在 '\n' 处停止但不消费换行符。
         // next_token() 的循环以 continue 重新进入，由其换行分支处理该换行。
         while let Some(c) = self.peek_char() {
-            if c == '\n' { break; }
+            if c == '\n' {
+                break;
+            }
             self.advance();
         }
     }
@@ -128,7 +131,10 @@ impl Lexer {
                     }
                     self.make_token(TokenKind::Newline, start, "\n")
                 }
-                '#' => { self.skip_comment(); continue; }
+                '#' => {
+                    self.skip_comment();
+                    continue;
+                }
                 '(' => {
                     self.paren_depth += 1;
                     self.make_token(TokenKind::LeftParen, start, "(")
@@ -194,7 +200,9 @@ impl Lexer {
             let tok = self.next_token()?;
             let is_eof = tok.kind == TokenKind::Eof;
             tokens.push(tok);
-            if is_eof { break; }
+            if is_eof {
+                break;
+            }
         }
         Ok(tokens)
     }
@@ -786,7 +794,8 @@ mod tests {
         let source = "x\r\ny\n";
         let lexer = Lexer::new(source);
         let tokens = lexer.tokenize_all().unwrap();
-        let newline_count = tokens.iter()
+        let newline_count = tokens
+            .iter()
             .filter(|t| t.kind == TokenKind::Newline)
             .count();
         assert_eq!(newline_count, 2);
@@ -817,18 +826,27 @@ mod tests {
     #[test]
     fn test_identifier() {
         let tokens = tokenize("myVar _foo bar123\n");
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "myVar")));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_foo")));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar123")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "myVar")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_foo")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar123")));
     }
 
     #[test]
     fn test_case_sensitive() {
         let tokens = tokenize("True False NIL\n");
-        let idents: Vec<_> = tokens.iter()
+        let idents: Vec<_> = tokens
+            .iter()
             .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
             .collect();
-        assert!(idents.iter().all(|t| matches!(&t.kind, TokenKind::Identifier(_))));
+        assert!(idents
+            .iter()
+            .all(|t| matches!(&t.kind, TokenKind::Identifier(_))));
     }
 
     #[test]
@@ -850,15 +868,23 @@ mod tests {
     #[test]
     fn test_keyword_prefix_is_identifier() {
         let tokens = tokenize("varx iffy returnx\n");
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "varx")));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "iffy")));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "returnx")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "varx")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "iffy")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "returnx")));
     }
 
     #[test]
     fn test_underscore_only_identifier() {
         let tokens = tokenize("_ = 1\n");
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "_")));
     }
 
     #[test]
@@ -874,7 +900,8 @@ mod tests {
                       try except finally defer with throw \
                       async await go import from as yield nonlocal global\n";
         let tokens = tokenize(source);
-        let keyword_tokens: Vec<_> = tokens.iter()
+        let keyword_tokens: Vec<_> = tokens
+            .iter()
             .filter(|t| !matches!(t.kind, TokenKind::Newline | TokenKind::Eof))
             .collect();
         assert_eq!(keyword_tokens.len(), 36);
@@ -1240,7 +1267,10 @@ mod tests {
     // ---- task 08: 换行与语句终止规则 ----
 
     fn newline_count(tokens: &[Token]) -> usize {
-        tokens.iter().filter(|t| t.kind == TokenKind::Newline).count()
+        tokens
+            .iter()
+            .filter(|t| t.kind == TokenKind::Newline)
+            .count()
     }
 
     #[test]
@@ -1253,7 +1283,8 @@ mod tests {
     fn test_operator_continuation() {
         let tokens = tokenize("total = a +\n        b +\n        c\n");
         // + 后的换行被跳过，只有末尾换行
-        let operators: Vec<_> = tokens.iter()
+        let operators: Vec<_> = tokens
+            .iter()
             .filter(|t| t.kind == TokenKind::Plus)
             .collect();
         assert_eq!(operators.len(), 2);
@@ -1265,14 +1296,20 @@ mod tests {
         // [] 内换行被跳过
         assert!(tokens.iter().any(|t| t.kind == TokenKind::LeftBracket));
         assert!(tokens.iter().any(|t| t.kind == TokenKind::RightBracket));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::String(s) if s == "Alice")));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::String(s) if s == "Bob")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::String(s) if s == "Alice")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::String(s) if s == "Bob")));
     }
 
     #[test]
     fn test_function_call_continuation() {
         let tokens = tokenize("result = fn(\n    arg1,\n    arg2\n)\n");
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "arg1")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "arg1")));
     }
 
     #[test]
@@ -1287,7 +1324,9 @@ mod tests {
         // 行尾逗号后的换行被跳过
         let tokens = tokenize("x = foo,\n    bar\n");
         assert!(tokens.iter().any(|t| t.kind == TokenKind::Comma));
-        assert!(tokens.iter().any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar")));
+        assert!(tokens
+            .iter()
+            .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "bar")));
     }
 
     #[test]

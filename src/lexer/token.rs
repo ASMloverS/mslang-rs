@@ -13,41 +13,102 @@ pub enum TokenKind {
     Identifier(String),
 
     // 36 个关键字
-    Var, Const, Fn, Return,
-    If, Elif, Else,
-    While, For, In, Break, Continue,
-    Class, Zelf, Super,  // Zelf = 'self' keyword (Self is Rust reserved word)
-    True, False, Nil,
-    And, Or, Not,
-    Try, Except, Finally, Defer, With, Throw,
-    Async, Await, Go,
-    Import, From, As,
-    Yield, Nonlocal, Global,
+    Var,
+    Const,
+    Fn,
+    Return,
+    If,
+    Elif,
+    Else,
+    While,
+    For,
+    In,
+    Break,
+    Continue,
+    Class,
+    Zelf,
+    Super, // Zelf = 'self' keyword (Self is Rust reserved word)
+    True,
+    False,
+    Nil,
+    And,
+    Or,
+    Not,
+    Try,
+    Except,
+    Finally,
+    Defer,
+    With,
+    Throw,
+    Async,
+    Await,
+    Go,
+    Import,
+    From,
+    As,
+    Yield,
+    Nonlocal,
+    Global,
 
     // 算术运算符 (+ - * / // % **)
-    Plus, Minus, Star, Slash, DoubleSlash, Percent, DoubleStar,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    DoubleSlash,
+    Percent,
+    DoubleStar,
     // 比较运算符 (== != < > <= >=)
-    EqualEqual, BangEqual, Less, Greater, LessEqual, GreaterEqual,
+    EqualEqual,
+    BangEqual,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
     // 位运算符 (& | ^ << >> ~)
-    Ampersand, Pipe, Caret, LeftShift, RightShift, Tilde,
+    Ampersand,
+    Pipe,
+    Caret,
+    LeftShift,
+    RightShift,
+    Tilde,
     // 身份比较 — Is 与 In 类似：词法分析器通过关键字查找表返回 TokenKind::Is
     // 表达式解析器在 parse_comparison() 中将其视为比较运算符（双重角色）
     Is,
     // 赋值运算符 (= += -= *= /= //= %= **= &= |= ^= <<= >>=)
-    Equal, PlusEqual, MinusEqual, StarEqual, SlashEqual,
-    DoubleSlashEqual, PercentEqual, DoubleStarEqual,
-    AmpersandEqual, PipeEqual, CaretEqual, LeftShiftEqual, RightShiftEqual,
+    Equal,
+    PlusEqual,
+    MinusEqual,
+    StarEqual,
+    SlashEqual,
+    DoubleSlashEqual,
+    PercentEqual,
+    DoubleStarEqual,
+    AmpersandEqual,
+    PipeEqual,
+    CaretEqual,
+    LeftShiftEqual,
+    RightShiftEqual,
     // 短声明 (:=)
     ColonEqual,
     // 分隔符
-    LeftParen, RightParen,
-    LeftBracket, RightBracket,
-    LeftBrace, RightBrace,
-    Comma, Dot, Colon, Semicolon, Arrow,
+    LeftParen,
+    RightParen,
+    LeftBracket,
+    RightBracket,
+    LeftBrace,
+    RightBrace,
+    Comma,
+    Dot,
+    Colon,
+    Semicolon,
+    Arrow,
     // 特殊符号
-    At, LeftArrow,
+    At,
+    LeftArrow,
     // 范围运算符（标准 01-lexical.md:184-193 定义但 TokenKind 枚举遗漏，此处补充）
-    DotDot, DotDotDot,
+    DotDot,
+    DotDotDot,
     // 换行/语句终止（标准 01-lexical.md:244 定义但 TokenKind 枚举遗漏，此处补充）
     Newline,
     // EOF
@@ -258,8 +319,16 @@ mod tests {
             kind: TokenKind::Int(42),
             lexeme: "42".into(),
             span: Span {
-                start: Position { line: 1, column: 1, offset: 0 },
-                end: Position { line: 1, column: 3, offset: 2 },
+                start: Position {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                end: Position {
+                    line: 1,
+                    column: 3,
+                    offset: 2,
+                },
             },
         };
         assert_eq!(tok.kind, TokenKind::Int(42));
@@ -285,8 +354,16 @@ mod tests {
             kind: TokenKind::Identifier("x".into()),
             lexeme: "x".into(),
             span: Span {
-                start: Position { line: 1, column: 1, offset: 0 },
-                end: Position { line: 1, column: 2, offset: 1 },
+                start: Position {
+                    line: 1,
+                    column: 1,
+                    offset: 0,
+                },
+                end: Position {
+                    line: 1,
+                    column: 2,
+                    offset: 1,
+                },
             },
         };
         let s = format!("{}", tok);
@@ -296,7 +373,11 @@ mod tests {
 
     #[test]
     fn test_position_copy() {
-        let p = Position { line: 1, column: 5, offset: 4 };
+        let p = Position {
+            line: 1,
+            column: 5,
+            offset: 4,
+        };
         let p2 = p;
         assert_eq!(p, p2);
     }

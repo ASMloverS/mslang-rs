@@ -611,7 +611,8 @@ mod tests {
 
     #[test]
     fn test_const_and_var() {
-        let prog = parse("const PI = 3.14159\nvar radius = 10\narea = PI * radius * radius\n").unwrap();
+        let prog =
+            parse("const PI = 3.14159\nvar radius = 10\narea = PI * radius * radius\n").unwrap();
         assert_eq!(prog.statements.len(), 3);
         assert!(matches!(&prog.statements[0], Stmt::ConstDecl { name, .. } if name == "PI"));
         assert!(matches!(&prog.statements[1], Stmt::VarDecl { name, .. } if name == "radius"));
@@ -630,7 +631,11 @@ mod tests {
     fn test_if_elif_else() {
         let prog = parse("if x > 0 {\n    print(\"pos\")\n} elif x == 0 {\n    print(\"zero\")\n} else {\n    print(\"neg\")\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::If { elif_clauses, else_block, .. } => {
+            Stmt::If {
+                elif_clauses,
+                else_block,
+                ..
+            } => {
                 assert_eq!(elif_clauses.len(), 1);
                 assert!(else_block.is_some());
             }
@@ -648,7 +653,11 @@ mod tests {
     fn test_for_in() {
         let prog = parse("for i in range(5) {\n    print(i)\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::ForIn { variable, second_variable, .. } => {
+            Stmt::ForIn {
+                variable,
+                second_variable,
+                ..
+            } => {
                 assert_eq!(variable, "i");
                 assert!(second_variable.is_none());
             }
@@ -660,7 +669,11 @@ mod tests {
     fn test_for_in_dual_var() {
         let prog = parse("for k, v in dict.items() {\n    print(k)\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::ForIn { variable, second_variable, .. } => {
+            Stmt::ForIn {
+                variable,
+                second_variable,
+                ..
+            } => {
                 assert_eq!(variable, "k");
                 assert_eq!(second_variable.as_deref(), Some("v"));
             }
@@ -672,7 +685,9 @@ mod tests {
     fn test_fn_decl() {
         let prog = parse("fn add(a, b) {\n    return a + b\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::FnDecl { name, params, body, .. } => {
+            Stmt::FnDecl {
+                name, params, body, ..
+            } => {
                 assert_eq!(name, "add");
                 assert_eq!(params.len(), 2);
                 assert_eq!(body.len(), 1);
@@ -683,7 +698,8 @@ mod tests {
 
     #[test]
     fn test_fn_with_defaults() {
-        let prog = parse("fn greet(name, prefix = \"Hello\") {\n    return prefix + name\n}\n").unwrap();
+        let prog =
+            parse("fn greet(name, prefix = \"Hello\") {\n    return prefix + name\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { params, .. } => {
                 assert_eq!(params.len(), 2);
@@ -745,26 +761,48 @@ mod tests {
         assert_eq!(prog.statements.len(), 2);
         assert!(matches!(
             &prog.statements[0],
-            Stmt::Assign { op: AssignOp::PlusAssign, .. }
+            Stmt::Assign {
+                op: AssignOp::PlusAssign,
+                ..
+            }
         ));
         assert!(matches!(
             &prog.statements[1],
-            Stmt::Assign { op: AssignOp::StarAssign, .. }
+            Stmt::Assign {
+                op: AssignOp::StarAssign,
+                ..
+            }
         ));
     }
 
     #[test]
     fn test_attribute_and_index_assign() {
         let prog = parse("obj.attr = 1\narr[0] = 2\n").unwrap();
-        assert!(matches!(&prog.statements[0], Stmt::Assign { target: Expr::Dot { .. }, .. }));
-        assert!(matches!(&prog.statements[1], Stmt::Assign { target: Expr::Index { .. }, .. }));
+        assert!(matches!(
+            &prog.statements[0],
+            Stmt::Assign {
+                target: Expr::Dot { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &prog.statements[1],
+            Stmt::Assign {
+                target: Expr::Index { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
     fn test_multi_assign() {
         let prog = parse("a, b = 1, 2\n").unwrap();
         match &prog.statements[0] {
-            Stmt::Assign { target, op: AssignOp::Assign, value } => {
+            Stmt::Assign {
+                target,
+                op: AssignOp::Assign,
+                value,
+            } => {
                 assert!(matches!(target, Expr::TupleLiteral { elements } if elements.len() == 2));
                 assert!(matches!(value, Expr::TupleLiteral { elements } if elements.len() == 2));
             }
@@ -829,7 +867,12 @@ mod tests {
         let prog = parse("class Animal {\n    kingdom = \"Animalia\"\n    fn speak(self) {\n        return self.name\n    }\n}\n").unwrap();
         assert_eq!(prog.statements.len(), 1);
         match &prog.statements[0] {
-            Stmt::ClassDecl { name, parent, methods, class_vars } => {
+            Stmt::ClassDecl {
+                name,
+                parent,
+                methods,
+                class_vars,
+            } => {
                 assert_eq!(name, "Animal");
                 assert!(parent.is_none());
                 assert_eq!(methods.len(), 1);
@@ -841,9 +884,17 @@ mod tests {
 
     #[test]
     fn test_class_inheritance() {
-        let prog = parse("class Dog < Animal {\n    fn speak(self) {\n        return \"bark\"\n    }\n}\n").unwrap();
+        let prog = parse(
+            "class Dog < Animal {\n    fn speak(self) {\n        return \"bark\"\n    }\n}\n",
+        )
+        .unwrap();
         match &prog.statements[0] {
-            Stmt::ClassDecl { name, parent, methods, .. } => {
+            Stmt::ClassDecl {
+                name,
+                parent,
+                methods,
+                ..
+            } => {
                 assert_eq!(name, "Dog");
                 assert_eq!(parent.as_deref(), Some("Animal"));
                 assert_eq!(methods.len(), 1);
@@ -867,10 +918,17 @@ mod tests {
     fn test_try_except_finally() {
         let prog = parse("try {\n    x()\n} except ValueError as e {\n    print(e)\n} finally {\n    cleanup()\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::Try { try_block, except_clauses, finally_block } => {
+            Stmt::Try {
+                try_block,
+                except_clauses,
+                finally_block,
+            } => {
                 assert_eq!(try_block.len(), 1);
                 assert_eq!(except_clauses.len(), 1);
-                assert_eq!(except_clauses[0].type_name.as_ref().unwrap(), &vec!["ValueError".to_string()]);
+                assert_eq!(
+                    except_clauses[0].type_name.as_ref().unwrap(),
+                    &vec!["ValueError".to_string()]
+                );
                 assert_eq!(except_clauses[0].alias.as_deref(), Some("e"));
                 assert!(finally_block.is_some());
             }
@@ -904,7 +962,11 @@ mod tests {
     fn test_with() {
         let prog = parse("with open(\"file.txt\") as f {\n    f.read()\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::With { expression: _, alias, body } => {
+            Stmt::With {
+                expression: _,
+                alias,
+                body,
+            } => {
                 assert!(alias.as_deref() == Some("f"));
                 assert_eq!(body.len(), 1);
             }
@@ -929,7 +991,12 @@ mod tests {
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => {
                 assert_eq!(body.len(), 2);
-                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::Yield { value: Some(_) } }));
+                assert!(matches!(
+                    &body[0],
+                    Stmt::ExprStmt {
+                        expr: Expr::Yield { value: Some(_) }
+                    }
+                ));
             }
             _ => panic!("expected fn"),
         }
@@ -940,7 +1007,12 @@ mod tests {
         let prog = parse("fn gen() {\n    yield from items\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => {
-                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::YieldFrom { .. } }));
+                assert!(matches!(
+                    &body[0],
+                    Stmt::ExprStmt {
+                        expr: Expr::YieldFrom { .. }
+                    }
+                ));
             }
             _ => panic!("expected fn"),
         }
@@ -951,7 +1023,12 @@ mod tests {
         let prog = parse("fn gen() {\n    yield\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => {
-                assert!(matches!(&body[0], Stmt::ExprStmt { expr: Expr::Yield { value: None } }));
+                assert!(matches!(
+                    &body[0],
+                    Stmt::ExprStmt {
+                        expr: Expr::Yield { value: None }
+                    }
+                ));
             }
             _ => panic!("expected fn"),
         }
@@ -973,7 +1050,9 @@ mod tests {
     fn test_go_expr() {
         let prog = parse("go worker()\n").unwrap();
         match &prog.statements[0] {
-            Stmt::ExprStmt { expr: Expr::Go { .. } } => {}
+            Stmt::ExprStmt {
+                expr: Expr::Go { .. },
+            } => {}
             _ => panic!("expected go expression"),
         }
     }

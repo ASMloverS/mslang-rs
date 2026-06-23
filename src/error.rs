@@ -4,10 +4,18 @@ use thiserror::Error;
 #[non_exhaustive]
 pub enum MspError {
     #[error("lexer error at {line}:{column}: {message}")]
-    LexError { line: usize, column: usize, message: String },
+    LexError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
 
     #[error("parse error at {line}:{column}: {message}")]
-    ParseError { line: usize, column: usize, message: String },
+    ParseError {
+        line: usize,
+        column: usize,
+        message: String,
+    },
 
     #[error("compile error: {message}")]
     CompileError { message: String },
@@ -40,7 +48,9 @@ mod tests {
 
     #[test]
     fn test_result_alias() {
-        fn sample() -> Result<i32> { Ok(42) }
+        fn sample() -> Result<i32> {
+            Ok(42)
+        }
         assert_eq!(sample().unwrap(), 42);
     }
 }

@@ -475,7 +475,9 @@ impl Parser {
             TokenKind::Go => {
                 self.advance();
                 let expr = self.parse_postfix()?;
-                Ok(Expr::Go { expr: Box::new(expr) })
+                Ok(Expr::Go {
+                    expr: Box::new(expr),
+                })
             }
             _ => {
                 let tok = self.peek();
@@ -722,11 +724,7 @@ impl Parser {
         }
     }
 
-    fn parse_dict_comprehension(
-        &mut self,
-        key_expr: Expr,
-        value_expr: Expr,
-    ) -> Result<Expr> {
+    fn parse_dict_comprehension(&mut self, key_expr: Expr, value_expr: Expr) -> Result<Expr> {
         let mut for_clauses = Vec::new();
 
         while self.match_token(&[TokenKind::For]) {
@@ -826,9 +824,7 @@ impl Parser {
         }
 
         // bare yield
-        if self.check(&TokenKind::Newline)
-            || self.check(&TokenKind::RightBrace)
-            || self.is_at_end()
+        if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) || self.is_at_end()
         {
             return Ok(Expr::Yield { value: None });
         }

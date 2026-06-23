@@ -1,11 +1,11 @@
-pub mod lexer;
 pub mod ast;
-pub mod parser;
-pub mod compiler;
-pub mod vm;
-pub mod gc;
-pub mod module;
 pub mod async_runtime;
+pub mod compiler;
+pub mod gc;
+pub mod lexer;
+pub mod module;
+pub mod parser;
 pub mod repl;
+pub mod vm;
 
 pub mod error;
