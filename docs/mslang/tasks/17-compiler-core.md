@@ -5,6 +5,7 @@ Phase 2.2a - 字节码编译 + VM 核心
 
 ## 前置任务
 - 16-opcode-definition
+- 20-object-system-basic
 
 ## 目标
 
@@ -67,6 +68,16 @@ pub struct Chunk {
     pub code: Vec<u8>,
     pub lines: Vec<(usize, usize)>,
 }
+
+impl Chunk {
+    pub fn new() -> Self {
+        Self {
+            constants: Vec::new(),
+            code: Vec::new(),
+            lines: Vec::new(),
+        }
+    }
+}
 ```
 
 ### CompilationUnit
@@ -99,6 +110,7 @@ pub struct Compiler<'a> {
     unit: CompilationUnit<'a>,
     source_file: Option<String>,
     source_lines: Vec<String>,
+    exports: Vec<String>,
 }
 
 impl<'a> Compiler<'a> {
@@ -114,7 +126,7 @@ impl<'a> Compiler<'a> {
             scope_depth: 0,
             parent: None,
         };
-        Compiler { unit, source_file: None, source_lines: Vec::new() }
+        Compiler { unit, source_file: None, source_lines: Vec::new(), exports: Vec::new() }
     }
 
     pub fn with_source(source: &str, file: Option<String>) -> Self {
@@ -139,10 +151,13 @@ impl Compiler<'_> {
         idx
     }
 
-    pub fn emit_constant(&mut self, value: Object, line: usize) {
+    pub fn emit_constant(&mut self, value: Object, line: usize) -> Result<(), String> {
         let idx = self.add_constant(value);
+        let idx = u16::try_from(idx)
+            .map_err(|_| format!("constant pool overflow: more than 65535 constants"))?;
         self.emit_byte(OpCode::Constant as u8, line);
-        self.emit_bytes(&(idx as u16).to_be_bytes(), line);
+        self.emit_bytes(&idx.to_be_bytes(), line);
+        Ok(())
     }
 }
 ```
@@ -169,11 +184,57 @@ impl Compiler<'_> {
         self.unit.chunk.code.len() - 2
     }
 
-    pub fn patch_jump(&mut self, offset: usize) {
-        let jump = (self.unit.chunk.code.len() - offset - 2) as u16;
+    pub fn patch_jump(&mut self, offset: usize) -> Result<(), String> {
+        let code_len = self.unit.chunk.code.len();
+        if offset + 2 > code_len {
+            return Err(format!("invalid jump offset: {} out of range", offset));
+        }
+        let jump = code_len - offset - 2;
+        let jump = u16::try_from(jump)
+            .map_err(|_| format!("forward jump distance exceeds 65535"))?;
         let bytes = jump.to_be_bytes();
         self.unit.chunk.code[offset] = bytes[0];
         self.unit.chunk.code[offset + 1] = bytes[1];
+        Ok(())
+    }
+
+    /// 后向跳转补丁（JUMP_BACK / CONTINUE）。跳转目标在当前代码位置之前。
+    /// offset 为 emit_jump 返回的操作数起始位置，loop_start 为循环起始指令偏移。
+    pub fn patch_jump_back(&mut self, offset: usize, loop_start: usize) -> Result<(), String> {
+        if offset + 2 > self.unit.chunk.code.len() {
+            return Err(format!("invalid jump offset: {} out of range", offset));
+        }
+        // 后向跳转：偏移量为负，用 i16 的补码表示
+        let backward = (offset + 2) - loop_start;
+        let backward = u16::try_from(backward)
+            .map_err(|_| format!("backward jump distance exceeds 65535"))?;
+        let bytes = backward.to_be_bytes();
+        self.unit.chunk.code[offset] = bytes[0];
+        self.unit.chunk.code[offset + 1] = bytes[1];
+        Ok(())
+    }
+}
+
+### 作用域管理
+
+mslang 使用函数级作用域（`if`/`while`/`for` 块不创建新作用域）。`begin_scope` / `end_scope` 仅在函数边界和推导式隐式作用域（`03-syntax.md:528`）中使用。
+
+```rust
+impl Compiler<'_> {
+    pub fn begin_scope(&mut self) {
+        self.unit.scope_depth += 1;
+    }
+
+    pub fn end_scope(&mut self) {
+        self.unit.scope_depth = self.unit.scope_depth.saturating_sub(1);
+        // 弹出当前作用域的局部变量
+        while let Some(local) = self.unit.locals.last() {
+            if local.depth > self.unit.scope_depth {
+                self.unit.locals.pop();
+            } else {
+                break;
+            }
+        }
     }
 }
 ```
@@ -182,16 +243,17 @@ impl Compiler<'_> {
 
 ```rust
 impl Compiler<'_> {
-    pub fn declare_local(&mut self, name: &str, line: usize) {
+    pub fn declare_local(&mut self, name: &str, line: usize) -> Result<(), String> {
         let depth = self.unit.scope_depth;
         if self.unit.locals.iter().rev().take_while(|l| l.depth == depth).any(|l| l.name == name) {
-            panic!("Variable '{}' already declared in this scope", name);
+            return Err(format!("line {}: variable '{}' already declared in this scope", line, name));
         }
         self.unit.locals.push(Local {
             name: name.to_string(),
             depth,
             is_captured: false,
         });
+        Ok(())
     }
 
     pub fn resolve_local(&self, name: &str) -> Option<usize> {
@@ -214,12 +276,15 @@ impl Compiler<'_> {
         Some(idx)
     }
 
-    fn resolve_upvalue_recursive(&mut self, name: &str) -> Option<(usize, bool)> {
+    /// 递归查找上值。先在直接 parent 的 locals 中查找（is_local=true）；
+    /// 若未找到，递归在 parent 的 upvalues 中查找（is_local=false）。
+    fn resolve_upvalue_recursive(&self, name: &str) -> Option<(usize, bool)> {
         let parent = self.unit.parent?;
         if let Some(idx) = parent.locals.iter().rposition(|l| l.name == name) {
             Some((idx, true))
         } else {
-            None
+            // 递归：在 parent 的上值链中查找
+            parent.resolve_upvalue_recursive(name).map(|(idx, _)| (idx, false))
         }
     }
 }
@@ -250,21 +315,24 @@ impl Compiler<'_> {
         self.emit_byte(OpCode::Halt as u8, 0);
         Ok(std::mem::replace(&mut self.unit.chunk, Chunk::new()))
     }
+
+    /// 语句编译入口。task 17 提供空实现（仅 ExprStmt/空程序可通过），
+    /// 完整实现由 task 18（表达式编译）和 task 19（语句编译）逐步填充。
+    fn compile_statement(&mut self, stmt: &Stmt) -> Result<(), String> {
+        // task 17 框架仅确保编译入口可调用；具体语句编译见 task 18/19。
+        // 空程序（statements 为空）不触发此方法。
+        match stmt {
+            _ => Err(format!("compile_statement not yet implemented (task 18/19)")),
+        }
+    }
 }
 ```
 
 ### 导出列表
 
-```rust
-pub struct Compiler<'a> {
-    unit: CompilationUnit<'a>,
-    source_file: Option<String>,
-    source_lines: Vec<String>,
-    exports: Vec<String>,
-}
-```
+`exports` 字段（已在上方 Compiler 结构体中定义）记录顶层 fn/class/const 声明的名称。模块系统（Task 45）通过此列表过滤导出内容。
 
-`exports` 记录顶层 fn/class/const 声明的名称。模块系统（Task 45）通过此列表过滤导出内容。
+`source_file` 和 `source_lines` 保留用于 task 57（友好错误信息与堆栈跟踪）的行号查找。
 
 ## 验证标准
 
@@ -309,7 +377,7 @@ mod tests {
     #[test]
     fn test_emit_constant() {
         let mut compiler = Compiler::new();
-        compiler.emit_constant(Object::Int(10), 1);
+        compiler.emit_constant(Object::Int(10), 1).unwrap();
         assert_eq!(compiler.unit.chunk.code[0], OpCode::Constant as u8);
         assert_eq!(compiler.unit.chunk.constants.len(), 1);
         assert_eq!(compiler.unit.chunk.constants[0], Object::Int(10));
@@ -321,7 +389,7 @@ mod tests {
         let jump_offset = compiler.emit_jump(OpCode::Jump, 1);
         compiler.emit_byte(OpCode::Nil as u8, 1);
         compiler.emit_byte(OpCode::Nil as u8, 1);
-        compiler.patch_jump(jump_offset);
+        compiler.patch_jump(jump_offset).unwrap();
         let offset = u16::from_be_bytes([
             compiler.unit.chunk.code[jump_offset],
             compiler.unit.chunk.code[jump_offset + 1],
@@ -332,11 +400,19 @@ mod tests {
     #[test]
     fn test_local_variable_management() {
         let mut compiler = Compiler::new();
-        compiler.declare_local("x", 1);
-        compiler.declare_local("y", 1);
+        compiler.declare_local("x", 1).unwrap();
+        compiler.declare_local("y", 1).unwrap();
         assert_eq!(compiler.resolve_local("x"), Some(1));
         assert_eq!(compiler.resolve_local("y"), Some(2));
         assert_eq!(compiler.resolve_local("z"), None);
+    }
+
+    #[test]
+    fn test_declare_local_duplicate_returns_error() {
+        let mut compiler = Compiler::new();
+        compiler.declare_local("x", 1).unwrap();
+        let result = compiler.declare_local("x", 2);
+        assert!(result.is_err());
     }
 }
 ```
