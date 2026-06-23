@@ -26,7 +26,7 @@
 
 | # | 任务 | 状态 |
 |---|---|---|
-| 16 | [字节码指令集定义](16-opcode-definition.md) | ⬜ |
+| 16 | [字节码指令集定义](16-opcode-definition.md) | ✅ |
 | 17 | [编译器核心框架](17-compiler-core.md) | ⬜ |
 | 18 | [表达式编译](18-compile-expressions.md) | ⬜ |
 | 19 | [语句编译](19-compile-statements.md) | ⬜ |
