@@ -188,6 +188,18 @@ Phase 2.1 - 字节码编译 + VM 核心
 
 `src/compiler/opcode.rs`
 
+> **`CompilationUnit` 定义**：反汇编器依赖 `CompilationUnit` 类型（参照 `11-bytecode-vm.md:183-196`）。task 16 在 `src/compiler/mod.rs` 中定义最小版本（仅含反汇编器所需字段），task 17（编译器核心框架）扩展完整字段（`lines`、`locals`、`upvalues`、`parent`）：
+>
+> ```rust
+> /// 编译单元。task 16 定义最小版本；task 17 扩展完整字段。
+> pub struct CompilationUnit {
+>     pub code: Vec<u8>,
+>     pub constants: Vec<String>,
+> }
+> ```
+>
+> `constants` 使用 `Vec<String>` 作为最小实现（常量池存储字符串名称，反汇编器用于显示）。task 17/20 定义 `Object` 系统后，`constants` 类型可扩展为 `Vec<Object>`。
+
 ### OpCode 枚举
 
 ```rust
@@ -340,7 +352,8 @@ pub fn disassemble(unit: &CompilationUnit, name: &str) {
 
 fn disassemble_instruction(unit: &CompilationUnit, offset: usize) -> usize {
     print!("{:04} ", offset);
-    let opcode = OpCode::from(unit.code[offset]);
+    let opcode = OpCode::from_byte(unit.code[offset])
+        .expect("invalid opcode in bytecode");
     match opcode.operand_size() {
         0 => {
             println!("{:?}", opcode);
@@ -384,15 +397,18 @@ impl OpCode {
 impl TryFrom<u8> for OpCode {
     type Error = ();
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Constant),
-            1 => Ok(Self::Nil),
-            // ... 依次映射
-            _ => Err(()),
+        if value <= Self::Halt as u8 {
+            // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
+            // Constant=0 through Halt=79. value <= Halt guarantees validity.
+            Ok(unsafe { core::mem::transmute(value) })
+        } else {
+            Err(())
         }
     }
 }
 ```
+
+> **注**：由于 `OpCode` 是 `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`，可安全使用 `transmute` 进行转换，无需逐一列出 80 个 match 臂。`Halt` 为最后一个变体（判别值 79），`value <= Self::Halt as u8` 等价于 `value <= 79`，确保所有合法值被接受、非法值被拒绝。
 
 ## 验证标准
 
