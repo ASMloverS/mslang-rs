@@ -80,6 +80,8 @@ enum TypeTag {
 - **Truthy**：`true`、非零数值、非空字符串、非空集合
 - **Falsy**：`false`、`nil`、`0`、`0.0`、`""`、空集合
 
+> **NaN 的 truthiness**：`Float(NaN)` 为 **truthy**（因 `NaN != 0.0`）。`02-types.md:97` 仅规定 NaN 的相等性（不等于任何值），未规定真值；此处与 Python 行为一致（NaN 为 truthy）。
+
 ### 类型名称
 
 引用 [02-types.md](../02-types.md)：
@@ -105,13 +107,20 @@ enum TypeTag {
 
 ```rust
 /// 统一对象头，16 bytes，所有堆对象的公共前缀。
-/// 布局来自 11-bytecode-vm.md；GC 语义见 14-gc.md。
+/// 布局来自 11-bytecode-vm.md（偏移图）；GC 语义见 14-gc.md。
+///
+/// 字段偏移（与 14-gc.md 的字节偏移图严格一致）：
+///   0     gc_meta   (u8)
+///   1     type_tag  (u8)
+///   2-3   size      (u16)
+///   4-7   _padding  (u32)   ← bytes 4-7 全部显式命名，无隐式填充
+///   8-15  class_ptr (u64)
 #[repr(C)]
 pub struct MsObjHeader {
     pub gc_meta:   u8,   // GC 元数据（三色标记、代数、finalizer、pin）
     pub type_tag:  u8,   // TypeTag 枚举值
     pub size:      u16,  // 对象总大小（字节，含头部）
-    pub _padding:  u16,  // 对齐填充，保留
+    pub _padding:  u32,  // bytes 4-7，对齐填充，保留
     pub class_ptr: u64,  // 指向 Class 元数据或类型描述表
 }
 ```
@@ -176,6 +185,8 @@ pub struct MsStr {
 
 这些函数是下游任务（21–51）操作堆对象的 DRY API，无需直接使用裸指针。
 
+> **MVP 双重分配 + size 字段说明**：MVP 的 `MsStr` 用两次独立分配（`Box<[u8]>` 数据缓冲区 + `Box<MsStr>`），二者均 `Box::into_raw` 泄漏（task 52 GC 上线后回收）。因此 `header.size = size_of::<MsStr>()`（`:200`）**仅含 MsStr 结构体，不含 data 缓冲区**——与 `14-gc.md:112`"size = 对象占用字节总数（含头部）"的最终语义不符。task 52 升级为"header 后紧跟数据"的内联布局后，`size` 改为含数据长度；同时须注册释放 `data_ptr` 缓冲区的 finalizer（或随内联布局一并回收）。
+
 ```rust
 /// 在堆上分配一个 String 对象，返回 Object::Ref。
 /// MVP：Box 分配；task 52-gc 替换为 TLAB bump 分配。
@@ -201,9 +212,14 @@ pub fn alloc_string(s: &str) -> Object {
 
 /// 从指向 MsStr 的 Ref 指针读取字符串内容。
 ///
+/// 返回值的生命周期由调用方约束（`'a`），**不可**用 `'static`——
+/// 数据来自堆分配，task 52 GC 上线后会被回收，`'static` 会绕过借用检查器、
+/// 掩盖 use-after-free。调用方须在 unsafe 契约中保证 MsStr 在 `'a` 期间有效。
+///
 /// # Safety
-/// `ptr` 必须指向由 `alloc_string` 分配的有效 `MsStr`。
-pub unsafe fn read_str(ptr: *mut MsObjHeader) -> &'static str {
+/// `ptr` 必须指向由 `alloc_string` 分配的、在 `'a` 期间保持有效的 `MsStr`，
+/// 且其内容为合法 UTF-8（`alloc_string` 保证）。
+pub unsafe fn read_str<'a>(ptr: *mut MsObjHeader) -> &'a str {
     let ms_str = ptr as *mut MsStr;
     let data_ptr = (*ms_str).data_ptr;
     let data_len = (*ms_str).data_len as usize;
@@ -230,6 +246,7 @@ impl std::fmt::Display for Object {
                 }
             }
             Object::Ref(ptr) => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
                 let tag = unsafe { (**ptr).type_tag };
                 if tag == TypeTag::STRING as u8 {
                     write!(f, "{}", unsafe { read_str(*ptr) })
@@ -254,10 +271,12 @@ impl Object {
             Object::Int(n) => *n != 0,
             Object::Float(n) => *n != 0.0,
             Object::Ref(ptr) => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
                 let tag = unsafe { (**ptr).type_tag };
                 if tag == TypeTag::STRING as u8 {
                     unsafe { !read_str(*ptr).is_empty() }
                 } else {
+                    // TODO(task 22): 非 String 集合须按非空判断（空集合为 falsy）
                     true
                 }
             }
@@ -277,6 +296,7 @@ impl Object {
             Object::Int(_) => "int",
             Object::Float(_) => "float",
             Object::Ref(ptr) => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
                 let tag = unsafe { (**ptr).type_tag };
                 if tag == TypeTag::STRING as u8 {
                     "string"
@@ -301,6 +321,7 @@ impl PartialEq for Object {
             (Object::Int(a), Object::Int(b)) => a == b,
             (Object::Float(a), Object::Float(b)) => a == b,
             (Object::Ref(a), Object::Ref(b)) => {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
                 let tag_a = unsafe { (**a).type_tag };
                 let tag_b = unsafe { (**b).type_tag };
                 if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
@@ -321,36 +342,49 @@ impl PartialEq for Object {
 
 基础类型需要实现 Hash 以支持作为 dict 的键或 set 的元素：
 
+> **Eq/Hash 契约**：Rust `HashMap`/`HashSet` 要求 `a == b ⟹ hash(a) == hash(b)`。由于 `02-types.md:305` 规定 `Int` 与 `Float` 数值相等时 `==` 为 `true`（如 `42 == 42.0`），二者的哈希**必须一致**。因此 Int 的哈希路径须与 Float 归一：能无损往返 f64 的整数按其 f64 表示哈希，超出 f64 精度的大整数按 i64 哈希（无任何 float 与之数值相等，不会冲突）。
+
 ```rust
 impl std::hash::Hash for Object {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
             Object::Nil => 0u8.hash(state),
             Object::Bool(b) => b.hash(state),
-            Object::Int(n) => n.hash(state),
-            Object::Float(f) => {
-                // NaN 不可哈希（参照 02-types.md § hash）
-                if f.is_nan() {
-                    panic!("TypeError: unhashable type: float NaN");
-                }
-                if *f == 0.0 {
-                    0.0f64.to_bits().hash(state)
+            Object::Int(n) => {
+                // 与 Float 保持哈希一致：能无损表示为 f64 的整数走 Float 路径
+                let f = *n as f64;
+                if (f as i64) == *n {
+                    hash_f64_normalized(f, state);
                 } else {
-                    f.to_bits().hash(state)
+                    n.hash(state) // 超出 f64 精度，无 float 可与之相等
                 }
             }
+            Object::Float(f) => hash_f64_normalized(*f, state),
             Object::Ref(ptr) => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
                 let tag = unsafe { (**ptr).type_tag };
                 if tag == TypeTag::STRING as u8 {
                     unsafe { read_str(*ptr) }.hash(state)
                 } else {
+                    // 非 String 的 Ref（List/Dict/... 不可哈希；Tuple 按 task 22 值哈希）
                     (*ptr as usize).hash(state)
                 }
             }
         }
     }
 }
+
+/// 归一化 f64 哈希：NaN 不可哈希（panic）；±0.0 视为同一键（与 02-types.md:352 一致）。
+fn hash_f64_normalized<H: std::hash::Hasher>(f: f64, state: &mut H) {
+    if f.is_nan() {
+        panic!("TypeError: unhashable type: float NaN");
+    }
+    let bits = if f == 0.0 { 0.0f64.to_bits() } else { f.to_bits() };
+    bits.hash(state);
+}
 ```
+
+> **Eq 暂缓说明**：本 task 仅实现 `PartialEq`（不实现 `Eq`），因为 `f64` 不满足 `Eq`（NaN != NaN）。`Object` 直接用作 `HashMap` 键需 `Eq + Hash`，由 task 22（集合类型）通过包装类型或在集合层处理 NaN 等价性来解决。`Hash` 此处先行实现以保证数值哈希一致性契约成立。
 
 ## 验证标准
 
@@ -363,6 +397,9 @@ impl std::hash::Hash for Object {
 7. `Object::Bool(true) == Object::Int(1)` 返回 `false`（不同类型除 int/float 外不等）
 8. 每个类型的 `type_name()` 返回正确字符串
 9. `Display` 格式化正确
+10. `hash(Int(n)) == hash(Float(n as f64))`（Eq/Hash 契约，n 在 f64 精度内）
+11. `hash(Float(-0.0)) == hash(Float(0.0))`；`hash(Float(NaN))` panic
+12. `MsObjHeader` 字段偏移与 14-gc.md 一致（gc_meta@0、type_tag@1、size@2、class_ptr@8），大小 16 字节
 
 ## 测试用例
 
@@ -422,6 +459,48 @@ mod tests {
         assert_eq!(Object::Int(0), Object::Float(0.0));
         assert_eq!(Object::Int(42), Object::Float(42.0));
         assert_ne!(Object::Int(42), Object::Float(42.1));
+    }
+
+    #[test]
+    fn test_hash_int_float_consistency() {
+        // Eq/Hash 契约：Int(n) == Float(n as f64) ⟹ 二者哈希必须相等（02-types.md:305）
+        use std::collections::hash_map::DefaultHasher;
+        fn h(o: &Object) -> u64 {
+            let mut s = DefaultHasher::new();
+            o.hash(&mut s);
+            s.finish()
+        }
+        assert_eq!(h(&Object::Int(0)), h(&Object::Float(0.0)));
+        assert_eq!(h(&Object::Int(42)), h(&Object::Float(42.0)));
+        assert_eq!(h(&Object::Int(-7)), h(&Object::Float(-7.0)));
+    }
+
+    #[test]
+    fn test_hash_float_zero_sign() {
+        // -0.0 与 0.0 哈希一致（02-types.md:352）
+        use std::collections::hash_map::DefaultHasher;
+        let mut h1 = DefaultHasher::new();
+        Object::Float(0.0).hash(&mut h1);
+        let mut h2 = DefaultHasher::new();
+        Object::Float(-0.0).hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeError: unhashable type: float NaN")]
+    fn test_hash_nan_panics() {
+        use std::collections::hash_map::DefaultHasher;
+        Object::Float(f64::NAN).hash(&mut DefaultHasher::new());
+    }
+
+    #[test]
+    fn test_header_field_offsets() {
+        // MsObjHeader 字段偏移须与 14-gc.md 布局图一致
+        assert_eq!(std::mem::offset_of!(MsObjHeader, gc_meta), 0);
+        assert_eq!(std::mem::offset_of!(MsObjHeader, type_tag), 1);
+        assert_eq!(std::mem::offset_of!(MsObjHeader, size), 2);
+        assert_eq!(std::mem::offset_of!(MsObjHeader, class_ptr), 8);
+        assert_eq!(std::mem::size_of::<MsObjHeader>(), 16);
     }
 }
 ```
