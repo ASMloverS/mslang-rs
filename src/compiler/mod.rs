@@ -6,6 +6,7 @@
 //! 参照 [11-bytecode-vm](../../../docs/mslang/11-bytecode-vm.md) 编译单元设计，
 //! [03-syntax](../../../docs/mslang/03-syntax.md) 作用域规则。
 
+pub mod expression;
 pub mod opcode;
 
 use crate::ast::node::{Program, Stmt};
