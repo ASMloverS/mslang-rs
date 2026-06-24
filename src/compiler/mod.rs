@@ -8,6 +8,7 @@
 
 pub mod expression;
 pub mod opcode;
+pub mod statement;
 
 use crate::ast::node::{Program, Stmt};
 use crate::vm::object::Object;
@@ -81,6 +82,20 @@ pub struct Compiler<'a> {
     source_file: Option<String>,
     source_lines: Vec<String>,
     exports: Vec<String>,
+    /// 循环上下文栈，支持 break/continue 与嵌套循环（最内层在栈顶）。
+    current_loop: Vec<LoopContext>,
+    /// 标记为 nonlocal 的变量名（当前函数作用域内有效）。
+    nonlocal_names: std::collections::HashSet<String>,
+    /// 标记为 global 的变量名（当前函数作用域内有效）。
+    global_names: std::collections::HashSet<String>,
+}
+
+/// 循环上下文。break 跳到循环出口（前向），continue 跳到循环头（后向）。
+struct LoopContext {
+    /// 循环头指令偏移（continue 目标）。
+    loop_start: usize,
+    /// 待 patch 的 break 跳转操作数位置列表。
+    break_jumps: Vec<usize>,
 }
 
 impl<'a> Compiler<'a> {
@@ -102,6 +117,9 @@ impl<'a> Compiler<'a> {
             source_file: None,
             source_lines: Vec::new(),
             exports: Vec::new(),
+            current_loop: Vec::new(),
+            nonlocal_names: std::collections::HashSet::new(),
+            global_names: std::collections::HashSet::new(),
         }
     }
 
@@ -301,7 +319,7 @@ impl Compiler<'_> {
     /// 编译程序，返回字节码块。
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, String> {
         for stmt in &program.statements {
-            self.compile_statement(stmt)?;
+            self.compile_statement(stmt, 0)?;
 
             // 记录顶层导出名（供模块系统使用）
             if self.unit.scope_depth == 0 {
@@ -321,13 +339,6 @@ impl Compiler<'_> {
         Ok(std::mem::take(&mut self.unit.chunk))
     }
 
-    /// 语句编译入口。task 17 提供空实现（仅空程序可通过），
-    /// 完整实现由 task 18（表达式编译）和 task 19（语句编译）逐步填充。
-    fn compile_statement(&mut self, _stmt: &Stmt) -> Result<(), String> {
-        // task 17 框架仅确保编译入口可调用；具体语句编译见 task 18/19。
-        // 空程序（statements 为空）不触发此方法。
-        Err("compile_statement not yet implemented (task 18/19)".to_string())
-    }
 }
 
 #[cfg(test)]
