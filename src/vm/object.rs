@@ -167,6 +167,548 @@ impl Object {
     }
 }
 
+/// 比较算子（VM 本地定义，与 compiler::OpCode 解耦）。
+#[derive(Debug, Clone, Copy)]
+pub enum CmpOp {
+    Equal,
+    NotEqual,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
+}
+
+// ---------------------------------------------------------------------------
+// 算术运算（task 21）
+// ---------------------------------------------------------------------------
+
+impl Object {
+    pub fn add(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => a
+                .checked_add(*b)
+                .map(Object::Int)
+                .ok_or_else(|| "OverflowError: integer addition overflow".to_string()),
+            (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 + b)),
+            (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a + *b as f64)),
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a + b)),
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (*(*a)).type_tag } == TypeTag::STRING as u8
+                    && unsafe { (*(*b)).type_tag } == TypeTag::STRING as u8 =>
+            {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
+                let result = unsafe { read_str(*a) }.to_owned() + unsafe { read_str(*b) };
+                Ok(alloc_string(&result))
+            }
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for +: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn subtract(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => a
+                .checked_sub(*b)
+                .map(Object::Int)
+                .ok_or_else(|| "OverflowError: integer subtraction overflow".to_string()),
+            (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 - b)),
+            (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a - *b as f64)),
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a - b)),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for -: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    pub fn multiply(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => a
+                .checked_mul(*b)
+                .map(Object::Int)
+                .ok_or_else(|| "OverflowError: integer multiplication overflow".to_string()),
+            (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 * b)),
+            (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a * *b as f64)),
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a * b)),
+            (Object::Ref(a), Object::Int(b)) | (Object::Int(b), Object::Ref(a))
+                if unsafe { (*(*a)).type_tag } == TypeTag::STRING as u8 =>
+            {
+                debug_assert!(!a.is_null(), "null Object::Ref");
+                if *b < 0 {
+                    return Err("TypeError: can't multiply string by negative int".to_string());
+                }
+                // 防止 `*b as usize` 触发 OOM abort：限制结果总长度（DoS 缓解）
+                const MAX_REPEAT_LEN: usize = 1 << 30; // 1 GiB 上限
+                let unit = unsafe { read_str(*a) }.len();
+                let total = unit
+                    .checked_mul(*b as usize)
+                    .ok_or_else(|| "OverflowError: string repeat count too large".to_string())?;
+                if total > MAX_REPEAT_LEN {
+                    return Err("MemoryError: string repeat result too large".to_string());
+                }
+                let repeated = unsafe { read_str(*a) }.repeat(*b as usize);
+                Ok(alloc_string(&repeated))
+            }
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for *: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn divide(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (_, Object::Int(0)) => Err("ZeroDivisionError: division by zero".to_string()),
+            (Object::Int(a), Object::Int(b)) => Ok(Object::Float(*a as f64 / *b as f64)),
+            (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 / b)),
+            (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a / *b as f64)),
+            // Float 除零遵循 IEEE 754：1.0/0.0 = +inf, -1.0/0.0 = -inf, 0.0/0.0 = NaN
+            // 参照 02-types.md § 特殊浮点值
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a / b)),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for /: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    pub fn floor_divide(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (_, Object::Int(0)) | (_, Object::Float(0.0)) => {
+                Err("ZeroDivisionError: integer division or modulo by zero".to_string())
+            }
+            // 整数 floor 除法须为精确整数运算（02-types.md:32），不走 f64（>2^53 丢精度）。
+            // 向负无穷取整（Python `//`）：截断商在"被除数与除数异号且不整除"时减 1，
+            // 与 modulo 自洽（a == (a//b)*b + (a%b)）。注：Rust `div_euclid` 为 Euclid 除法，
+            // 负除数时商 != floor（余数恒 ≥ 0），故不能用。
+            (Object::Int(a), Object::Int(b)) => {
+                let q = a / b;
+                let r = a % b;
+                let q = if r != 0 && (r < 0) != (*b < 0) { q - 1 } else { q };
+                Ok(Object::Int(q))
+            }
+            (Object::Int(a), Object::Float(b)) => Ok(Object::Float((*a as f64 / b).floor())),
+            (Object::Float(a), Object::Int(b)) => Ok(Object::Float((a / *b as f64).floor())),
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float((a / b).floor())),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for //: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn modulo(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (_, Object::Int(0)) | (_, Object::Float(0.0)) => {
+                Err("ZeroDivisionError: integer division or modulo by zero".to_string())
+            }
+            // floor-mod（Python `%`，符号跟随除数）：截断余数在"被除数与除数异号且不整除"
+            // 时加除数校正，与 floor_divide 自洽（a == (a//b)*b + (a%b)）。注：Rust
+            // `rem_euclid` 为 Euclid 余数（恒 ≥ 0），负除数时 != Python %，故不能用。
+            (Object::Int(a), Object::Int(b)) => {
+                let r = a % b;
+                let r = if r != 0 && (r < 0) != (*b < 0) { r + b } else { r };
+                Ok(Object::Int(r))
+            }
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a - (a / b).floor() * b)),
+            (Object::Int(a), Object::Float(b)) => {
+                let a = *a as f64;
+                Ok(Object::Float(a - (a / b).floor() * b))
+            }
+            (Object::Float(a), Object::Int(b)) => {
+                let b = *b as f64;
+                Ok(Object::Float(a - (a / b).floor() * b))
+            }
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for %: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    pub fn power(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) if *b >= 0 => {
+                // i64 的 ** ：指数 ≥ 64 必溢出（|a|≥2 时），且 checked_pow 取 u32 指数，
+                // 超大指数会被 `as u32` 截断导致静默错误值。先按溢出处理。
+                if *b >= 64 {
+                    return Err("OverflowError: integer power overflow".to_string());
+                }
+                a.checked_pow(*b as u32)
+                    .map(Object::Int)
+                    .ok_or_else(|| "OverflowError: integer power overflow".to_string())
+            }
+            (Object::Int(a), Object::Int(b)) => {
+                Ok(Object::Float((*a as f64).powf(*b as f64)))
+            }
+            (Object::Int(a), Object::Float(b)) => Ok(Object::Float((*a as f64).powf(*b))),
+            (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a.powf(*b as f64))),
+            (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a.powf(*b))),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for **: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn negate(&self) -> Result<Object, String> {
+        match self {
+            // checked_neg：-i64::MIN 溢出，须报 OverflowError（02-types.md:79）
+            Object::Int(n) => n
+                .checked_neg()
+                .map(Object::Int)
+                .ok_or_else(|| "OverflowError: integer negation overflow".to_string()),
+            Object::Float(n) => Ok(Object::Float(-n)),
+            _ => Err(format!(
+                "TypeError: bad operand type for unary -: '{}'",
+                self.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    pub fn compare(&self, other: &Object, op: CmpOp) -> Result<Object, String> {
+        let result = match op {
+            CmpOp::Equal => self == other,
+            CmpOp::NotEqual => self != other,
+            CmpOp::Less => self.try_less(other)?,
+            CmpOp::Greater => self.try_greater(other)?,
+            CmpOp::LessEqual => self.try_less_equal(other)?,
+            CmpOp::GreaterEqual => self.try_greater_equal(other)?,
+        };
+        Ok(Object::Bool(result))
+    }
+
+    fn try_less(&self, other: &Object) -> Result<bool, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(a < b),
+            (Object::Float(a), Object::Float(b)) => Ok(a < b),
+            (Object::Int(a), Object::Float(b)) => Ok((*a as f64) < *b),
+            (Object::Float(a), Object::Int(b)) => Ok(*a < (*b as f64)),
+            (Object::Ref(a), Object::Ref(b)) => {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
+                let tag_a = unsafe { (**a).type_tag };
+                let tag_b = unsafe { (**b).type_tag };
+                if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
+                    Ok(unsafe { read_str(*a) } < unsafe { read_str(*b) })
+                } else {
+                    Err(format!(
+                        "TypeError: '<' not supported between instances of '{}' and '{}'",
+                        self.type_name(),
+                        other.type_name()
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "TypeError: '<' not supported between instances of '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    fn try_greater(&self, other: &Object) -> Result<bool, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(a > b),
+            (Object::Float(a), Object::Float(b)) => Ok(a > b),
+            (Object::Int(a), Object::Float(b)) => Ok((*a as f64) > *b),
+            (Object::Float(a), Object::Int(b)) => Ok(*a > (*b as f64)),
+            (Object::Ref(a), Object::Ref(b)) => {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
+                let tag_a = unsafe { (**a).type_tag };
+                let tag_b = unsafe { (**b).type_tag };
+                if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
+                    Ok(unsafe { read_str(*a) } > unsafe { read_str(*b) })
+                } else {
+                    Err(format!(
+                        "TypeError: '>' not supported between instances of '{}' and '{}'",
+                        self.type_name(),
+                        other.type_name()
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "TypeError: '>' not supported between instances of '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    fn try_less_equal(&self, other: &Object) -> Result<bool, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(a <= b),
+            (Object::Float(a), Object::Float(b)) => Ok(a <= b),
+            (Object::Int(a), Object::Float(b)) => Ok((*a as f64) <= *b),
+            (Object::Float(a), Object::Int(b)) => Ok(*a <= (*b as f64)),
+            (Object::Ref(a), Object::Ref(b)) => {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
+                let tag_a = unsafe { (**a).type_tag };
+                let tag_b = unsafe { (**b).type_tag };
+                if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
+                    Ok(unsafe { read_str(*a) } <= unsafe { read_str(*b) })
+                } else {
+                    Err(format!(
+                        "TypeError: '<=' not supported between instances of '{}' and '{}'",
+                        self.type_name(),
+                        other.type_name()
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "TypeError: '<=' not supported between instances of '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    fn try_greater_equal(&self, other: &Object) -> Result<bool, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(a >= b),
+            (Object::Float(a), Object::Float(b)) => Ok(a >= b),
+            (Object::Int(a), Object::Float(b)) => Ok((*a as f64) >= *b),
+            (Object::Float(a), Object::Int(b)) => Ok(*a >= (*b as f64)),
+            (Object::Ref(a), Object::Ref(b)) => {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
+                let tag_a = unsafe { (**a).type_tag };
+                let tag_b = unsafe { (**b).type_tag };
+                if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
+                    Ok(unsafe { read_str(*a) } >= unsafe { read_str(*b) })
+                } else {
+                    Err(format!(
+                        "TypeError: '>=' not supported between instances of '{}' and '{}'",
+                        self.type_name(),
+                        other.type_name()
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "TypeError: '>=' not supported between instances of '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    /// `is`：身份比较。Ref↔Ref 比指针；inline 类型抛 TypeError（02-types.md:313）。
+    pub fn is_identity(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Ref(a), Object::Ref(b)) => {
+                debug_assert!(!a.is_null() && !b.is_null(), "null Object::Ref");
+                Ok(Object::Bool(*a == *b))
+            }
+            // 任意一侧为 inline 类型：is 不可用
+            _ => Err(format!(
+                "TypeError: 'is' cannot be used with inline types '{}'/'{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    /// String 子串 `in`：判断 self 是否包含 needle。
+    /// List/Dict/Set 的 `in` 由 task 22 实现（集合成员判断）。
+    pub fn contains_str(&self, needle: &Object) -> Result<Object, String> {
+        match (self, needle) {
+            (Object::Ref(h), Object::Ref(n))
+                if unsafe { (*(*h)).type_tag } == TypeTag::STRING as u8
+                    && unsafe { (*(*n)).type_tag } == TypeTag::STRING as u8 =>
+            {
+                debug_assert!(!h.is_null() && !n.is_null(), "null Object::Ref");
+                Ok(Object::Bool(unsafe { read_str(*h).contains(read_str(*n)) }))
+            }
+            _ => Err(format!(
+                "TypeError: 'in' (string) requires 'str' in 'str', got '{}' and '{}'",
+                self.type_name(),
+                needle.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    pub fn bit_and(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a & b)),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for &: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn bit_or(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a | b)),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for |: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn bit_xor(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a ^ b)),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for ^: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn bit_not(&self) -> Result<Object, String> {
+        match self {
+            Object::Int(n) => Ok(Object::Int(!n)),
+            _ => Err(format!(
+                "TypeError: bad operand type for unary ~: '{}'",
+                self.type_name()
+            )),
+        }
+    }
+
+    pub fn left_shift(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(_), Object::Int(b)) if *b < 0 => {
+                Err("ValueError: negative shift count".to_string())
+            }
+            (Object::Int(_), Object::Int(b)) if *b >= 64 => {
+                Err("ValueError: shift count too large".to_string())
+            }
+            // 注：b ∈ [0,63] 时 checked_shl 必返回 Some（仅校验位移量，已由上面守卫保证）。
+            // 位移结果若越过 i64 范围（如 1<<63 得 i64::MIN 负值）按 i64 回绕返回——
+            // 02-types.md 未规定左移溢出语义，此处采用"回绕"而非 OverflowError。
+            (Object::Int(a), Object::Int(b)) => a
+                .checked_shl(*b as u32)
+                .map(Object::Int)
+                .ok_or_else(|| "OverflowError: integer left shift overflow".to_string()),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for <<: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+
+    pub fn right_shift(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Int(_), Object::Int(b)) if *b < 0 => {
+                Err("ValueError: negative shift count".to_string())
+            }
+            (Object::Int(_), Object::Int(b)) if *b >= 64 => {
+                Err("ValueError: shift count too large".to_string())
+            }
+            (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a >> b)),
+            _ => Err(format!(
+                "TypeError: unsupported operand type(s) for >>: '{}' and '{}'",
+                self.type_name(),
+                other.type_name()
+            )),
+        }
+    }
+}
+
+impl Object {
+    pub fn logical_not(&self) -> Object {
+        Object::Bool(!self.is_truthy())
+    }
+
+    pub fn logical_and(&self, other: &Object) -> Object {
+        if self.is_truthy() {
+            other.clone()
+        } else {
+            self.clone()
+        }
+    }
+
+    pub fn logical_or(&self, other: &Object) -> Object {
+        if self.is_truthy() {
+            self.clone()
+        } else {
+            other.clone()
+        }
+    }
+}
+
+impl Object {
+    pub fn to_int(&self) -> Result<Object, String> {
+        match self {
+            Object::Int(_) => Ok(self.clone()),
+            Object::Float(f) => {
+                // 拒绝 NaN / ±Infinity / 越界（Python 报 ValueError/OverflowError），
+                // 避免 `*f as i64` 静默饱和或 NaN→0。
+                if f.is_nan() {
+                    return Err("ValueError: cannot convert NaN to int".to_string());
+                }
+                if f.is_infinite() || *f < i64::MIN as f64 || *f > i64::MAX as f64 {
+                    return Err("OverflowError: float too large to convert to int".to_string());
+                }
+                Ok(Object::Int(*f as i64))
+            }
+            Object::Bool(b) => Ok(Object::Int(if *b { 1 } else { 0 })),
+            Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                let s = unsafe { read_str(*ptr) };
+                s.parse::<i64>()
+                    .map(Object::Int)
+                    .map_err(|_| format!("ValueError: invalid literal for int(): '{}'", s))
+            }
+            Object::Nil => Err("TypeError: cannot convert nil to int".to_string()),
+            _ => Err(format!(
+                "TypeError: cannot convert {} to int",
+                self.type_name()
+            )),
+        }
+    }
+
+    pub fn to_float(&self) -> Result<Object, String> {
+        match self {
+            Object::Float(_) => Ok(self.clone()),
+            Object::Int(n) => Ok(Object::Float(*n as f64)),
+            Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::STRING as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                let s = unsafe { read_str(*ptr) };
+                s.parse::<f64>()
+                    .map(Object::Float)
+                    .map_err(|_| format!("ValueError: invalid literal for float(): '{}'", s))
+            }
+            _ => Err(format!("TypeError: cannot convert {} to float", self.type_name())),
+        }
+    }
+
+    pub fn to_str(&self) -> Object {
+        alloc_string(&format!("{}", self))
+    }
+
+    pub fn to_bool(&self) -> Object {
+        Object::Bool(self.is_truthy())
+    }
+}
+
 impl fmt::Display for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -433,5 +975,169 @@ mod tests {
         } else {
             panic!("alloc_string should return Ref");
         }
+    }
+
+    // task 21 运算符测试
+
+    #[test]
+    fn test_int_add() {
+        let result = Object::Int(10).add(&Object::Int(3)).unwrap();
+        assert_eq!(result, Object::Int(13));
+    }
+
+    #[test]
+    fn test_int_div_returns_float() {
+        let result = Object::Int(10).divide(&Object::Int(3)).unwrap();
+        assert!(matches!(result, Object::Float(_)));
+    }
+
+    #[test]
+    fn test_floor_div_negative() {
+        let result = Object::Int(-7).floor_divide(&Object::Int(2)).unwrap();
+        assert_eq!(result, Object::Int(-4));
+    }
+
+    #[test]
+    fn test_power() {
+        let result = Object::Int(2).power(&Object::Int(10)).unwrap();
+        assert_eq!(result, Object::Int(1024));
+    }
+
+    #[test]
+    fn test_string_concat() {
+        let result = alloc_string("hello").add(&alloc_string(" world")).unwrap();
+        assert_eq!(result, alloc_string("hello world"));
+    }
+
+    #[test]
+    fn test_string_repeat() {
+        let result = alloc_string("ab").multiply(&Object::Int(3)).unwrap();
+        assert_eq!(result, alloc_string("ababab"));
+    }
+
+    #[test]
+    fn test_division_by_zero() {
+        // Int 除零 → ZeroDivisionError
+        let result = Object::Int(10).divide(&Object::Int(0));
+        assert!(result.is_err());
+
+        // Float 除零 → IEEE 754（参照 02-types.md § 特殊浮点值）
+        let result = Object::Float(1.0).divide(&Object::Float(0.0)).unwrap();
+        assert_eq!(result, Object::Float(f64::INFINITY));
+
+        let result = Object::Float(-1.0).divide(&Object::Float(0.0)).unwrap();
+        assert_eq!(result, Object::Float(f64::NEG_INFINITY));
+    }
+
+    #[test]
+    fn test_integer_overflow() {
+        let max_int = Object::Int(i64::MAX);
+        let result = max_int.add(&Object::Int(1));
+        assert!(result.is_err());
+
+        let result = Object::Int(2).power(&Object::Int(63));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bitwise_int_only() {
+        assert!(Object::Int(5).bit_and(&Object::Int(3)).is_ok());
+        assert!(Object::Float(5.0).bit_and(&Object::Float(3.0)).is_err());
+    }
+
+    #[test]
+    fn test_logical_short_circuit() {
+        let result = Object::Int(0).logical_and(&Object::Int(42));
+        assert_eq!(result, Object::Int(0));
+
+        let result = Object::Int(1).logical_and(&Object::Int(42));
+        assert_eq!(result, Object::Int(42));
+    }
+
+    #[test]
+    fn test_type_conversion() {
+        assert_eq!(alloc_string("42").to_int().unwrap(), Object::Int(42));
+        assert_eq!(Object::Int(42).to_float().unwrap(), Object::Float(42.0));
+        assert_eq!(Object::Int(0).to_bool(), Object::Bool(false));
+    }
+
+    #[test]
+    fn test_floor_div_and_mod_consistency() {
+        // // 与 % 自洽：a == (a//b)*b + (a%b)，且 % 取除数符号（floor-mod）
+        // 负数场景（02-types.md:72-77，与 Python 一致）
+        assert_eq!(
+            Object::Int(-7).floor_divide(&Object::Int(2)).unwrap(),
+            Object::Int(-4)
+        );
+        assert_eq!(
+            Object::Int(-7).modulo(&Object::Int(2)).unwrap(),
+            Object::Int(1)
+        );
+        assert_eq!(
+            Object::Int(7).modulo(&Object::Int(-2)).unwrap(),
+            Object::Int(-1)
+        );
+        // 不变式验证
+        for (a, b) in [(-7i64, 2), (7, -2), (-7, -2), (7, 2), (1_000_003, 7)] {
+            let av = Object::Int(a);
+            let bv = Object::Int(b);
+            let q = if let Object::Int(q) = av.floor_divide(&bv).unwrap() {
+                q
+            } else {
+                unreachable!()
+            };
+            let r = if let Object::Int(r) = av.modulo(&bv).unwrap() {
+                r
+            } else {
+                unreachable!()
+            };
+            assert_eq!(q * b + r, a, "a={} b={} 不满足 (a//b)*b + a%b == a", a, b);
+            // floor-mod 余数符号跟随除数（或为 0）
+            assert!(r == 0 || (r < 0) == (b < 0), "a={} b={} 余数符号错误: r={}", a, b, r);
+        }
+    }
+
+    #[test]
+    fn test_floor_div_large_int_no_f64_loss() {
+        // > 2^53 的整数 floor division 必须精确（不走 f64 路径）
+        let big = 9_007_199_254_740_993i64; // 2^53 + 1
+        assert_eq!(
+            Object::Int(big).floor_divide(&Object::Int(1)).unwrap(),
+            Object::Int(big)
+        );
+    }
+
+    #[test]
+    fn test_float_mod_floor_semantics() {
+        // Float % 与 // 自洽，符号跟随除数
+        assert_eq!(
+            Object::Float(-7.0).modulo(&Object::Float(2.0)).unwrap(),
+            Object::Float(1.0)
+        );
+    }
+
+    #[test]
+    fn test_negate_overflow() {
+        // -i64::MIN 溢出 → OverflowError（02-types.md:79）
+        assert!(Object::Int(i64::MIN).negate().is_err());
+        assert_eq!(Object::Int(5).negate().unwrap(), Object::Int(-5));
+    }
+
+    #[test]
+    fn test_power_huge_exponent() {
+        // 指数 ≥ 64 必溢出（i64），不因 `as u32` 截断返回静默错误值
+        assert!(Object::Int(2).power(&Object::Int(64)).is_err());
+        assert!(Object::Int(2).power(&Object::Int(1_000_000)).is_err());
+    }
+
+    #[test]
+    fn test_is_identity() {
+        // Ref↔Ref：同对象 → true，不同对象 → false（身份比较）
+        let s1 = alloc_string("x");
+        let s2 = alloc_string("x");
+        assert_eq!(s1.clone().is_identity(&s1).unwrap(), Object::Bool(true));
+        assert_eq!(s1.is_identity(&s2).unwrap(), Object::Bool(false));
+        // inline 类型 → TypeError（02-types.md:313）
+        assert!(Object::Int(42).is_identity(&Object::Int(42)).is_err());
     }
 }

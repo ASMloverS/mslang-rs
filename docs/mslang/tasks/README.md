@@ -31,7 +31,7 @@
 | 18 | [表达式编译](18-compile-expressions.md) | ✅ |
 | 19 | [语句编译](19-compile-statements.md) | ✅ |
 | 20 | [Object 系统基础类型](20-object-system-basic.md) | ✅ |
-| 21 | [Object 运算符实现](21-object-system-operations.md) | ⬜ |
+| 21 | [Object 运算符实现](21-object-system-operations.md) | ✅ |
 | 22 | [Object 集合类型](22-object-system-collections.md) | ⬜ |
 | 23 | [虚拟机核心执行循环](23-vm-core.md) | ⬜ |
 | 24 | [VM 算术运算与控制流](24-vm-arithmetic-control.md) | ⬜ |
