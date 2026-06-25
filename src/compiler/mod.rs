@@ -338,7 +338,6 @@ impl Compiler<'_> {
         self.emit_byte(OpCode::Halt as u8, 0);
         Ok(std::mem::take(&mut self.unit.chunk))
     }
-
 }
 
 #[cfg(test)]

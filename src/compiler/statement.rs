@@ -21,9 +21,7 @@ impl Compiler<'_> {
             Stmt::ConstDecl { name, initializer } => {
                 self.compile_var_decl(name, initializer, true, line)
             }
-            Stmt::Assign { target, op, value } => {
-                self.compile_assign_stmt(target, op, value, line)
-            }
+            Stmt::Assign { target, op, value } => self.compile_assign_stmt(target, op, value, line),
             Stmt::ExprStmt { expr } => self.compile_expr_stmt(expr, line),
             Stmt::Block { statements } => self.compile_block(statements, line),
             Stmt::If {
@@ -50,9 +48,9 @@ impl Compiler<'_> {
             }
             Stmt::ClassDecl { .. } => Err("class compilation not yet implemented (task 40)".into()),
             Stmt::Defer { .. } => Err("defer compilation not yet implemented (task 36)".into()),
-            Stmt::Try { .. } => Err(
-                "try/except/finally compilation not yet implemented (task 37)".into(),
-            ),
+            Stmt::Try { .. } => {
+                Err("try/except/finally compilation not yet implemented (task 37)".into())
+            }
             Stmt::With { .. } => Err("with compilation not yet implemented (task 38)".into()),
             Stmt::Import { .. } | Stmt::FromImport { .. } => {
                 Err("import compilation not yet implemented (task 45)".into())
@@ -412,8 +410,8 @@ impl Compiler<'_> {
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::{Chunk, Compiler, OpCode};
     use crate::ast::node::Program;
+    use crate::compiler::{Chunk, Compiler, OpCode};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
 
@@ -596,12 +594,7 @@ mod tests {
 
     #[test]
     fn test_deferred_statement_types_return_error() {
-        for source in [
-            "fn f() { x = 1 }",
-            "defer foo()",
-            "throw e",
-            "import os",
-        ] {
+        for source in ["fn f() { x = 1 }", "defer foo()", "throw e", "import os"] {
             let program = parse(source);
             let mut compiler = Compiler::new();
             assert!(
@@ -612,4 +605,3 @@ mod tests {
         }
     }
 }
-

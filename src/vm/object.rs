@@ -6,6 +6,7 @@
 //!
 //! 本模块为下游任务（21–55）引用对象模型的规范锚点。
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -76,6 +77,95 @@ pub struct MsStr {
     pub data_len: u32,
 }
 
+/// 有序可变映射（保持插入顺序，与 Python 3.7+ 一致）。
+/// `entries` 保存键值，`order` 保存键的插入顺序以供迭代/Display。
+pub struct DictMap {
+    entries: HashMap<Object, Object>,
+    order: Vec<Object>,
+}
+
+impl DictMap {
+    pub fn new() -> Self {
+        DictMap {
+            entries: HashMap::new(),
+            order: Vec::new(),
+        }
+    }
+
+    pub fn insert(&mut self, key: Object, value: Object) {
+        if !self.entries.contains_key(&key) {
+            self.order.push(key.clone());
+        }
+        self.entries.insert(key, value);
+    }
+
+    pub fn get(&self, key: &Object) -> Option<&Object> {
+        self.entries.get(key)
+    }
+
+    pub fn remove(&mut self, key: &Object) -> Option<Object> {
+        let old = self.entries.remove(key);
+        if old.is_some() {
+            self.order.retain(|k| k != key);
+        }
+        old
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn keys(&self) -> Vec<&Object> {
+        self.order.iter().collect()
+    }
+
+    pub fn items(&self) -> Vec<(&Object, &Object)> {
+        self.order
+            .iter()
+            .filter_map(|k| self.entries.get(k).map(|v| (k, v)))
+            .collect()
+    }
+}
+
+impl Default for DictMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 堆上 List 对象。data_ptr 指向 Box<Vec<Object>>。
+#[repr(C)]
+pub struct MsList {
+    pub header: MsObjHeader,
+    pub data_ptr: *mut Vec<Object>,
+}
+
+/// 堆上 Dict 对象。data_ptr 指向 Box<DictMap>。
+#[repr(C)]
+pub struct MsDict {
+    pub header: MsObjHeader,
+    pub data_ptr: *mut DictMap,
+}
+
+/// 堆上 Tuple 对象。data_ptr 指向 Box<Vec<Object>>（不可变语义由上层保证）。
+#[repr(C)]
+pub struct MsTuple {
+    pub header: MsObjHeader,
+    pub data_ptr: *mut Vec<Object>,
+    pub len: u32,
+}
+
+/// 堆上 Set 对象。data_ptr 指向 Box<HashSet<Object>>。
+#[repr(C)]
+pub struct MsSet {
+    pub header: MsObjHeader,
+    pub data_ptr: *mut HashSet<Object>,
+}
+
 // ---------------------------------------------------------------------------
 // 堆分配辅助函数（DRY API，下游任务 21–51 通过这些函数操作堆对象）
 // ---------------------------------------------------------------------------
@@ -118,6 +208,111 @@ pub unsafe fn read_str<'a>(ptr: *mut MsObjHeader) -> &'a str {
     std::str::from_utf8_unchecked(std::slice::from_raw_parts(data_ptr, data_len))
 }
 
+/// 分配 List 对象，返回 Object::Ref。
+pub fn alloc_list(items: Vec<Object>) -> Object {
+    let data_ptr = Box::into_raw(Box::new(items));
+    let obj = Box::new(MsList {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::LIST as u8,
+            size: std::mem::size_of::<MsList>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        data_ptr,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 List 对象的内部 Vec。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_list` 分配的、在 `'a` 期间保持有效的 `MsList`。
+/// 同一对象不得嵌套调用 `read_list`（会产生重叠 `&mut`，见"借用约束"节）。
+pub unsafe fn read_list<'a>(ptr: *mut MsObjHeader) -> &'a mut Vec<Object> {
+    let ms_list = ptr as *mut MsList;
+    &mut *(*ms_list).data_ptr
+}
+
+/// 分配 Dict 对象，返回 Object::Ref。
+pub fn alloc_dict(map: DictMap) -> Object {
+    let data_ptr = Box::into_raw(Box::new(map));
+    let obj = Box::new(MsDict {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::DICT as u8,
+            size: std::mem::size_of::<MsDict>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        data_ptr,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 Dict 对象的内部 DictMap。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_dict` 分配的、在 `'a` 期间保持有效的 `MsDict`。
+/// 不得嵌套调用（借用约束）。
+pub unsafe fn read_dict<'a>(ptr: *mut MsObjHeader) -> &'a mut DictMap {
+    let ms_dict = ptr as *mut MsDict;
+    &mut *(*ms_dict).data_ptr
+}
+
+/// 分配 Tuple 对象，返回 Object::Ref。
+pub fn alloc_tuple(items: Vec<Object>) -> Object {
+    let len = items.len() as u32;
+    let data_ptr = Box::into_raw(Box::new(items));
+    let obj = Box::new(MsTuple {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::TUPLE as u8,
+            size: std::mem::size_of::<MsTuple>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        data_ptr,
+        len,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 Tuple 对象的内部 Vec（只读，Tuple 不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_tuple` 分配的、在 `'a` 期间保持有效的 `MsTuple`。
+pub unsafe fn read_tuple<'a>(ptr: *mut MsObjHeader) -> &'a Vec<Object> {
+    let ms_tuple = ptr as *mut MsTuple;
+    &*(*ms_tuple).data_ptr
+}
+
+/// 分配 Set 对象，返回 Object::Ref。
+pub fn alloc_set(inner: HashSet<Object>) -> Object {
+    let data_ptr = Box::into_raw(Box::new(inner));
+    let obj = Box::new(MsSet {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::SET as u8,
+            size: std::mem::size_of::<MsSet>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        data_ptr,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 Set 对象的内部 HashSet。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_set` 分配的、在 `'a` 期间保持有效的 `MsSet`。
+/// 不得嵌套调用（借用约束）。
+pub unsafe fn read_set<'a>(ptr: *mut MsObjHeader) -> &'a mut HashSet<Object> {
+    let ms_set = ptr as *mut MsSet;
+    &mut *(*ms_set).data_ptr
+}
+
 // ---------------------------------------------------------------------------
 // Object 行为
 // ---------------------------------------------------------------------------
@@ -137,8 +332,19 @@ impl Object {
                 if tag == TypeTag::STRING as u8 {
                     // SAFETY: type_tag 为 STRING，指针由 alloc_string 分配。
                     unsafe { !read_str(*ptr).is_empty() }
+                } else if tag == TypeTag::LIST as u8 {
+                    // SAFETY: type_tag 为 LIST，指针由 alloc_list 分配。
+                    unsafe { !read_list(*ptr).is_empty() }
+                } else if tag == TypeTag::DICT as u8 {
+                    // SAFETY: type_tag 为 DICT，指针由 alloc_dict 分配。
+                    unsafe { !read_dict(*ptr).is_empty() }
+                } else if tag == TypeTag::TUPLE as u8 {
+                    // SAFETY: type_tag 为 TUPLE，指针由 alloc_tuple 分配。
+                    unsafe { !read_tuple(*ptr).is_empty() }
+                } else if tag == TypeTag::SET as u8 {
+                    // SAFETY: type_tag 为 SET，指针由 alloc_set 分配。
+                    unsafe { !read_set(*ptr).is_empty() }
                 } else {
-                    // TODO(task 22): 非 String 集合须按非空判断（空集合为 falsy）
                     true
                 }
             }
@@ -294,7 +500,11 @@ impl Object {
             (Object::Int(a), Object::Int(b)) => {
                 let q = a / b;
                 let r = a % b;
-                let q = if r != 0 && (r < 0) != (*b < 0) { q - 1 } else { q };
+                let q = if r != 0 && (r < 0) != (*b < 0) {
+                    q - 1
+                } else {
+                    q
+                };
                 Ok(Object::Int(q))
             }
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float((*a as f64 / b).floor())),
@@ -318,7 +528,11 @@ impl Object {
             // `rem_euclid` 为 Euclid 余数（恒 ≥ 0），负除数时 != Python %，故不能用。
             (Object::Int(a), Object::Int(b)) => {
                 let r = a % b;
-                let r = if r != 0 && (r < 0) != (*b < 0) { r + b } else { r };
+                let r = if r != 0 && (r < 0) != (*b < 0) {
+                    r + b
+                } else {
+                    r
+                };
                 Ok(Object::Int(r))
             }
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a - (a / b).floor() * b)),
@@ -352,9 +566,7 @@ impl Object {
                     .map(Object::Int)
                     .ok_or_else(|| "OverflowError: integer power overflow".to_string())
             }
-            (Object::Int(a), Object::Int(b)) => {
-                Ok(Object::Float((*a as f64).powf(*b as f64)))
-            }
+            (Object::Int(a), Object::Int(b)) => Ok(Object::Float((*a as f64).powf(*b as f64))),
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float((*a as f64).powf(*b))),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a.powf(*b as f64))),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a.powf(*b))),
@@ -696,7 +908,10 @@ impl Object {
                     .map(Object::Float)
                     .map_err(|_| format!("ValueError: invalid literal for float(): '{}'", s))
             }
-            _ => Err(format!("TypeError: cannot convert {} to float", self.type_name())),
+            _ => Err(format!(
+                "TypeError: cannot convert {} to float",
+                self.type_name()
+            )),
         }
     }
 
@@ -706,6 +921,401 @@ impl Object {
 
     pub fn to_bool(&self) -> Object {
         Object::Bool(self.is_truthy())
+    }
+}
+
+impl Object {
+    pub fn list_push(&self, value: Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                unsafe { read_list(*ptr) }.push(value);
+                Ok(Object::Nil)
+            }
+            _ => Err("TypeError: push requires a list".to_string()),
+        }
+    }
+
+    pub fn list_pop(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                unsafe { read_list(*ptr) }
+                    .pop()
+                    .ok_or_else(|| "IndexError: pop from empty list".to_string())
+            }
+            _ => Err("TypeError: pop requires a list".to_string()),
+        }
+    }
+
+    /// 负索引支持：-1 为末尾。越界抛 IndexError。
+    pub fn list_get_index(&self, index: i64) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                let items = unsafe { read_list(*ptr) };
+                let len = items.len() as i64;
+                let idx = if index < 0 { len + index } else { index };
+                if idx < 0 || idx >= len {
+                    return Err(format!("IndexError: list index {} out of range", index));
+                }
+                Ok(items[idx as usize].clone())
+            }
+            _ => Err("TypeError: index access requires a list".to_string()),
+        }
+    }
+
+    /// `lst[i] = v`。负索引支持；越界抛 IndexError。
+    pub fn list_set_index(&self, index: i64, value: Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                let items = unsafe { read_list(*ptr) };
+                let len = items.len() as i64;
+                let idx = if index < 0 { len + index } else { index };
+                if idx < 0 || idx >= len {
+                    return Err(format!(
+                        "IndexError: list assignment index {} out of range",
+                        index
+                    ));
+                }
+                items[idx as usize] = value.clone();
+                Ok(value)
+            }
+            _ => Err("TypeError: index assignment requires a list".to_string()),
+        }
+    }
+
+    pub fn list_length(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                Ok(Object::Int(unsafe { read_list(*ptr) }.len() as i64))
+            }
+            _ => Err("TypeError: len requires a list".to_string()),
+        }
+    }
+
+    /// `val in lst`。
+    pub fn list_contains(&self, value: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => Ok(
+                Object::Bool(unsafe { read_list(*ptr) }.iter().any(|x| x == value)),
+            ),
+            _ => Err("TypeError: 'in' requires a list".to_string()),
+        }
+    }
+
+    pub fn list_insert(&self, index: i64, value: Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                let items = unsafe { read_list(*ptr) };
+                let len = items.len() as i64;
+                let idx = (if index < 0 { len + index } else { index }).clamp(0, len) as usize;
+                items.insert(idx, value.clone());
+                Ok(value)
+            }
+            _ => Err("TypeError: insert requires a list".to_string()),
+        }
+    }
+
+    /// 删除首个等于 value 的元素；不存在抛 ValueError。
+    pub fn list_remove(&self, value: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                let items = unsafe { read_list(*ptr) };
+                if let Some(pos) = items.iter().position(|x| x == value) {
+                    items.remove(pos);
+                    Ok(Object::Nil)
+                } else {
+                    Err("ValueError: list.remove(x): x not in list".to_string())
+                }
+            }
+            _ => Err("TypeError: remove requires a list".to_string()),
+        }
+    }
+
+    /// `lst1 + lst2` → 新 List（拼接）。task 21 已声明由本 task 实现。
+    pub fn list_concat(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (**a).type_tag } == TypeTag::LIST as u8
+                    && unsafe { (**b).type_tag } == TypeTag::LIST as u8 =>
+            {
+                let mut merged = unsafe { read_list(*a) }.clone();
+                merged.extend(unsafe { read_list(*b) }.iter().cloned());
+                Ok(alloc_list(merged))
+            }
+            _ => Err("TypeError: + requires two lists".to_string()),
+        }
+    }
+
+    /// `lst * n` → 新 List（重复）。n < 0 报 TypeError。
+    pub fn list_repeat(&self, n: &Object) -> Result<Object, String> {
+        match (self, n) {
+            (Object::Ref(a), Object::Int(b))
+                if unsafe { (**a).type_tag } == TypeTag::LIST as u8 =>
+            {
+                if *b < 0 {
+                    return Err("TypeError: can't multiply list by negative int".into());
+                }
+                let src = unsafe { read_list(*a) };
+                let result: Vec<Object> = std::iter::repeat_with(|| src.iter().cloned())
+                    .take(*b as usize)
+                    .flatten()
+                    .collect();
+                Ok(alloc_list(result))
+            }
+            _ => Err("TypeError: * requires a list and an int".to_string()),
+        }
+    }
+}
+
+impl Object {
+    /// `d[key]`：不存在返回 `Object::Nil`（02-types.md:181，不抛异常）。
+    pub fn dict_get(&self, key: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                Ok(unsafe { read_dict(*ptr) }
+                    .get(key)
+                    .cloned()
+                    .unwrap_or(Object::Nil))
+            }
+            _ => Err("TypeError: dict access requires a dict".to_string()),
+        }
+    }
+
+    /// `d[key] = val`。key 必须可哈希（List/Dict/Set/NAN 会 panic）。
+    pub fn dict_set(&self, key: Object, value: Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                unsafe { read_dict(*ptr) }.insert(key, value.clone());
+                Ok(value)
+            }
+            _ => Err("TypeError: dict assignment requires a dict".to_string()),
+        }
+    }
+
+    /// `d.remove(key)`：键不存在抛 KeyError（02-types.md:187）。
+    pub fn dict_remove(&self, key: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                unsafe { read_dict(*ptr) }
+                    .remove(key)
+                    .ok_or_else(|| format!("KeyError: {}", key))
+            }
+            _ => Err("TypeError: remove requires a dict".to_string()),
+        }
+    }
+
+    /// `key in d`。
+    pub fn dict_contains(&self, key: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                Ok(Object::Bool(unsafe { read_dict(*ptr) }.get(key).is_some()))
+            }
+            _ => Err("TypeError: 'in' requires a dict".to_string()),
+        }
+    }
+
+    pub fn dict_length(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                Ok(Object::Int(unsafe { read_dict(*ptr) }.len() as i64))
+            }
+            _ => Err("TypeError: len requires a dict".to_string()),
+        }
+    }
+
+    /// `d.keys()` → 新 List（按插入序）。
+    pub fn dict_keys(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                let keys: Vec<Object> = unsafe { read_dict(*ptr) }
+                    .keys()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                Ok(alloc_list(keys))
+            }
+            _ => Err("TypeError: keys() requires a dict".to_string()),
+        }
+    }
+
+    /// `d.items()` → 新 List of Tuple(key, value)（按插入序）。
+    pub fn dict_items(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                let pairs: Vec<Object> = unsafe { read_dict(*ptr) }
+                    .items()
+                    .into_iter()
+                    .map(|(k, v)| Object::make_tuple(vec![k.clone(), v.clone()]))
+                    .collect();
+                Ok(alloc_list(pairs))
+            }
+            _ => Err("TypeError: items() requires a dict".to_string()),
+        }
+    }
+}
+
+impl Object {
+    pub fn make_tuple(elements: Vec<Object>) -> Object {
+        alloc_tuple(elements)
+    }
+
+    /// 负索引支持；越界抛 IndexError。Tuple 不可变，仅读。
+    pub fn tuple_get_index(&self, index: i64) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                let items = unsafe { read_tuple(*ptr) };
+                let len = items.len() as i64;
+                let idx = if index < 0 { len + index } else { index };
+                if idx < 0 || idx >= len {
+                    return Err(format!("IndexError: tuple index {} out of range", index));
+                }
+                Ok(items[idx as usize].clone())
+            }
+            _ => Err("TypeError: index access requires a tuple".to_string()),
+        }
+    }
+
+    pub fn tuple_length(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+                Ok(Object::Int(unsafe { read_tuple(*ptr) }.len() as i64))
+            }
+            _ => Err("TypeError: len requires a tuple".to_string()),
+        }
+    }
+
+    pub fn tuple_contains(&self, value: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => Ok(
+                Object::Bool(unsafe { read_tuple(*ptr) }.iter().any(|x| x == value)),
+            ),
+            _ => Err("TypeError: 'in' requires a tuple".to_string()),
+        }
+    }
+}
+
+impl Object {
+    /// `s.add(val)`。val 必须可哈希。
+    pub fn set_add(&self, value: Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                unsafe { read_set(*ptr) }.insert(value.clone());
+                Ok(value)
+            }
+            _ => Err("TypeError: add requires a set".to_string()),
+        }
+    }
+
+    /// `s.remove(val)`：元素不存在抛 KeyError（02-types.md:246）。
+    pub fn set_remove(&self, value: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                if unsafe { read_set(*ptr) }.remove(value) {
+                    Ok(value.clone())
+                } else {
+                    Err(format!("KeyError: {}", value))
+                }
+            }
+            _ => Err("TypeError: remove requires a set".to_string()),
+        }
+    }
+
+    /// `val in s`。
+    pub fn set_contains(&self, value: &Object) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+                Ok(Object::Bool(unsafe { read_set(*ptr) }.contains(value)))
+            }
+            _ => Err("TypeError: 'in' requires a set".to_string()),
+        }
+    }
+
+    pub fn set_length(&self) -> Result<Object, String> {
+        match self {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+                Ok(Object::Int(unsafe { read_set(*ptr) }.len() as i64))
+            }
+            _ => Err("TypeError: len requires a set".to_string()),
+        }
+    }
+
+    pub fn set_union(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (**a).type_tag } == TypeTag::SET as u8
+                    && unsafe { (**b).type_tag } == TypeTag::SET as u8 =>
+            {
+                let mut result = unsafe { read_set(*a) }.clone();
+                result.extend(unsafe { read_set(*b) }.iter().cloned());
+                Ok(alloc_set(result))
+            }
+            _ => Err("TypeError: | requires sets".to_string()),
+        }
+    }
+
+    pub fn set_intersection(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (**a).type_tag } == TypeTag::SET as u8
+                    && unsafe { (**b).type_tag } == TypeTag::SET as u8 =>
+            {
+                let set_b = unsafe { read_set(*b) };
+                let result: HashSet<Object> = unsafe { read_set(*a) }
+                    .iter()
+                    .filter(|x| set_b.contains(x))
+                    .cloned()
+                    .collect();
+                Ok(alloc_set(result))
+            }
+            _ => Err("TypeError: & requires sets".to_string()),
+        }
+    }
+
+    /// `s1 - s2`（差集）。
+    pub fn set_difference(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (**a).type_tag } == TypeTag::SET as u8
+                    && unsafe { (**b).type_tag } == TypeTag::SET as u8 =>
+            {
+                let set_b = unsafe { read_set(*b) };
+                let result: HashSet<Object> = unsafe { read_set(*a) }
+                    .iter()
+                    .filter(|x| !set_b.contains(x))
+                    .cloned()
+                    .collect();
+                Ok(alloc_set(result))
+            }
+            _ => Err("TypeError: - requires sets".to_string()),
+        }
+    }
+
+    /// `s1 ^ s2`（对称差）。
+    pub fn set_symmetric_difference(&self, other: &Object) -> Result<Object, String> {
+        match (self, other) {
+            (Object::Ref(a), Object::Ref(b))
+                if unsafe { (**a).type_tag } == TypeTag::SET as u8
+                    && unsafe { (**b).type_tag } == TypeTag::SET as u8 =>
+            {
+                let mut result = unsafe { read_set(*a) }.clone();
+                for x in unsafe { read_set(*b) }.iter() {
+                    if !result.remove(x) {
+                        result.insert(x.clone());
+                    }
+                }
+                Ok(alloc_set(result))
+            }
+            _ => Err("TypeError: ^ requires sets".to_string()),
+        }
     }
 }
 
@@ -729,8 +1339,37 @@ impl fmt::Display for Object {
                 if tag == TypeTag::STRING as u8 {
                     // SAFETY: type_tag 为 STRING，指针由 alloc_string 分配。
                     write!(f, "{}", unsafe { read_str(*ptr) })
+                } else if tag == TypeTag::LIST as u8 {
+                    // SAFETY: type_tag 为 LIST，指针由 alloc_list 分配。
+                    let items = unsafe { read_list(*ptr) };
+                    let strs: Vec<String> = items.iter().map(|o| format!("{}", o)).collect();
+                    write!(f, "[{}]", strs.join(", "))
+                } else if tag == TypeTag::DICT as u8 {
+                    // SAFETY: type_tag 为 DICT，指针由 alloc_dict 分配。
+                    let map = unsafe { read_dict(*ptr) };
+                    let strs: Vec<String> = map
+                        .items()
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect();
+                    write!(f, "{{{}}}", strs.join(", "))
+                } else if tag == TypeTag::TUPLE as u8 {
+                    // SAFETY: type_tag 为 TUPLE，指针由 alloc_tuple 分配。
+                    let items = unsafe { read_tuple(*ptr) };
+                    let strs: Vec<String> = items.iter().map(|o| format!("{}", o)).collect();
+                    if strs.len() == 1 {
+                        write!(f, "({},)", strs[0])
+                    } else {
+                        write!(f, "({})", strs.join(", "))
+                    }
+                } else if tag == TypeTag::SET as u8 {
+                    // SAFETY: type_tag 为 SET，指针由 alloc_set 分配。
+                    let inner = unsafe { read_set(*ptr) };
+                    // HashSet 迭代序不确定，Display 排序以保证输出稳定（便于调试与测试）
+                    let mut strs: Vec<String> = inner.iter().map(|o| format!("{}", o)).collect();
+                    strs.sort();
+                    write!(f, "{{{}}}", strs.join(", "))
                 } else {
-                    // 非 String 的 Ref 类型由后续任务（21+）扩展
                     write!(f, "<object:{}>", tag)
                 }
             }
@@ -757,9 +1396,28 @@ impl PartialEq for Object {
                 // SAFETY: 调用方保证 Ref 指针指向有效 MsObjHeader。
                 let tag_a = unsafe { (**a).type_tag };
                 let tag_b = unsafe { (**b).type_tag };
-                if tag_a == TypeTag::STRING as u8 && tag_b == TypeTag::STRING as u8 {
+                if tag_a != tag_b {
+                    return false;
+                }
+                if tag_a == TypeTag::STRING as u8 {
                     // SAFETY: 两侧 type_tag 均为 STRING。
                     unsafe { read_str(*a) == read_str(*b) }
+                } else if tag_a == TypeTag::LIST as u8 {
+                    // SAFETY: 两侧 type_tag 均为 LIST。
+                    unsafe { read_list(*a) == read_list(*b) }
+                } else if tag_a == TypeTag::TUPLE as u8 {
+                    // SAFETY: 两侧 type_tag 均为 TUPLE。
+                    unsafe { read_tuple(*a) == read_tuple(*b) }
+                } else if tag_a == TypeTag::DICT as u8 {
+                    // Dict 相等性仅比较 entries（与 Python 一致）；
+                    // 插入顺序仅影响 Display/迭代，不影响 ==。
+                    // SAFETY: 两侧 type_tag 均为 DICT。
+                    let ma = unsafe { read_dict(*a) };
+                    let mb = unsafe { read_dict(*b) };
+                    ma.entries == mb.entries
+                } else if tag_a == TypeTag::SET as u8 {
+                    // SAFETY: 两侧 type_tag 均为 SET。
+                    unsafe { read_set(*a) == read_set(*b) }
                 } else {
                     false
                 }
@@ -768,6 +1426,11 @@ impl PartialEq for Object {
         }
     }
 }
+
+/// Object 满足 Eq 的不变性：Float(NaN) 永不可哈希（Hash 在 NaN 上 panic），
+/// 故 NaN 不会进入 HashMap/HashSet；其余类型的 PartialEq 均为等价关系。
+/// 因此 `==` 的 NaN 非自反性不影响集合正确性，可安全 impl Eq。
+impl Eq for Object {}
 
 /// Hash（为后续集合类型准备）。引用 02-types.md § 可哈希类型。
 impl Hash for Object {
@@ -792,8 +1455,24 @@ impl Hash for Object {
                 if tag == TypeTag::STRING as u8 {
                     // SAFETY: type_tag 为 STRING。
                     unsafe { read_str(*ptr) }.hash(state)
+                } else if tag == TypeTag::TUPLE as u8 {
+                    // 递归哈希元素；若 tuple 含 List/Dict/Set 元素，其 Hash 会 panic（TypeError 传播）
+                    // SAFETY: type_tag 为 TUPLE。
+                    unsafe { read_tuple(*ptr) }.hash(state)
+                } else if tag == TypeTag::LIST as u8
+                    || tag == TypeTag::DICT as u8
+                    || tag == TypeTag::SET as u8
+                {
+                    // 运行时通过 type_name 报 TypeError
+                    let type_str = if tag == TypeTag::LIST as u8 {
+                        "list"
+                    } else if tag == TypeTag::DICT as u8 {
+                        "dict"
+                    } else {
+                        "set"
+                    };
+                    panic!("TypeError: unhashable type: '{}'", type_str);
                 } else {
-                    // 非 String 的 Ref（List/Dict/... 不可哈希；Tuple 按 task 22 值哈希）
                     (*ptr as usize).hash(state)
                 }
             }
@@ -806,7 +1485,11 @@ fn hash_f64_normalized<H: Hasher>(f: f64, state: &mut H) {
     if f.is_nan() {
         panic!("TypeError: unhashable type: float NaN");
     }
-    let bits = if f == 0.0 { 0.0f64.to_bits() } else { f.to_bits() };
+    let bits = if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
+    };
     bits.hash(state);
 }
 
@@ -1093,7 +1776,13 @@ mod tests {
             };
             assert_eq!(q * b + r, a, "a={} b={} 不满足 (a//b)*b + a%b == a", a, b);
             // floor-mod 余数符号跟随除数（或为 0）
-            assert!(r == 0 || (r < 0) == (b < 0), "a={} b={} 余数符号错误: r={}", a, b, r);
+            assert!(
+                r == 0 || (r < 0) == (b < 0),
+                "a={} b={} 余数符号错误: r={}",
+                a,
+                b,
+                r
+            );
         }
     }
 
@@ -1139,5 +1828,327 @@ mod tests {
         assert_eq!(s1.is_identity(&s2).unwrap(), Object::Bool(false));
         // inline 类型 → TypeError（02-types.md:313）
         assert!(Object::Int(42).is_identity(&Object::Int(42)).is_err());
+    }
+
+    // ---- task 22 集合类型测试 ----
+
+    #[test]
+    fn test_list_basic() {
+        let list = alloc_list(vec![Object::Int(1), Object::Int(2), Object::Int(3)]);
+        assert_eq!(list.list_get_index(0).unwrap(), Object::Int(1));
+        assert_eq!(list.list_get_index(-1).unwrap(), Object::Int(3));
+    }
+
+    #[test]
+    fn test_list_push_pop() {
+        let list = alloc_list(vec![]);
+        list.list_push(Object::Int(1)).unwrap();
+        list.list_push(Object::Int(2)).unwrap();
+        assert_eq!(list.list_pop().unwrap(), Object::Int(2));
+    }
+
+    #[test]
+    fn test_dict_insertion_order() {
+        let mut map = DictMap::new();
+        map.insert(alloc_string("b"), Object::Int(2));
+        map.insert(alloc_string("a"), Object::Int(1));
+        let dict = alloc_dict(map);
+        let Object::Ref(ptr) = dict else { panic!() };
+        let keys = unsafe { read_dict(ptr) }.keys();
+        assert_eq!(*keys[0], alloc_string("b"));
+        assert_eq!(*keys[1], alloc_string("a"));
+    }
+
+    #[test]
+    fn test_tuple_hashable() {
+        let tuple = alloc_tuple(vec![Object::Int(1), Object::Int(2)]);
+        let mut set = HashSet::new();
+        set.insert(tuple.clone());
+        assert!(set.contains(&tuple));
+    }
+
+    #[test]
+    fn test_set_uniqueness() {
+        let mut inner = HashSet::new();
+        inner.insert(Object::Int(1));
+        inner.insert(Object::Int(1));
+        inner.insert(Object::Int(2));
+        assert_eq!(inner.len(), 2);
+    }
+
+    #[test]
+    fn test_empty_collections_falsy() {
+        assert!(!alloc_list(vec![]).is_truthy());
+        assert!(!alloc_dict(DictMap::new()).is_truthy());
+        assert!(!alloc_tuple(vec![]).is_truthy());
+        assert!(alloc_list(vec![Object::Int(1)]).is_truthy());
+    }
+
+    #[test]
+    fn test_collection_display() {
+        let list = alloc_list(vec![Object::Int(1), Object::Int(2)]);
+        assert_eq!(format!("{}", list), "[1, 2]");
+
+        let tuple = alloc_tuple(vec![Object::Int(1)]);
+        assert_eq!(format!("{}", tuple), "(1,)");
+
+        let tuple2 = alloc_tuple(vec![Object::Int(1), Object::Int(2)]);
+        assert_eq!(format!("{}", tuple2), "(1, 2)");
+    }
+
+    #[test]
+    fn test_dict_equality_ignores_order() {
+        // 同内容不同插入序的 dict 应相等（与 Python 一致）
+        let mut m1 = DictMap::new();
+        m1.insert(alloc_string("a"), Object::Int(1));
+        m1.insert(alloc_string("b"), Object::Int(2));
+        let mut m2 = DictMap::new();
+        m2.insert(alloc_string("b"), Object::Int(2));
+        m2.insert(alloc_string("a"), Object::Int(1));
+        assert_eq!(alloc_dict(m1), alloc_dict(m2));
+    }
+
+    #[test]
+    fn test_dict_remove_returns_value_and_missing_raises() {
+        let mut m = DictMap::new();
+        m.insert(alloc_string("k"), Object::Int(9));
+        let d = alloc_dict(m);
+        assert_eq!(d.dict_remove(&alloc_string("k")).unwrap(), Object::Int(9));
+        assert!(d.dict_remove(&alloc_string("missing")).is_err()); // KeyError
+    }
+
+    #[test]
+    fn test_list_concat_and_repeat() {
+        let l1 = alloc_list(vec![Object::Int(1), Object::Int(2)]);
+        let l2 = alloc_list(vec![Object::Int(3)]);
+        assert_eq!(
+            l1.list_concat(&l2).unwrap(),
+            alloc_list(vec![Object::Int(1), Object::Int(2), Object::Int(3)])
+        );
+        assert_eq!(
+            l2.list_repeat(&Object::Int(3)).unwrap(),
+            alloc_list(vec![Object::Int(3), Object::Int(3), Object::Int(3)])
+        );
+    }
+
+    #[test]
+    fn test_dict_zero_float_key_collision() {
+        // -0.0 与 0.0 视为同一键（02-types.md:352）
+        let mut m = DictMap::new();
+        m.insert(Object::Float(0.0), Object::Int(1));
+        m.insert(Object::Float(-0.0), Object::Int(2));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get(&Object::Float(0.0)), Some(&Object::Int(2)));
+    }
+
+    fn iset(ints: &[i64]) -> Object {
+        let mut h = HashSet::new();
+        for i in ints {
+            h.insert(Object::Int(*i));
+        }
+        alloc_set(h)
+    }
+
+    #[test]
+    fn test_list_set_index_and_length() {
+        let l = alloc_list(vec![Object::Int(10), Object::Int(20)]);
+        assert_eq!(l.list_length().unwrap(), Object::Int(2));
+        assert_eq!(
+            l.list_set_index(-1, Object::Int(99)).unwrap(),
+            Object::Int(99)
+        );
+        assert_eq!(l.list_get_index(1).unwrap(), Object::Int(99));
+        assert!(l.list_set_index(5, Object::Int(0)).is_err()); // 越界
+    }
+
+    #[test]
+    fn test_list_contains_insert_remove() {
+        let l = alloc_list(vec![Object::Int(1), Object::Int(2)]);
+        assert_eq!(
+            l.list_contains(&Object::Int(2)).unwrap(),
+            Object::Bool(true)
+        );
+        assert_eq!(
+            l.list_contains(&Object::Int(9)).unwrap(),
+            Object::Bool(false)
+        );
+        l.list_insert(0, Object::Int(0)).unwrap();
+        assert_eq!(l.list_get_index(0).unwrap(), Object::Int(0));
+        l.list_remove(&Object::Int(2)).unwrap();
+        assert_eq!(l.list_length().unwrap(), Object::Int(2));
+        assert!(l.list_remove(&Object::Int(99)).is_err()); // ValueError
+    }
+
+    #[test]
+    fn test_list_errors() {
+        assert!(alloc_list(vec![]).list_pop().is_err()); // 空列表 pop
+        assert!(alloc_list(vec![Object::Int(1)]).list_get_index(5).is_err()); // 越界
+        assert!(alloc_list(vec![Object::Int(1)])
+            .list_repeat(&Object::Int(-1))
+            .is_err()); // 负数重复
+        assert!(Object::Int(1).list_push(Object::Nil).is_err()); // 非 list
+        assert!(alloc_list(vec![Object::Int(1)])
+            .list_concat(&Object::Int(2))
+            .is_err());
+    }
+
+    #[test]
+    fn test_tuple_ops() {
+        let t = alloc_tuple(vec![Object::Int(1), Object::Int(2), Object::Int(3)]);
+        assert_eq!(t.tuple_get_index(0).unwrap(), Object::Int(1));
+        assert_eq!(t.tuple_get_index(-1).unwrap(), Object::Int(3));
+        assert_eq!(t.tuple_length().unwrap(), Object::Int(3));
+        assert_eq!(
+            t.tuple_contains(&Object::Int(2)).unwrap(),
+            Object::Bool(true)
+        );
+        assert!(t.tuple_get_index(9).is_err()); // 越界
+        assert!(Object::Int(1).tuple_get_index(0).is_err()); // 非 tuple
+    }
+
+    #[test]
+    fn test_make_tuple() {
+        let t = Object::make_tuple(vec![Object::Int(1), Object::Int(2)]);
+        assert_eq!(t.tuple_length().unwrap(), Object::Int(2));
+        assert_eq!(format!("{}", t), "(1, 2)");
+    }
+
+    #[test]
+    fn test_dict_get_set_contains() {
+        let d = alloc_dict(DictMap::new());
+        d.dict_set(alloc_string("a"), Object::Int(1)).unwrap();
+        assert_eq!(d.dict_get(&alloc_string("a")).unwrap(), Object::Int(1));
+        assert_eq!(d.dict_get(&alloc_string("missing")).unwrap(), Object::Nil); // 不存在返回 nil
+        assert_eq!(
+            d.dict_contains(&alloc_string("a")).unwrap(),
+            Object::Bool(true)
+        );
+        assert_eq!(
+            d.dict_contains(&alloc_string("z")).unwrap(),
+            Object::Bool(false)
+        );
+        assert_eq!(d.dict_length().unwrap(), Object::Int(1));
+    }
+
+    #[test]
+    fn test_dict_keys_items_order() {
+        let mut m = DictMap::new();
+        m.insert(Object::Int(1), Object::Int(10));
+        m.insert(Object::Int(2), Object::Int(20));
+        let d = alloc_dict(m);
+        let keys = d.dict_keys().unwrap();
+        assert_eq!(keys.list_get_index(0).unwrap(), Object::Int(1));
+        let items = d.dict_items().unwrap();
+        // 每项为 tuple(key, value)，第二项的 value 为 20
+        assert_eq!(
+            items.list_get_index(1).unwrap().tuple_get_index(1).unwrap(),
+            Object::Int(20)
+        );
+        assert!(Object::Int(1).dict_get(&Object::Nil).is_err()); // 非 dict
+    }
+
+    #[test]
+    fn test_set_add_remove_contains() {
+        let s = alloc_set(HashSet::new());
+        s.set_add(Object::Int(1)).unwrap();
+        s.set_add(Object::Int(1)).unwrap(); // 去重
+        s.set_add(Object::Int(2)).unwrap();
+        assert_eq!(s.set_length().unwrap(), Object::Int(2));
+        assert_eq!(s.set_contains(&Object::Int(1)).unwrap(), Object::Bool(true));
+        assert_eq!(s.set_remove(&Object::Int(2)).unwrap(), Object::Int(2));
+        assert!(s.set_remove(&Object::Int(99)).is_err()); // KeyError
+        assert!(Object::Int(1).set_add(Object::Nil).is_err()); // 非 set
+    }
+
+    #[test]
+    fn test_set_algebra() {
+        let s1 = iset(&[1, 2, 3]);
+        let s2 = iset(&[2, 3, 4]);
+        assert_eq!(s1.set_union(&s2).unwrap(), iset(&[1, 2, 3, 4]));
+        assert_eq!(s1.set_intersection(&s2).unwrap(), iset(&[2, 3]));
+        assert_eq!(s1.set_difference(&s2).unwrap(), iset(&[1]));
+        assert_eq!(s1.set_symmetric_difference(&s2).unwrap(), iset(&[1, 4]));
+        assert!(s1.set_union(&Object::Int(1)).is_err()); // 非 set
+    }
+
+    #[test]
+    fn test_set_and_dict_display() {
+        let s = iset(&[3, 1, 2]);
+        assert_eq!(format!("{}", s), "{1, 2, 3}"); // 排序稳定
+        let mut m = DictMap::new();
+        m.insert(alloc_string("a"), Object::Int(1));
+        let d = alloc_dict(m);
+        assert_eq!(format!("{}", d), "{a: 1}");
+    }
+
+    #[test]
+    fn test_empty_and_nested_display() {
+        assert_eq!(format!("{}", alloc_list(vec![])), "[]");
+        assert_eq!(format!("{}", alloc_dict(DictMap::new())), "{}");
+        assert_eq!(format!("{}", alloc_tuple(vec![])), "()");
+        assert_eq!(format!("{}", alloc_set(HashSet::new())), "{}");
+        let inner = alloc_list(vec![Object::Int(2), Object::Int(3)]);
+        let outer = alloc_list(vec![Object::Int(1), inner]);
+        assert_eq!(format!("{}", outer), "[1, [2, 3]]");
+    }
+
+    #[test]
+    fn test_all_collections_truthiness() {
+        assert!(alloc_list(vec![Object::Int(1)]).is_truthy());
+        assert!(alloc_tuple(vec![Object::Int(1)]).is_truthy());
+        assert!(alloc_set(HashSet::from([Object::Int(1)])).is_truthy());
+        let mut m = DictMap::new();
+        m.insert(Object::Int(1), Object::Int(1));
+        assert!(alloc_dict(m).is_truthy());
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeError: unhashable type: 'list'")]
+    fn test_list_unhashable() {
+        use std::collections::hash_map::DefaultHasher;
+        alloc_list(vec![Object::Int(1)]).hash(&mut DefaultHasher::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeError: unhashable type: 'dict'")]
+    fn test_dict_unhashable() {
+        use std::collections::hash_map::DefaultHasher;
+        alloc_dict(DictMap::new()).hash(&mut DefaultHasher::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeError: unhashable type: 'set'")]
+    fn test_set_unhashable() {
+        use std::collections::hash_map::DefaultHasher;
+        alloc_set(HashSet::new()).hash(&mut DefaultHasher::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "TypeError: unhashable type: 'list'")]
+    fn test_tuple_with_unhashable_element() {
+        use std::collections::hash_map::DefaultHasher;
+        let t = alloc_tuple(vec![alloc_list(vec![Object::Int(1)])]);
+        t.hash(&mut DefaultHasher::new());
+    }
+
+    #[test]
+    fn test_object_eq_marker_for_hashmap() {
+        // impl Eq for Object 使 HashMap/HashSet 可用 Object 作键
+        let mut m: HashMap<Object, Object> = HashMap::new();
+        m.insert(Object::Int(1), alloc_string("one"));
+        m.insert(alloc_string("k"), Object::Int(9));
+        assert_eq!(m.get(&Object::Int(1)), Some(&alloc_string("one")));
+        assert_eq!(m.get(&alloc_string("k")), Some(&Object::Int(9)));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn test_dict_zero_float_collision_via_api() {
+        // 通过 Object API 验证 -0.0/0.0 同键（02-types.md:352）
+        let d = alloc_dict(DictMap::new());
+        d.dict_set(Object::Float(0.0), Object::Int(1)).unwrap();
+        d.dict_set(Object::Float(-0.0), Object::Int(2)).unwrap();
+        assert_eq!(d.dict_length().unwrap(), Object::Int(1));
+        assert_eq!(d.dict_get(&Object::Float(0.0)).unwrap(), Object::Int(2));
     }
 }

@@ -481,6 +481,8 @@ impl Compiler<'_> {
 }
 
 #[cfg(test)]
+// 3.14 是设计文档示例值（非 PI 近似），spec 指定保留。
+#[allow(clippy::approx_constant)]
 mod tests {
     use crate::ast::node::{AssignOp, BinaryOp, Expr, Literal, UnaryOp};
     use crate::compiler::{Compiler, OpCode};
