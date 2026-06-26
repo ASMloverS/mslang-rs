@@ -5,8 +5,10 @@ pub mod object;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::gc::GarbageCollector;
-use crate::vm::builtins::read_native_function;
-use crate::vm::object::{read_str, CmpOp, Object, TypeTag};
+use crate::vm::builtins::{read_native_function, to_iterator};
+use crate::vm::object::{
+    alloc_iterator, read_iterator, read_list, read_str, read_tuple, CmpOp, Object, TypeTag,
+};
 use frame::CallFrame;
 use std::collections::HashMap;
 
@@ -434,6 +436,83 @@ impl VM {
                         .ok_or_else(|| "continue underflow".to_string())?;
                 }
 
+                // ITERATOR（task 26）：弹出可迭代对象，压入其迭代器。
+                // 编译器在 for..in 头部发射（statement.rs:329）。
+                OpCode::Iterator => {
+                    let iterable = self.pop()?;
+                    let iter_state =
+                        to_iterator(&iterable).map_err(|e| format!("RuntimeError: {}", e))?;
+                    self.push(alloc_iterator(iter_state))?;
+                }
+
+                // FOR_ITER（task 26）：迭代器常驻栈顶；取下一值压入栈顶之上供
+                // StoreLocal/Unpack 消费。耗尽时 ip += offset 跳到循环出口
+                // （offset 为相对「操作数后一字节」的前向偏移，与 patch_jump 同口径）。
+                OpCode::ForIter => {
+                    let offset = self.read_u16()? as usize;
+                    // 先取出 next 值并结束 &mut stack 借用，再 push，避免借用冲突。
+                    let next_val: Option<Object> = {
+                        let top = self.stack.len() - 1;
+                        match &mut self.stack[top] {
+                            Object::Ref(ptr)
+                                if unsafe { (**ptr).type_tag } == TypeTag::ITERATOR as u8 =>
+                            {
+                                unsafe { read_iterator(*ptr) }.state.next()
+                            }
+                            _ => return Err("RuntimeError: not an iterator".to_string()),
+                        }
+                    };
+                    match next_val {
+                        Some(v) => self.push(v)?,
+                        None => {
+                            let frame =
+                                self.frames.last_mut().ok_or("no call frame".to_string())?;
+                            frame.ip += offset;
+                        }
+                    }
+                }
+
+                // UNPACK n（task 26）：弹出顶部集合（tuple/list），将其 n 个元素
+                // 压入栈，使元素 0 位于栈顶（编译器随后按序 StoreLocal 各循环变量）。
+                // for..in 双变量循环（statement.rs:336）依赖此指令。
+                OpCode::Unpack => {
+                    let n = self.read_byte()? as usize;
+                    let val = self.pop()?;
+                    let elements: Vec<Object> = match &val {
+                        Object::Ref(ptr) => {
+                            debug_assert!(!ptr.is_null(), "null Object::Ref");
+                            let tag = unsafe { (**ptr).type_tag };
+                            if tag == TypeTag::TUPLE as u8 {
+                                unsafe { read_tuple(*ptr) }.clone()
+                            } else if tag == TypeTag::LIST as u8 {
+                                unsafe { read_list(*ptr) }.clone()
+                            } else {
+                                return Err(format!(
+                                    "TypeError: cannot unpack non-iterable '{}' object",
+                                    val.type_name()
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "TypeError: cannot unpack non-iterable '{}' object",
+                                val.type_name()
+                            ))
+                        }
+                    };
+                    if elements.len() != n {
+                        return Err(format!(
+                            "ValueError: not enough values to unpack (expected {}, got {})",
+                            n,
+                            elements.len()
+                        ));
+                    }
+                    // 逆序压入，使 elements[0] 落在栈顶。
+                    for e in elements.into_iter().rev() {
+                        self.push(e)?;
+                    }
+                }
+
                 // CALL（task 25）：仅原生函数分支（TypeTag::FUNCTION）。
                 // 用户函数 / 闭包调用（TypeTag::CLOSURE）由 task 27 扩展。
                 OpCode::Call => {
@@ -506,7 +585,11 @@ mod tests {
     use crate::compiler::{Chunk, Compiler};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
-    use crate::vm::object::{alloc_list, alloc_string, alloc_tuple, Object};
+    use crate::vm::object::{
+        alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, DictMap,
+        IteratorState, Object,
+    };
+    use std::collections::HashSet;
 
     fn parse(source: &str) -> Program {
         let tokens = Lexer::new(source).tokenize_all().unwrap();
@@ -1493,9 +1576,28 @@ mod tests {
 
     #[test]
     fn test_builtin_range() {
-        // range(5) -> [0,1,2,3,4]
+        // range 现返回迭代器（task 26）；list(range(5)) 消费为 [0,1,2,3,4]。
+        // 合成嵌套调用字节码：CALL 约定要求 callee 在其参数之下，
+        // 故 list 先入栈，再求值其参数 range(5)。
+        let constants = vec![alloc_string("list"), alloc_string("range"), Object::Int(5)];
+        let code = vec![
+            OpCode::LoadGlobal as u8,
+            0x00,
+            0x00, // push list（外层 callee）
+            OpCode::LoadGlobal as u8,
+            0x00,
+            0x01, // push range（内层 callee）
+            OpCode::Constant as u8,
+            0x00,
+            0x02, // push Int(5)
+            OpCode::Call as u8,
+            0x01, // range(5) -> iterator（留在 list 之上）
+            OpCode::Call as u8,
+            0x01, // list(iter) -> [0,1,2,3,4]
+            OpCode::Halt as u8,
+        ];
         assert_eq!(
-            call_builtin("range", &[Object::Int(5)]).unwrap(),
+            run_chunk(code, constants).unwrap(),
             alloc_list(vec![
                 Object::Int(0),
                 Object::Int(1),
@@ -1546,5 +1648,232 @@ mod tests {
         assert!(compile_and_run("print(type(42))").is_ok());
         // max(1, 2, 3) → Ok
         assert!(compile_and_run("max(1, 2, 3)").is_ok());
+    }
+
+    // ---- task 26：ITERATOR / FOR_ITER / UNPACK VM 执行 ----
+    //
+    // 注：顶层=局部作用域的已知 bug（spec line 334-338，task 23 既有先例）使
+    // 真实编译的顶层 for..in 因 slot 1 越界而失败，故此处用合成 Chunk 直接
+    // 验证 opcode 语义（与 test_while_loop_iterations 同策略）；编译器侧由
+    // test_compiler_emits_for_in_opcodes 验证发射。
+
+    /// 构造「统计可迭代对象元素个数」的 for..in 循环字节码并运行，返回计数。
+    /// 覆盖 ITERATOR + FOR_ITER 对各可迭代类型的执行。
+    fn count_iterations(iterable: Object) -> Result<Object, String> {
+        // 布局：slot0=count；push iterable→ITERATOR；loop: FOR_ITER→Pop(弃值)→
+        // count+=1→JUMP_BACK；exit: Pop(iter)→LoadLocal 0→HALT。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00, // Int(0) → slot0
+            OpCode::Constant as u8,
+            0x00,
+            0x01,                   // iterable
+            OpCode::Iterator as u8, // → iter
+            OpCode::ForIter as u8,
+            0x00,
+            0x0C,              // → exit (offset 12)
+            OpCode::Pop as u8, // 弃迭代值
+            OpCode::LoadLocal as u8,
+            0x00,
+            OpCode::Constant as u8,
+            0x00,
+            0x02, // Int(1)
+            OpCode::Add as u8,
+            OpCode::StoreLocal as u8,
+            0x00,
+            OpCode::JumpBack as u8,
+            0x00,
+            0x0F,              // → loop_start (offset 15)
+            OpCode::Pop as u8, // exit: 弹出迭代器
+            OpCode::LoadLocal as u8,
+            0x00,
+            OpCode::Halt as u8,
+        ];
+        run_chunk(code, vec![Object::Int(0), iterable, Object::Int(1)])
+    }
+
+    #[test]
+    fn test_for_iter_counts_each_iterable_type() {
+        // list / string / dict(键) / set / range 迭代器 均可被 FOR_ITER 遍历
+        assert_eq!(
+            count_iterations(alloc_list(vec![
+                Object::Int(1),
+                Object::Int(2),
+                Object::Int(3),
+                Object::Int(4),
+                Object::Int(5)
+            ]))
+            .unwrap(),
+            Object::Int(5)
+        );
+        assert_eq!(
+            count_iterations(alloc_string("hello")).unwrap(),
+            Object::Int(5)
+        );
+        let mut m = DictMap::new();
+        m.insert(alloc_string("a"), Object::Int(1));
+        m.insert(alloc_string("b"), Object::Int(2));
+        assert_eq!(count_iterations(alloc_dict(m)).unwrap(), Object::Int(2));
+        let mut s = HashSet::new();
+        s.insert(Object::Int(1));
+        s.insert(Object::Int(2));
+        s.insert(Object::Int(3));
+        assert_eq!(count_iterations(alloc_set(s)).unwrap(), Object::Int(3));
+        // range 迭代器（Iterator 对迭代器克隆状态，见 to_iterator ITERATOR 分支）
+        let range_it = alloc_iterator(IteratorState::Range {
+            current: 0,
+            end: 5,
+            step: 1,
+        });
+        assert_eq!(count_iterations(range_it).unwrap(), Object::Int(5));
+        // 空可迭代对象 → 0 次
+        assert_eq!(
+            count_iterations(alloc_list(vec![])).unwrap(),
+            Object::Int(0)
+        );
+    }
+
+    #[test]
+    fn test_for_iter_sums_list_values() {
+        // 验证 FOR_ITER 推送的值确为各元素（累加 [0,1,2,3,4] = 10）。
+        // 布局：slot0=sum；push list→ITERATOR；loop: FOR_ITER→LoadLocal0→Add→
+        // StoreLocal0→JUMP_BACK；exit: Pop→LoadLocal0→HALT。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00, // Int(0) → slot0 (sum)
+            OpCode::Constant as u8,
+            0x00,
+            0x01, // list [0,1,2,3,4]
+            OpCode::Iterator as u8,
+            OpCode::ForIter as u8,
+            0x00,
+            0x08, // → exit (offset 8)
+            OpCode::LoadLocal as u8,
+            0x00,              // push sum
+            OpCode::Add as u8, // value + sum
+            OpCode::StoreLocal as u8,
+            0x00, // sum = value + sum
+            OpCode::JumpBack as u8,
+            0x00,
+            0x0B,              // → loop_start (offset 11)
+            OpCode::Pop as u8, // exit: 弹出迭代器
+            OpCode::LoadLocal as u8,
+            0x00,
+            OpCode::Halt as u8,
+        ];
+        let list = alloc_list(vec![
+            Object::Int(0),
+            Object::Int(1),
+            Object::Int(2),
+            Object::Int(3),
+            Object::Int(4),
+        ]);
+        assert_eq!(
+            run_chunk(code, vec![Object::Int(0), list]).unwrap(),
+            Object::Int(10)
+        );
+    }
+
+    #[test]
+    fn test_unpack_opcode_isolated() {
+        // UNPACK 2：tuple(5,7) → 逆序压入，元素 0 落在栈顶 → HALT 返回 5。
+        let tuple = alloc_tuple(vec![Object::Int(5), Object::Int(7)]);
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Unpack as u8,
+            0x02,
+            OpCode::Halt as u8,
+        ];
+        assert_eq!(run_chunk(code, vec![tuple]).unwrap(), Object::Int(5));
+        // 个数不匹配 → ValueError
+        let tuple2 = alloc_tuple(vec![Object::Int(1), Object::Int(2)]);
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Unpack as u8,
+            0x03, // 期望 3，实际 2
+            OpCode::Halt as u8,
+        ];
+        let r = run_chunk(code, vec![tuple2]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("ValueError"));
+    }
+
+    #[test]
+    fn test_for_iter_with_unpack_sums_first_elements() {
+        // 端到端模拟双变量 for..in：遍历 [(1,10),(2,20),(3,30)]，累加每对首元素 = 6。
+        // 验证 FOR_ITER + UNPACK + 多轮迭代协同。布局：slot0=sum；push list→ITERATOR；
+        // loop: FOR_ITER→UNPACK 2→LoadLocal0→Add→StoreLocal0→Pop(弃次元素)→JUMP_BACK；
+        // exit: Pop→LoadLocal0→HALT。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00, // Int(0) → slot0
+            OpCode::Constant as u8,
+            0x00,
+            0x01, // list of tuples
+            OpCode::Iterator as u8,
+            OpCode::ForIter as u8,
+            0x00,
+            0x0B, // → exit (offset 11)
+            OpCode::Unpack as u8,
+            0x02, // → [iter, second, first]
+            OpCode::LoadLocal as u8,
+            0x00,              // push sum
+            OpCode::Add as u8, // first + sum
+            OpCode::StoreLocal as u8,
+            0x00,              // sum = first + sum
+            OpCode::Pop as u8, // 弃 second
+            OpCode::JumpBack as u8,
+            0x00,
+            0x0E,              // → loop_start (offset 14)
+            OpCode::Pop as u8, // exit: 弹出迭代器
+            OpCode::LoadLocal as u8,
+            0x00,
+            OpCode::Halt as u8,
+        ];
+        let tuples = alloc_list(vec![
+            alloc_tuple(vec![Object::Int(1), Object::Int(10)]),
+            alloc_tuple(vec![Object::Int(2), Object::Int(20)]),
+            alloc_tuple(vec![Object::Int(3), Object::Int(30)]),
+        ]);
+        assert_eq!(
+            run_chunk(code, vec![Object::Int(0), tuples]).unwrap(),
+            Object::Int(6)
+        );
+    }
+
+    #[test]
+    fn test_iterator_opcode_not_iterable_errors() {
+        // ITERATOR 对不可迭代对象（int）→ RuntimeError（TypeError 包装）
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Iterator as u8,
+            OpCode::Halt as u8,
+        ];
+        let r = run_chunk(code, vec![Object::Int(1)]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not iterable"));
+    }
+
+    #[test]
+    fn test_compiler_emits_for_in_opcodes() {
+        // 证明真实编译器对 for..in 发射 ITERATOR + FOR_ITER（编译器侧已实现，
+        // task 19）；本 task 在 VM 侧补齐执行。双变量额外发 UNPACK。
+        let prog = parse("for i in [1] {\n}");
+        let chunk = Compiler::new().compile(&prog).unwrap();
+        assert!(chunk.code.contains(&(OpCode::Iterator as u8)));
+        assert!(chunk.code.contains(&(OpCode::ForIter as u8)));
+
+        let prog2 = parse("for a, b in [(1, 2)] {\n}");
+        let chunk2 = Compiler::new().compile(&prog2).unwrap();
+        assert!(chunk2.code.contains(&(OpCode::Unpack as u8)));
     }
 }

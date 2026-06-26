@@ -315,6 +315,164 @@ pub unsafe fn read_set<'a>(ptr: *mut MsObjHeader) -> &'a mut HashSet<Object> {
 }
 
 // ---------------------------------------------------------------------------
+// Iterator 堆对象（task 26）
+// ---------------------------------------------------------------------------
+
+/// 迭代器内部状态。每种可迭代来源对应一个变体。
+///
+/// `ListIter`/`DictKeys`/`Reversed`/`Enumerate`/`Zip` 持有 `Vec<Object>`，
+/// 其中可能含 `Object::Ref` 堆指针。**GC 前瞻（task 52 依赖）**：task 52 GC 上线时
+/// **必须**为 `TypeTag::ITERATOR` 注册 trace 函数，遍历 `IteratorState` 内全部
+/// `Object::Ref`（见 14-gc.md:124）；否则被引用对象将被误回收导致悬垂指针。
+/// 本任务 MVP 采用 `Box::into_raw` 泄漏分配，task 52 前 GC 不运行，故当前安全。
+#[derive(Clone, Debug)]
+pub enum IteratorState {
+    Range {
+        current: i64,
+        end: i64,
+        step: i64,
+    },
+    ListIter {
+        items: Vec<Object>,
+        index: usize,
+    },
+    StringIter {
+        chars: Vec<char>,
+        index: usize,
+    },
+    DictKeys {
+        keys: Vec<Object>,
+        index: usize,
+    },
+    Enumerate {
+        inner: Box<IteratorState>,
+        index: usize,
+    },
+    Zip {
+        iterators: Vec<IteratorState>,
+    },
+    Reversed {
+        items: Vec<Object>,
+        index: usize,
+    },
+}
+
+impl IteratorState {
+    /// 推进迭代器，返回下一个值或 `None`（耗尽）。
+    ///
+    /// 方法名 `next` 为规格（26-builtins-iterators.md「IteratorState next() 协议」）
+    /// 钦定；不实现 `std::iter::Iterator` 以免偏离权威规格 API，故放行该 lint。
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<Object> {
+        match self {
+            IteratorState::Range { current, end, step } => {
+                if (*step > 0 && *current < *end) || (*step < 0 && *current > *end) {
+                    let val = Object::Int(*current);
+                    // i64 溢出边界：极端区间 debug panic / release 回绕（Python range 为
+                    // 任意精度）。MVP 接受 i64 限制（见 26-builtins-iterators.md 注）。
+                    *current += *step;
+                    Some(val)
+                } else {
+                    None
+                }
+            }
+
+            IteratorState::ListIter { items, index } => {
+                if *index < items.len() {
+                    let val = items[*index].clone();
+                    *index += 1;
+                    Some(val)
+                } else {
+                    None
+                }
+            }
+
+            IteratorState::StringIter { chars, index } => {
+                if *index < chars.len() {
+                    let ch = chars[*index];
+                    *index += 1;
+                    Some(alloc_string(&ch.to_string()))
+                } else {
+                    None
+                }
+            }
+
+            IteratorState::DictKeys { keys, index } => {
+                if *index < keys.len() {
+                    let val = keys[*index].clone();
+                    *index += 1;
+                    Some(val)
+                } else {
+                    None
+                }
+            }
+
+            IteratorState::Enumerate { inner, index } => match inner.next() {
+                Some(val) => {
+                    let tuple = alloc_tuple(vec![Object::Int(*index as i64), val]);
+                    *index += 1;
+                    Some(tuple)
+                }
+                None => None,
+            },
+
+            IteratorState::Zip { iterators } => {
+                let mut values = Vec::new();
+                for it in iterators.iter_mut() {
+                    match it.next() {
+                        Some(val) => values.push(val),
+                        None => return None,
+                    }
+                }
+                Some(alloc_tuple(values))
+            }
+
+            IteratorState::Reversed { items, index } => {
+                if *index > 0 {
+                    *index -= 1;
+                    Some(items[*index].clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// 堆上 Iterator 对象。引用 [20-object-system-basic](../../docs/mslang/tasks/20-object-system-basic.md)
+/// 的 `MsObjHeader`。type_tag 为 `TypeTag::ITERATOR`。
+#[repr(C)]
+pub struct MsIterator {
+    pub header: MsObjHeader,
+    pub state: IteratorState,
+}
+
+/// 分配 Iterator 堆对象，返回 Object::Ref。
+/// MVP：Box 泄漏分配；task 52-gc 接入真实回收并注册 ITERATOR trace 函数。
+pub fn alloc_iterator(state: IteratorState) -> Object {
+    let obj = Box::new(MsIterator {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::ITERATOR as u8,
+            size: std::mem::size_of::<MsIterator>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        state,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsIterator 的可变状态引用。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_iterator` 分配的有效 `MsIterator`。
+/// 生命周期由调用方约束（`'a`），**不得**用 `'static`——遵循 task 20 read_* 约定。
+pub unsafe fn read_iterator<'a>(ptr: *mut MsObjHeader) -> &'a mut MsIterator {
+    &mut *(ptr as *mut MsIterator)
+}
+
+// ---------------------------------------------------------------------------
 // Object 行为
 // ---------------------------------------------------------------------------
 

@@ -12,10 +12,12 @@
 #![allow(clippy::get_first)]
 
 use super::object::{
-    alloc_dict, alloc_list, alloc_set, alloc_string, alloc_tuple, read_dict, read_list, read_set,
-    read_str, read_tuple, CmpOp, MsObjHeader, Object, TypeTag,
+    alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, read_dict,
+    read_iterator, read_list, read_set, read_str, read_tuple, CmpOp, DictMap, IteratorState,
+    MsObjHeader, Object, TypeTag,
 };
 use super::VM;
+use std::collections::HashSet;
 
 /// 原生函数调用签名。
 pub type NativeFn = fn(&mut VM, &[Object]) -> Result<Object, String>;
@@ -95,10 +97,10 @@ impl VM {
             ("float", 1, builtin_float),
             ("str", 1, builtin_str),
             ("bool", 1, builtin_bool),
-            ("list", 1, builtin_list),
-            ("tuple", 1, builtin_tuple),
-            ("set", 1, builtin_set),
-            ("dict", 1, builtin_dict),
+            ("list", usize::MAX, builtin_list),
+            ("tuple", usize::MAX, builtin_tuple),
+            ("set", usize::MAX, builtin_set),
+            ("dict", usize::MAX, builtin_dict),
             // 数学
             ("abs", 1, builtin_abs),
             ("max", usize::MAX, builtin_max),
@@ -115,7 +117,17 @@ impl VM {
             ("id", 1, builtin_id),
             ("hash", 1, builtin_hash),
             ("copy", 1, builtin_copy),
+            // 迭代器与容器函数（task 26）：range 覆盖 task 25 的 List 版本为迭代器；
+            // sorted/reversed/enumerate/zip/map/filter/any/all 为新增。
             ("range", usize::MAX, builtin_range),
+            ("sorted", 1, builtin_sorted),
+            ("reversed", 1, builtin_reversed),
+            ("enumerate", 1, builtin_enumerate),
+            ("zip", usize::MAX, builtin_zip),
+            ("map", 2, builtin_map),
+            ("filter", 2, builtin_filter),
+            ("any", 1, builtin_any),
+            ("all", 1, builtin_all),
             // 占位：依赖后续 task，MVP 返回 Err（见各自实现）
             ("open", usize::MAX, builtin_open), // task 46（stdlib-io）
             ("deepcopy", 1, builtin_deepcopy),  // task 22 扩展 / task 26
@@ -215,101 +227,128 @@ fn builtin_bool(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     Ok(arg.to_bool())
 }
 
-// 集合转换。迭代器统一协议在 task 26/32；此处对已实现的集合类型做直接转换。
-fn builtin_list(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let arg = args.get(0).ok_or("list() requires 1 argument")?;
-    match arg {
-        Object::Ref(ptr) => {
-            debug_assert!(!ptr.is_null(), "null Object::Ref");
-            let tag = unsafe { (**ptr).type_tag };
-            if tag == TypeTag::STRING as u8 {
-                // list("abc") -> ["a","b","c"]
-                let chars: Vec<Object> = unsafe { read_str(*ptr) }
-                    .chars()
-                    .map(|c| alloc_string(c.to_string().as_str()))
-                    .collect();
-                Ok(alloc_list(chars))
-            } else if tag == TypeTag::LIST as u8 {
-                Ok(alloc_list(unsafe { read_list(*ptr) }.clone()))
-            } else if tag == TypeTag::TUPLE as u8 {
-                Ok(alloc_list(unsafe { read_tuple(*ptr) }.clone()))
-            } else if tag == TypeTag::SET as u8 {
-                Ok(alloc_list(
-                    unsafe { read_set(*ptr) }.iter().cloned().collect(),
-                ))
-            } else {
-                Err(format!(
-                    "TypeError: '{}' object is not iterable",
-                    arg.type_name()
-                ))
-            }
-        }
-        _ => Err(format!(
-            "TypeError: '{}' object is not iterable",
-            arg.type_name()
-        )),
-    }
-}
+// ---------------------------------------------------------------------------
+// 迭代器协议（task 26）
+// ---------------------------------------------------------------------------
 
-fn builtin_tuple(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let arg = args.get(0).ok_or("tuple() requires 1 argument")?;
-    match arg {
+/// 将任意可迭代对象转为 `IteratorState`。
+///
+/// 支持 LIST / TUPLE / STRING / DICT（键） / SET / ITERATOR（克隆状态）。
+/// 性能说明：对 list/tuple/dict/set 做整表克隆入 `IteratorState`（大集合下内存翻倍）。
+/// MVP 接受此开销以换取实现简洁与 `FOR_ITER` 无别名安全。
+pub(crate) fn to_iterator(obj: &Object) -> Result<IteratorState, String> {
+    match obj {
         Object::Ref(ptr) => {
             debug_assert!(!ptr.is_null(), "null Object::Ref");
+            // SAFETY: 调用方保证 Ref 指针指向有效 MsObjHeader。
             let tag = unsafe { (**ptr).type_tag };
             if tag == TypeTag::LIST as u8 {
-                Ok(alloc_tuple(unsafe { read_list(*ptr) }.clone()))
+                Ok(IteratorState::ListIter {
+                    items: unsafe { read_list(*ptr) }.clone(),
+                    index: 0,
+                })
             } else if tag == TypeTag::TUPLE as u8 {
-                Ok(alloc_tuple(unsafe { read_tuple(*ptr) }.clone()))
+                Ok(IteratorState::ListIter {
+                    items: unsafe { read_tuple(*ptr) }.clone(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::STRING as u8 {
+                Ok(IteratorState::StringIter {
+                    chars: unsafe { read_str(*ptr) }.chars().collect(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::DICT as u8 {
+                Ok(IteratorState::DictKeys {
+                    keys: unsafe { read_dict(*ptr) }
+                        .keys()
+                        .into_iter()
+                        .cloned()
+                        .collect(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::SET as u8 {
+                Ok(IteratorState::ListIter {
+                    items: unsafe { read_set(*ptr) }.iter().cloned().collect(),
+                    index: 0,
+                })
+            } else if tag == TypeTag::ITERATOR as u8 {
+                Ok(unsafe { read_iterator(*ptr) }.state.clone())
             } else {
                 Err(format!(
                     "TypeError: '{}' object is not iterable",
-                    arg.type_name()
+                    obj.type_name()
                 ))
             }
         }
         _ => Err(format!(
             "TypeError: '{}' object is not iterable",
-            arg.type_name()
+            obj.type_name()
         )),
     }
 }
 
+/// 将任意可迭代对象消费为 `Vec<Object>`（DRY：供 list/tuple/set 构造复用）。
+fn collect_iter(arg: &Object) -> Result<Vec<Object>, String> {
+    let mut out = Vec::new();
+    let mut it = to_iterator(arg)?;
+    while let Some(v) = it.next() {
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// `list()` 空列表；`list(iterable)` 从可迭代对象构造。
+/// 覆盖 task 25 同名实现：改可变参数（0 或 1），统一走 `to_iterator`（含 SET）。
+fn builtin_list(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.is_empty() {
+        return Ok(alloc_list(Vec::new()));
+    }
+    if args.len() > 1 {
+        return Err("list() takes 0 or 1 arguments".to_string());
+    }
+    Ok(alloc_list(collect_iter(&args[0])?))
+}
+
+/// `tuple()` 空元组；`tuple(iterable)` 从可迭代对象构造。
+fn builtin_tuple(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.is_empty() {
+        return Ok(alloc_tuple(Vec::new()));
+    }
+    if args.len() > 1 {
+        return Err("tuple() takes 0 or 1 arguments".to_string());
+    }
+    Ok(alloc_tuple(collect_iter(&args[0])?))
+}
+
+/// `set()` 空集合；`set(iterable)` 从可迭代对象构造。
 fn builtin_set(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let arg = args.get(0).ok_or("set() requires 1 argument")?;
-    match arg {
-        Object::Ref(ptr) => {
-            debug_assert!(!ptr.is_null(), "null Object::Ref");
-            let tag = unsafe { (**ptr).type_tag };
-            let items: Vec<Object> = if tag == TypeTag::LIST as u8 {
-                unsafe { read_list(*ptr) }.clone()
-            } else if tag == TypeTag::TUPLE as u8 {
-                unsafe { read_tuple(*ptr) }.clone()
-            } else {
-                return Err(format!(
-                    "TypeError: '{}' object is not iterable",
-                    arg.type_name()
-                ));
-            };
-            Ok(alloc_set(items.into_iter().collect()))
-        }
-        _ => Err(format!(
-            "TypeError: '{}' object is not iterable",
-            arg.type_name()
-        )),
+    if args.is_empty() {
+        return Ok(alloc_set(HashSet::new()));
     }
+    if args.len() > 1 {
+        return Err("set() takes 0 or 1 arguments".to_string());
+    }
+    let items = collect_iter(&args[0])?;
+    Ok(alloc_set(items.into_iter().collect()))
 }
 
+/// `dict()` 空字典；`dict(d)` dict 拷贝。
+/// 从 (k, v) 对可迭代对象构造（dict([(k,v),...])）依赖元组解包迭代，随 task 30
+/// （多返回值与元组解包）完善，本 MVP 暂不支持并显式报错。
 fn builtin_dict(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let arg = args.get(0).ok_or("dict() requires 1 argument")?;
-    match arg {
+    if args.is_empty() {
+        return Ok(alloc_dict(DictMap::new()));
+    }
+    if args.len() > 1 {
+        return Err("dict() takes 0 or 1 arguments".to_string());
+    }
+    match &args[0] {
         Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
             Ok(alloc_dict(unsafe { read_dict(*ptr) }.clone()))
         }
-        // 从二元 tuple 列表构造 dict 的完整支持依赖 task 26 迭代器协议；MVP 仅支持 dict→dict 拷贝。
         _ => Err(format!(
             "TypeError: cannot convert '{}' to dict (MVP: only dict supported)",
-            arg.type_name()
+            args[0].type_name()
         )),
     }
 }
@@ -582,35 +621,167 @@ fn builtin_deepcopy(_vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
     Err("not yet implemented: deepcopy() (task 22 extension / task 26)".to_string())
 }
 
-/// range(start, stop?, step?) -> List。MVP 返回 List；task 32 升级为惰性迭代器。
+/// range(end) / range(start, end) / range(start, end, step) -> 迭代器。
+/// task 26 升级为迭代器（覆盖 task 25 的 List 版本，符合 10-builtins.md:97-99）。
+/// require_int 复用 task 25 已有实现，不重复定义。
 fn builtin_range(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let (start, stop, step) = match args.len() {
+    let (start, end, step) = match args.len() {
         1 => (0, require_int(&args[0])?, 1),
         2 => (require_int(&args[0])?, require_int(&args[1])?, 1),
-        3 => (
-            require_int(&args[0])?,
-            require_int(&args[1])?,
-            require_int(&args[2])?,
-        ),
+        3 => {
+            let step = require_int(&args[2])?;
+            if step == 0 {
+                return Err("ValueError: range() step must not be zero".to_string());
+            }
+            (require_int(&args[0])?, require_int(&args[1])?, step)
+        }
         _ => return Err("range() requires 1-3 arguments".to_string()),
     };
-    if step == 0 {
-        return Err("ValueError: range() step argument must not be zero".to_string());
+    Ok(alloc_iterator(IteratorState::Range {
+        current: start,
+        end,
+        step,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// 迭代器函数（task 26）
+// ---------------------------------------------------------------------------
+
+/// sorted(iterable) -> 新列表（升序）。比较失败须上抛 TypeError（不静默错序）。
+fn builtin_sorted(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("sorted() requires 1 argument")?;
+    // 统一走 to_iterator，接受任意可迭代对象（list/tuple/string/set/dict/range/iterator）。
+    let mut items: Vec<Object> = Vec::new();
+    let mut iter = to_iterator(arg)?;
+    while let Some(v) = iter.next() {
+        items.push(v);
     }
-    let mut items = Vec::new();
-    let mut i = start;
-    if step > 0 {
-        while i < stop {
-            items.push(Object::Int(i));
-            i += step;
+    // CmpOp 与 OpCode 解耦（task 21，object.rs）。比较失败须上抛 TypeError。
+    let mut err: Option<String> = None;
+    items.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
         }
-    } else {
-        while i > stop {
-            items.push(Object::Int(i));
-            i += step;
+        match a.compare(b, CmpOp::Less) {
+            Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
+            Ok(_) => match a.compare(b, CmpOp::Greater) {
+                Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
+                Ok(_) => std::cmp::Ordering::Equal,
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            },
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
         }
+    });
+    if let Some(e) = err {
+        return Err(e);
     }
     Ok(alloc_list(items))
+}
+
+/// reversed(iterable) -> 反转迭代器。仅支持有确定序的 list/tuple/string。
+fn builtin_reversed(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("reversed() requires 1 argument")?;
+    let items = match arg {
+        Object::Ref(ptr) => {
+            debug_assert!(!ptr.is_null(), "null Object::Ref");
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                unsafe { read_list(*ptr) }.clone()
+            } else if tag == TypeTag::TUPLE as u8 {
+                unsafe { read_tuple(*ptr) }.clone()
+            } else if tag == TypeTag::STRING as u8 {
+                // reversed("abc") -> ["c","b","a"]（与 Python 对等）
+                unsafe { read_str(*ptr) }
+                    .chars()
+                    .map(|c| alloc_string(&c.to_string()))
+                    .collect()
+            } else {
+                return Err(format!(
+                    "TypeError: '{}' object is not reversible",
+                    arg.type_name()
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "TypeError: '{}' object is not reversible",
+                arg.type_name()
+            ))
+        }
+    };
+    let len = items.len();
+    Ok(alloc_iterator(IteratorState::Reversed {
+        items,
+        index: len,
+    }))
+}
+
+/// enumerate(iterable) -> 产生 (index, value) 对的迭代器。
+fn builtin_enumerate(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("enumerate() requires 1 argument")?;
+    let inner = to_iterator(arg)?;
+    Ok(alloc_iterator(IteratorState::Enumerate {
+        inner: Box::new(inner),
+        index: 0,
+    }))
+}
+
+/// zip(*iterables) -> 并行迭代，产生各迭代器当前值组成的元组。
+fn builtin_zip(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.is_empty() {
+        return Err("zip() requires at least 1 argument".to_string());
+    }
+    let iterators: Result<Vec<IteratorState>, String> = args.iter().map(to_iterator).collect();
+    Ok(alloc_iterator(IteratorState::Zip {
+        iterators: iterators?,
+    }))
+}
+
+/// map(fn, iterable) -> 列表。急切求值（10-builtins.md:104-105）。
+/// 依赖用户函数调用（task 27/28），本 task 以存根返回 Err。
+fn builtin_map(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let _fn_arg = args.get(0).ok_or("map() requires 2 arguments")?;
+    let _iterable = args.get(1).ok_or("map() requires 2 arguments")?;
+    Err("map() requires function call support (Phase 3)".to_string())
+}
+
+/// filter(fn, iterable) -> 列表。急切求值（10-builtins.md:104-105）。
+/// 依赖用户函数调用（task 27/28），本 task 以存根返回 Err。
+fn builtin_filter(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let _fn_arg = args.get(0).ok_or("filter() requires 2 arguments")?;
+    let _iterable = args.get(1).ok_or("filter() requires 2 arguments")?;
+    Err("filter() requires function call support (Phase 3)".to_string())
+}
+
+/// any(iterable) -> 任一为 truthy 即 true。
+fn builtin_any(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("any() requires 1 argument")?;
+    let mut iter = to_iterator(arg)?;
+    while let Some(val) = iter.next() {
+        if val.is_truthy() {
+            return Ok(Object::Bool(true));
+        }
+    }
+    Ok(Object::Bool(false))
+}
+
+/// all(iterable) -> 全部为 truthy 才 true。
+fn builtin_all(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let arg = args.get(0).ok_or("all() requires 1 argument")?;
+    let mut iter = to_iterator(arg)?;
+    while let Some(val) = iter.next() {
+        if !val.is_truthy() {
+            return Ok(Object::Bool(false));
+        }
+    }
+    Ok(Object::Bool(true))
 }
 
 /// 辅助：要求整型参数，返回 i64。
@@ -826,9 +997,12 @@ mod tests {
     #[test]
     fn test_range() {
         let mut v = vm();
+        // range 现返回迭代器（task 26，覆盖 task 25 的 List 版本）；
+        // 经 collect_iter 消费为 Vec 后比对。
         // range(5) -> [0,1,2,3,4]
+        let it = builtin_range(&mut v, &[Object::Int(5)]).unwrap();
         assert_eq!(
-            builtin_range(&mut v, &[Object::Int(5)]).unwrap(),
+            alloc_list(collect_iter(&it).unwrap()),
             alloc_list(vec![
                 Object::Int(0),
                 Object::Int(1),
@@ -838,13 +1012,15 @@ mod tests {
             ])
         );
         // range(2, 8, 2) -> [2,4,6]
+        let it = builtin_range(&mut v, &[Object::Int(2), Object::Int(8), Object::Int(2)]).unwrap();
         assert_eq!(
-            builtin_range(&mut v, &[Object::Int(2), Object::Int(8), Object::Int(2)]).unwrap(),
+            alloc_list(collect_iter(&it).unwrap()),
             alloc_list(vec![Object::Int(2), Object::Int(4), Object::Int(6)])
         );
         // range(3, 0, -1) -> [3,2,1]
+        let it = builtin_range(&mut v, &[Object::Int(3), Object::Int(0), Object::Int(-1)]).unwrap();
         assert_eq!(
-            builtin_range(&mut v, &[Object::Int(3), Object::Int(0), Object::Int(-1)]).unwrap(),
+            alloc_list(collect_iter(&it).unwrap()),
             alloc_list(vec![Object::Int(3), Object::Int(2), Object::Int(1)])
         );
         // step == 0 -> ValueError
@@ -903,5 +1079,323 @@ mod tests {
             assert_eq!((*ptr).type_tag, TypeTag::FUNCTION as u8);
             assert_eq!(read_native_function(ptr).name(), "print");
         }
+    }
+
+    // ---- task 26：迭代器与容器函数 ----
+
+    /// 消费迭代器 Object 为 Vec（测试辅助）。
+    fn drain(obj: &Object) -> Vec<Object> {
+        collect_iter(obj).unwrap()
+    }
+
+    #[test]
+    fn test_range_basic() {
+        let mut iter = IteratorState::Range {
+            current: 0,
+            end: 5,
+            step: 1,
+        };
+        let values: Vec<Object> = std::iter::from_fn(|| iter.next()).collect();
+        assert_eq!(values.len(), 5);
+        assert_eq!(values[0], Object::Int(0));
+        assert_eq!(values[4], Object::Int(4));
+    }
+
+    #[test]
+    fn test_range_with_step() {
+        let mut iter = IteratorState::Range {
+            current: 0,
+            end: 10,
+            step: 2,
+        };
+        let values: Vec<Object> = std::iter::from_fn(|| iter.next()).collect();
+        assert_eq!(
+            values,
+            vec![
+                Object::Int(0),
+                Object::Int(2),
+                Object::Int(4),
+                Object::Int(6),
+                Object::Int(8),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_range_negative_step() {
+        let mut iter = IteratorState::Range {
+            current: 5,
+            end: 0,
+            step: -1,
+        };
+        let values: Vec<Object> = std::iter::from_fn(|| iter.next()).collect();
+        assert_eq!(values.len(), 5);
+        assert_eq!(values[0], Object::Int(5));
+        assert_eq!(values[4], Object::Int(1));
+    }
+
+    #[test]
+    fn test_enumerate() {
+        let inner = IteratorState::ListIter {
+            items: vec![alloc_string("a"), alloc_string("b")],
+            index: 0,
+        };
+        let mut iter = IteratorState::Enumerate {
+            inner: Box::new(inner),
+            index: 0,
+        };
+        let first = iter.next().unwrap();
+        assert_eq!(first, alloc_tuple(vec![Object::Int(0), alloc_string("a"),]));
+        let second = iter.next().unwrap();
+        assert_eq!(
+            second,
+            alloc_tuple(vec![Object::Int(1), alloc_string("b"),])
+        );
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_zip() {
+        let iter = IteratorState::Zip {
+            iterators: vec![
+                IteratorState::ListIter {
+                    items: vec![Object::Int(1), Object::Int(2)],
+                    index: 0,
+                },
+                IteratorState::ListIter {
+                    items: vec![alloc_string("x"), alloc_string("y")],
+                    index: 0,
+                },
+            ],
+        };
+        let mut iter = iter;
+        let first = iter.next().unwrap();
+        assert_eq!(first, alloc_tuple(vec![Object::Int(1), alloc_string("x"),]));
+        let second = iter.next().unwrap();
+        assert_eq!(
+            second,
+            alloc_tuple(vec![Object::Int(2), alloc_string("y"),])
+        );
+        // 长度对齐到最短：第二个迭代器耗尽后整体停止
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_any_all() {
+        let mut v = vm();
+
+        let result = builtin_any(
+            &mut v,
+            &[alloc_list(vec![Object::Bool(false), Object::Bool(true)])],
+        )
+        .unwrap();
+        assert_eq!(result, Object::Bool(true));
+
+        let result = builtin_all(
+            &mut v,
+            &[alloc_list(vec![Object::Bool(true), Object::Bool(false)])],
+        )
+        .unwrap();
+        assert_eq!(result, Object::Bool(false));
+
+        // 空集合：any -> false，all -> true（与 Python 一致）
+        assert_eq!(
+            builtin_any(&mut v, &[alloc_list(vec![])]).unwrap(),
+            Object::Bool(false)
+        );
+        assert_eq!(
+            builtin_all(&mut v, &[alloc_list(vec![])]).unwrap(),
+            Object::Bool(true)
+        );
+    }
+
+    #[test]
+    fn test_sorted() {
+        let mut v = vm();
+        // sorted([3,1,2]) -> [1,2,3]
+        assert_eq!(
+            builtin_sorted(
+                &mut v,
+                &[alloc_list(vec![
+                    Object::Int(3),
+                    Object::Int(1),
+                    Object::Int(2)
+                ])]
+            )
+            .unwrap(),
+            alloc_list(vec![Object::Int(1), Object::Int(2), Object::Int(3)])
+        );
+        // 接受任意可迭代对象：sorted(range(5)) 倒序经 reversed 验证；此处直接排序 tuple
+        assert_eq!(
+            builtin_sorted(&mut v, &[alloc_tuple(vec![Object::Int(2), Object::Int(1)])]).unwrap(),
+            alloc_list(vec![Object::Int(1), Object::Int(2)])
+        );
+        // 不可比较元素 -> TypeError（不静默错序）
+        let r = builtin_sorted(&mut v, &[alloc_list(vec![s("a"), Object::Int(1)])]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("TypeError"));
+    }
+
+    #[test]
+    fn test_reversed() {
+        let mut v = vm();
+        // reversed([1,2,3]) -> 迭代器，消费得 [3,2,1]
+        let it = builtin_reversed(
+            &mut v,
+            &[alloc_list(vec![
+                Object::Int(1),
+                Object::Int(2),
+                Object::Int(3),
+            ])],
+        )
+        .unwrap();
+        assert_eq!(
+            alloc_list(drain(&it)),
+            alloc_list(vec![Object::Int(3), Object::Int(2), Object::Int(1)])
+        );
+        // reversed("abc") -> ["c","b","a"]
+        let it = builtin_reversed(&mut v, &[s("abc")]).unwrap();
+        assert_eq!(
+            alloc_list(drain(&it)),
+            alloc_list(vec![s("c"), s("b"), s("a")])
+        );
+        // 不可逆类型 -> TypeError
+        assert!(builtin_reversed(&mut v, &[Object::Int(1)]).is_err());
+    }
+
+    #[test]
+    fn test_enumerate_builtin() {
+        let mut v = vm();
+        let it = builtin_enumerate(&mut v, &[alloc_list(vec![s("a"), s("b")])]).unwrap();
+        let drained = drain(&it);
+        assert_eq!(
+            alloc_list(drained),
+            alloc_list(vec![
+                alloc_tuple(vec![Object::Int(0), s("a")]),
+                alloc_tuple(vec![Object::Int(1), s("b")]),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_zip_builtin() {
+        let mut v = vm();
+        let it = builtin_zip(
+            &mut v,
+            &[
+                alloc_list(vec![Object::Int(1), Object::Int(2)]),
+                alloc_list(vec![s("x"), s("y")]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            alloc_list(drain(&it)),
+            alloc_list(vec![
+                alloc_tuple(vec![Object::Int(1), s("x")]),
+                alloc_tuple(vec![Object::Int(2), s("y")]),
+            ])
+        );
+        assert!(builtin_zip(&mut v, &[]).is_err()); // 至少 1 参
+    }
+
+    #[test]
+    fn test_container_constructors() {
+        let mut v = vm();
+        // 空构造（0 参）
+        assert_eq!(builtin_list(&mut v, &[]).unwrap(), alloc_list(vec![]));
+        assert_eq!(builtin_tuple(&mut v, &[]).unwrap(), alloc_tuple(vec![]));
+        // list("abc") -> ["a","b","c"]；set([1,2,2]) -> {1,2}
+        assert_eq!(
+            builtin_list(&mut v, &[s("abc")]).unwrap(),
+            alloc_list(vec![s("a"), s("b"), s("c")])
+        );
+        let set_obj = builtin_set(
+            &mut v,
+            &[alloc_list(vec![
+                Object::Int(1),
+                Object::Int(2),
+                Object::Int(2),
+            ])],
+        )
+        .unwrap();
+        let Object::Ref(ptr) = &set_obj else {
+            panic!("expected Ref");
+        };
+        let inner = unsafe { read_set(*ptr) };
+        assert_eq!(inner.len(), 2);
+        // 多参 -> Err
+        assert!(builtin_list(&mut v, &[Object::Int(1), Object::Int(2)]).is_err());
+        // tuple 从 range 迭代器构造（验证迭代器可被消费）
+        let it = builtin_range(&mut v, &[Object::Int(3)]).unwrap();
+        assert_eq!(
+            builtin_tuple(&mut v, std::slice::from_ref(&it)).unwrap(),
+            alloc_tuple(vec![Object::Int(0), Object::Int(1), Object::Int(2)])
+        );
+    }
+
+    #[test]
+    fn test_dict_constructor() {
+        let mut v = vm();
+        // 空 dict
+        assert_eq!(
+            builtin_dict(&mut v, &[]).unwrap(),
+            alloc_dict(DictMap::new())
+        );
+        // dict 拷贝
+        let mut m = DictMap::new();
+        m.insert(s("k"), Object::Int(9));
+        let src = alloc_dict(m);
+        assert_eq!(
+            builtin_dict(&mut v, std::slice::from_ref(&src)).unwrap(),
+            src
+        );
+        // 非 dict（MVP 不支持 (k,v) 对构造）-> Err
+        assert!(builtin_dict(&mut v, &[alloc_list(vec![])]).is_err());
+    }
+
+    #[test]
+    fn test_to_iterator_all_types() {
+        // SET 支持（task 26 订正）：to_iterator 须接受 set
+        let mut s = HashSet::new();
+        s.insert(Object::Int(7));
+        let set_obj = alloc_set(s);
+        assert!(to_iterator(&set_obj).is_ok());
+        // 迭代器自身可再次转迭代（克隆状态）
+        let it = alloc_iterator(IteratorState::Range {
+            current: 0,
+            end: 3,
+            step: 1,
+        });
+        assert!(to_iterator(&it).is_ok());
+        // 不可迭代 -> Err
+        assert!(to_iterator(&Object::Int(1)).is_err());
+    }
+
+    #[test]
+    fn test_iterator_heap_object() {
+        // alloc_iterator -> read_iterator：type_tag 与状态可读/可推进
+        let obj = alloc_iterator(IteratorState::Range {
+            current: 0,
+            end: 2,
+            step: 1,
+        });
+        let Object::Ref(ptr) = obj else {
+            panic!("expected Ref");
+        };
+        unsafe {
+            assert_eq!((*ptr).type_tag, TypeTag::ITERATOR as u8);
+            let it = read_iterator(ptr);
+            assert_eq!(it.state.next(), Some(Object::Int(0)));
+            assert_eq!(it.state.next(), Some(Object::Int(1)));
+            assert_eq!(it.state.next(), None);
+        }
+    }
+
+    #[test]
+    fn test_map_filter_stubs() {
+        let mut v = vm();
+        // 依赖用户函数调用（task 27/28），本 task 以存根返回 Err。
+        assert!(builtin_map(&mut v, &[Object::Int(1), Object::Int(2)]).is_err());
+        assert!(builtin_filter(&mut v, &[Object::Int(1), Object::Int(2)]).is_err());
     }
 }
