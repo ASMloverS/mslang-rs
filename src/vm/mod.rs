@@ -1,10 +1,10 @@
 pub mod builtins;
 pub mod frame;
+pub mod gc;
 pub mod object;
 
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
-use crate::gc::GarbageCollector;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
     alloc_iterator, read_iterator, read_list, read_str, read_tuple, CmpOp, Object, TypeTag,
@@ -20,7 +20,9 @@ pub struct VM {
     globals: HashMap<String, Object>,
     /// 内置函数参数个数表（`usize::MAX` = 可变参数），供 CALL 校验。
     native_arities: HashMap<String, usize>,
-    gc: GarbageCollector,
+    /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
+    /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
+    heap: gc::MsHeap,
 }
 
 impl VM {
@@ -30,7 +32,7 @@ impl VM {
             frames: Vec::new(),
             globals: HashMap::new(),
             native_arities: HashMap::new(),
-            gc: GarbageCollector::new(),
+            heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
         vm
@@ -118,10 +120,9 @@ impl VM {
 impl VM {
     fn run(&mut self) -> Result<Object, String> {
         loop {
-            // GC 触发点（task 52 接入真实回收；当前 collect 为 no-op）
-            if self.gc.should_collect() {
-                self.gc.collect();
-            }
+            // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
+            // 0，此调用为 no-op；接入后在此按阈值触发 minor/major GC（STW）。
+            gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals);
 
             let opcode_byte = self.read_byte()?;
             let opcode = OpCode::from_byte(opcode_byte)
