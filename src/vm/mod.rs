@@ -1,9 +1,11 @@
+pub mod builtins;
 pub mod frame;
 pub mod object;
 
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::gc::GarbageCollector;
+use crate::vm::builtins::read_native_function;
 use crate::vm::object::{read_str, CmpOp, Object, TypeTag};
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -14,17 +16,22 @@ pub struct VM {
     stack: Vec<Object>,
     frames: Vec<CallFrame>,
     globals: HashMap<String, Object>,
+    /// 内置函数参数个数表（`usize::MAX` = 可变参数），供 CALL 校验。
+    native_arities: HashMap<String, usize>,
     gc: GarbageCollector,
 }
 
 impl VM {
     pub fn new() -> Self {
-        VM {
+        let mut vm = VM {
             stack: Vec::with_capacity(STACK_MAX),
             frames: Vec::new(),
             globals: HashMap::new(),
+            native_arities: HashMap::new(),
             gc: GarbageCollector::new(),
-        }
+        };
+        vm.register_builtins();
+        vm
     }
 
     pub fn interpret(&mut self, chunk: Chunk) -> Result<Object, String> {
@@ -427,6 +434,54 @@ impl VM {
                         .ok_or_else(|| "continue underflow".to_string())?;
                 }
 
+                // CALL（task 25）：仅原生函数分支（TypeTag::FUNCTION）。
+                // 用户函数 / 闭包调用（TypeTag::CLOSURE）由 task 27 扩展。
+                OpCode::Call => {
+                    let argc = self.read_byte()? as usize;
+                    // 边界检查（D1）：防止 argc 过大导致下溢/越界。
+                    if argc + 1 > self.stack.len() {
+                        return Err("stack underflow for CALL arguments".to_string());
+                    }
+                    let callee_idx = self.stack.len() - argc - 1;
+                    let callee = self.stack[callee_idx].clone();
+                    match &callee {
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 =>
+                        {
+                            // 读出函数指针与参数个数信息（借用堆对象，不借用 self）。
+                            let (func, arity, name) = {
+                                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                                // SAFETY: type_tag 为 FUNCTION，指针由 alloc_native_function 分配。
+                                let native = unsafe { read_native_function(*ptr) };
+                                let arity = self.native_arities.get(native.name()).copied();
+                                (native.func, arity, native.name().to_owned())
+                            };
+                            // 参数个数校验（C2）：固定 arity 须严格匹配。
+                            if let Some(arity) = arity {
+                                if arity != usize::MAX && arity != argc {
+                                    return Err(format!(
+                                        "TypeError: {}() takes exactly {} argument{} but {} were given",
+                                        name,
+                                        arity,
+                                        if arity == 1 { "" } else { "s" },
+                                        argc
+                                    ));
+                                }
+                            }
+                            let args = self.stack[self.stack.len() - argc..].to_vec();
+                            self.stack.truncate(self.stack.len() - argc - 1);
+                            let result = func(self, &args)?;
+                            self.push(result)?;
+                        }
+                        _ => {
+                            return Err(format!(
+                                "TypeError: '{}' object is not callable",
+                                callee.type_name()
+                            ))
+                        }
+                    }
+                }
+
                 _ => {
                     return Err(format!("unimplemented opcode: {:?}", opcode));
                 }
@@ -442,6 +497,8 @@ impl Default for VM {
 }
 
 #[cfg(test)]
+// 3.14 是设计文档示例值（非 PI 近似），spec 指定保留。
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
     use crate::ast::node::Program;
@@ -449,7 +506,7 @@ mod tests {
     use crate::compiler::{Chunk, Compiler};
     use crate::lexer::Lexer;
     use crate::parser::Parser;
-    use crate::vm::object::{alloc_string, Object};
+    use crate::vm::object::{alloc_list, alloc_string, alloc_tuple, Object};
 
     fn parse(source: &str) -> Program {
         let tokens = Lexer::new(source).tokenize_all().unwrap();
@@ -1246,5 +1303,248 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Object::Int(2));
+    }
+
+    // ---- task 25：内置函数 CALL 集成（LoadGlobal → CALL native dispatch）----
+    //
+    // register_builtins 在 VM::new() 中注入全部内置函数；call_builtin 构造
+    // 合成字节码（LoadGlobal name → push args → CALL → Halt）端到端验证
+    // 原生函数调用分支、arity 校验与全局解析。
+
+    fn call_builtin(name: &str, args: &[Object]) -> Result<Object, String> {
+        let mut code = Vec::new();
+        let mut constants = vec![alloc_string(name)];
+        code.push(OpCode::LoadGlobal as u8);
+        code.extend(&0u16.to_be_bytes()); // const[0] = name
+        for arg in args {
+            let idx = constants.len();
+            constants.push(arg.clone());
+            code.push(OpCode::Constant as u8);
+            code.extend(&(idx as u16).to_be_bytes());
+        }
+        code.push(OpCode::Call as u8);
+        code.push(args.len() as u8);
+        code.push(OpCode::Halt as u8);
+        run_chunk(code, constants)
+    }
+
+    /// 仅加载全局内置函数对象（不调用），用于 isinstance 第二参数等场景。
+    fn load_builtin(name: &str) -> Object {
+        run_chunk(
+            vec![OpCode::LoadGlobal as u8, 0x00, 0x00, OpCode::Halt as u8],
+            vec![alloc_string(name)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_builtin_type_returns_name() {
+        // type(42) -> "int"；type([1,2]) -> "list"（B3 扩展）
+        assert_eq!(
+            call_builtin("type", &[Object::Int(42)]).unwrap(),
+            alloc_string("int")
+        );
+        assert_eq!(
+            call_builtin("type", &[alloc_string("hello")]).unwrap(),
+            alloc_string("string")
+        );
+        assert_eq!(
+            call_builtin("type", &[alloc_list(vec![Object::Int(1), Object::Int(2)])]).unwrap(),
+            alloc_string("list")
+        );
+    }
+
+    #[test]
+    fn test_builtin_len() {
+        assert_eq!(
+            call_builtin("len", &[alloc_string("hello")]).unwrap(),
+            Object::Int(5)
+        );
+        assert_eq!(
+            call_builtin(
+                "len",
+                &[alloc_list(vec![
+                    Object::Int(1),
+                    Object::Int(2),
+                    Object::Int(3)
+                ])]
+            )
+            .unwrap(),
+            Object::Int(3)
+        );
+    }
+
+    #[test]
+    fn test_builtin_abs_max_min_sum() {
+        assert_eq!(
+            call_builtin("abs", &[Object::Int(-5)]).unwrap(),
+            Object::Int(5)
+        );
+        assert_eq!(
+            call_builtin("max", &[Object::Int(1), Object::Int(2), Object::Int(3)]).unwrap(),
+            Object::Int(3)
+        );
+        assert_eq!(
+            call_builtin("min", &[Object::Int(1), Object::Int(2), Object::Int(3)]).unwrap(),
+            Object::Int(1)
+        );
+        assert_eq!(
+            call_builtin(
+                "sum",
+                &[alloc_list(vec![
+                    Object::Int(1),
+                    Object::Int(2),
+                    Object::Int(3)
+                ])]
+            )
+            .unwrap(),
+            Object::Int(6)
+        );
+    }
+
+    #[test]
+    fn test_builtin_conversions() {
+        assert_eq!(
+            call_builtin("int", &[alloc_string("42")]).unwrap(),
+            Object::Int(42)
+        );
+        assert_eq!(
+            call_builtin("float", &[alloc_string("3.14")]).unwrap(),
+            Object::Float(3.14)
+        );
+        assert_eq!(
+            call_builtin("str", &[Object::Int(42)]).unwrap(),
+            alloc_string("42")
+        );
+        assert_eq!(
+            call_builtin("bool", &[Object::Int(0)]).unwrap(),
+            Object::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_builtin_ceil_floor_round() {
+        assert_eq!(
+            call_builtin("ceil", &[Object::Float(3.7)]).unwrap(),
+            Object::Int(4)
+        );
+        assert_eq!(
+            call_builtin("floor", &[Object::Float(3.7)]).unwrap(),
+            Object::Int(3)
+        );
+        assert_eq!(
+            call_builtin("round", &[Object::Float(3.5)]).unwrap(),
+            Object::Float(4.0)
+        );
+        // round(3.14159, 2) -> 3.14
+        assert_eq!(
+            call_builtin("round", &[Object::Float(3.14159), Object::Int(2)]).unwrap(),
+            Object::Float(3.14)
+        );
+    }
+
+    #[test]
+    fn test_builtin_round_digits_out_of_range() {
+        // round(x, 20) -> ValueError（digits 越界，D3）
+        let r = call_builtin("round", &[Object::Float(1.0), Object::Int(20)]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("ValueError"));
+    }
+
+    #[test]
+    fn test_builtin_isinstance() {
+        // isinstance(42, int) -> true（int 全局即内置转换函数，充当类型对象）
+        assert_eq!(
+            call_builtin("isinstance", &[Object::Int(42), load_builtin("int")]).unwrap(),
+            Object::Bool(true)
+        );
+        // isinstance("hi", int) -> false
+        assert_eq!(
+            call_builtin("isinstance", &[alloc_string("hi"), load_builtin("int")]).unwrap(),
+            Object::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_builtin_arity_check() {
+        // type() arity=1；传 0 参 → TypeError
+        let r = call_builtin("type", &[]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("TypeError"));
+    }
+
+    #[test]
+    fn test_builtin_collection_conversions() {
+        // list("abc") -> ["a","b","c"]
+        assert_eq!(
+            call_builtin("list", &[alloc_string("abc")]).unwrap(),
+            alloc_list(vec![
+                alloc_string("a"),
+                alloc_string("b"),
+                alloc_string("c")
+            ])
+        );
+        // tuple([1,2]) -> (1,2)
+        assert_eq!(
+            call_builtin("tuple", &[alloc_list(vec![Object::Int(1), Object::Int(2)])]).unwrap(),
+            alloc_tuple(vec![Object::Int(1), Object::Int(2)])
+        );
+    }
+
+    #[test]
+    fn test_builtin_range() {
+        // range(5) -> [0,1,2,3,4]
+        assert_eq!(
+            call_builtin("range", &[Object::Int(5)]).unwrap(),
+            alloc_list(vec![
+                Object::Int(0),
+                Object::Int(1),
+                Object::Int(2),
+                Object::Int(3),
+                Object::Int(4)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_builtin_print_returns_nil() {
+        // print 不报错且返回 nil（输出至测试 stdout，格式由 Display 保证，已单测）
+        assert_eq!(
+            call_builtin("print", &[alloc_string("hello")]).unwrap(),
+            Object::Nil
+        );
+    }
+
+    #[test]
+    fn test_call_non_callable_type_error() {
+        // 调用非函数全局（nil 局部无此名）→ "object is not callable"
+        // 注：未定义名经 LoadGlobal 返回 Nil；CALL Nil → TypeError。
+        let r = call_builtin("does_not_exist", &[]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not callable"));
+    }
+
+    // ---- task 25：真实编译器端到端（Lexer+Parser+Compiler+VM）----
+    //
+    // 证明真实编译器对内置标识符发射 LoadGlobal（而非误判为局部），
+    // CALL 经原生函数分支正确分派。用「错误注入」使结果可观测
+    // （裸表达式语句被 POP，返回值恒为 Nil，故靠是否报错判断）。
+
+    #[test]
+    fn test_end_to_end_builtin_resolves_as_global() {
+        // len(5) → 内置函数被解析并调用 → TypeError（int 无 len）
+        let r = compile_and_run("len(5)");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("TypeError"));
+        // abs(-5) → 解析 + 调用成功，无报错
+        assert!(compile_and_run("abs(-5)").is_ok());
+    }
+
+    #[test]
+    fn test_end_to_end_nested_builtin_calls() {
+        // print(type(42))：嵌套调用；type 内层成功 → print 外层成功 → Ok
+        assert!(compile_and_run("print(type(42))").is_ok());
+        // max(1, 2, 3) → Ok
+        assert!(compile_and_run("max(1, 2, 3)").is_ok());
     }
 }

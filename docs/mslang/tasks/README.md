@@ -35,7 +35,7 @@
 | 22 | [Object 集合类型](22-object-system-collections.md) | ✅ |
 | 23 | [虚拟机核心执行循环](23-vm-core.md) | ✅ |
 | 24 | [VM 算术运算与控制流](24-vm-arithmetic-control.md) | ✅ |
-| 25 | [基础内置函数](25-builtins-basic.md) | ⬜ |
+| 25 | [基础内置函数](25-builtins-basic.md) | ✅ |
 | 26 | [内置迭代器与容器函数](26-builtins-iterators.md) | ⬜ |
 
 ## Phase 2.5 — GC 基础（Young 代半空间复制 + Old 代 STW 标记-清除）

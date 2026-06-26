@@ -79,6 +79,7 @@ pub struct MsStr {
 
 /// 有序可变映射（保持插入顺序，与 Python 3.7+ 一致）。
 /// `entries` 保存键值，`order` 保存键的插入顺序以供迭代/Display。
+#[derive(Clone)]
 pub struct DictMap {
     entries: HashMap<Object, Object>,
     order: Vec<Object>,
@@ -364,8 +365,21 @@ impl Object {
                 let tag = unsafe { (**ptr).type_tag };
                 if tag == TypeTag::STRING as u8 {
                     "string"
+                } else if tag == TypeTag::LIST as u8 {
+                    "list"
+                } else if tag == TypeTag::DICT as u8 {
+                    "dict"
+                } else if tag == TypeTag::TUPLE as u8 {
+                    "tuple"
+                } else if tag == TypeTag::SET as u8 {
+                    "set"
+                } else if tag == TypeTag::FUNCTION as u8 || tag == TypeTag::CLOSURE as u8 {
+                    "function"
+                } else if tag == TypeTag::CLASS as u8 {
+                    "class"
+                } else if tag == TypeTag::INSTANCE as u8 {
+                    "instance"
                 } else {
-                    // 后续任务扩展其他 Ref 类型的 type_name
                     "object"
                 }
             }
