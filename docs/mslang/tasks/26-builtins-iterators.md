@@ -1,7 +1,7 @@
 # 内置迭代器与容器函数
 
 ## 所属阶段
-Phase 2.5b - 字节码编译 + VM 核心
+Phase 2 - 字节码编译 + VM 核心
 
 ## 前置任务
 - 25-builtins-basic
@@ -51,12 +51,17 @@ Phase 2.5b - 字节码编译 + VM 核心
 
 ### 文件位置
 
-`src/vm/builtins.rs`（扩展任务 25）
+`src/vm/builtins.rs`（扩展 task 25；其中 range/list/tuple/set/dict 为**覆盖替换** task 25 已注册的同名实现）
 `src/vm/object.rs`（添加 MsIterator 堆对象）
+`src/vm/mod.rs`（添加 `ITERATOR`/`FOR_ITER` 的 VM 执行分支）
 
 ### 对象模型说明
 
-迭代器以 `Object::Ref(*mut MsObjHeader)` 存储，type_tag 为 `TypeTag::ITERATOR`。内部状态封装于 `MsIterator` 堆对象，引用 [20-object-system-basic](./20-object-system-basic.md) 的 `MsObjHeader`。
+迭代器以 `Object::Ref(*mut MsObjHeader)` 存储，type_tag 为 `TypeTag::ITERATOR`（= 11，见 `20-object-system-basic.md` 权威 TypeTag 与 `14-gc.md:102`）。内部状态封装于 `MsIterator` 堆对象，引用 [20-object-system-basic](./20-object-system-basic.md) 的 `MsObjHeader`。
+
+> **任务边界（订正 `12-implementation-plan.md` 与 task 25 注释的歧义）**：本任务拥有 **VM 侧迭代器基础设施 + 内置可迭代对象**（range→迭代器、`MsIterator`/`IteratorState`/`to_iterator`、`ITERATOR`/`FOR_ITER` 的 VM 执行）。编译器已在 task 19 发出 `ITERATOR`/`FOR_ITER`（`src/compiler/statement.rs:329-378`），故 VM 必须在本任务实现这两条 opcode，否则任何 `for..in` 运行期失败。用户层 `__iter__`/`__next__` 协议归 **task 32 / 43**；`12-implementation-plan.md:337-339` 的「ITERATOR/FOR_ITER/可迭代协议」Phase 4 条目应据此拆分（opcode 执行归本任务，协议归 task 32/43）。
+
+> **GC 前瞻（task 52 依赖）**：`IteratorState` 的 `ListIter`/`DictKeys`/`Reversed`/`Enumerate`/`Zip` 持有 `Vec<Object>`，其中可能含 `Object::Ref` 堆指针。按 `14-gc.md:124`，每个类型须注册 `trace` 函数。task 52 GC 上线时**必须**为 `TypeTag::ITERATOR` 注册 trace，遍历 `IteratorState` 内全部 `Object::Ref`，否则被引用对象将被误回收导致悬垂指针。本任务采用 MVP 泄漏分配（`Box::into_raw`），task 52 前 GC 不运行，故当前安全。
 
 ### MsIterator 堆对象与分配
 
@@ -118,12 +123,15 @@ pub fn alloc_iterator(state: IteratorState) -> Object {
 ///
 /// # Safety
 /// `ptr` 必须指向由 `alloc_iterator` 分配的有效 `MsIterator`。
-pub unsafe fn read_iterator(ptr: *mut MsObjHeader) -> &'static mut MsIterator {
+/// 生命周期由调用方约束（`'a`），**不得**用 `'static`——遵循 task 20 read_* 约定。
+pub unsafe fn read_iterator<'a>(ptr: *mut MsObjHeader) -> &'a mut MsIterator {
     &mut *(ptr as *mut MsIterator)
 }
 ```
 
 ### IteratorState next() 协议
+
+> **i64 溢出边界**：Range 的 `*current += *step`（下文）在极端区间溢出时 debug 构建 panic、release 回绕（Python range 为任意精度）。MVP 接受 i64 限制；如需严格语义，改 `checked_add` 并在溢出时提前返回 `None`（终止迭代）或经调用方上抛 `OverflowError`（须将 `next` 升级为 `Result`）。
 
 ```rust
 impl IteratorState {
@@ -211,6 +219,8 @@ impl IteratorState {
 
 ### to_iterator 工具函数
 
+> **性能说明**：本函数对 list/tuple/dict/set 做**整表克隆**入 `IteratorState`（大集合下内存翻倍）。MVP 接受此开销以换取实现简洁与 `FOR_ITER` 无别名安全；后续可改为持有源对象引用 + 索引。
+
 ```rust
 fn to_iterator(obj: &Object) -> Result<IteratorState, String> {
     match obj {
@@ -236,6 +246,11 @@ fn to_iterator(obj: &Object) -> Result<IteratorState, String> {
                     keys: unsafe { read_dict(*ptr) }.keys().cloned().collect(),
                     index: 0,
                 })
+            } else if tag == TypeTag::SET as u8 {
+                Ok(IteratorState::ListIter {
+                    items: unsafe { read_set(*ptr) }.iter().cloned().collect(),
+                    index: 0,
+                })
             } else if tag == TypeTag::ITERATOR as u8 {
                 Ok(unsafe { read_iterator(*ptr) }.state.clone())
             } else {
@@ -255,22 +270,25 @@ fn to_iterator(obj: &Object) -> Result<IteratorState, String> {
 
 ### range 函数
 
+> **替换 task 25 的 range**：task 25 的 `builtin_range` 返回 **list**（`builtins.rs:586-613`），其注释自称「task 32 升级为惰性迭代器」。但设计规格 `10-builtins.md:97-99` 要求 `range(...) -> iterator`，且编译器已发 `ITERATOR`/`FOR_ITER`，故本任务**就地替换** task 25 的 range 为迭代器版本（符合规格），并须同步：①更新 `builtins.rs:585` 注释为「task 26 升级为迭代器」；②更新 task 25 的 range 测试（`builtins.rs:827`、`src/vm/mod.rs:1495`）以适配迭代器输出（如经 `for..in` 或 `list(range(...))` 消费）。`int_arg` 复用 task 25 已有的 `require_int`，不重复定义。
+
 ```rust
 fn builtin_range(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    // require_int 复用 task 25（builtins.rs:617），不重复定义。
     let (start, end, step) = match args.len() {
         1 => {
-            let end = int_arg(&args[0], "range()")?;
+            let end = require_int(&args[0])?;
             (0, end, 1)
         }
         2 => {
-            let start = int_arg(&args[0], "range()")?;
-            let end = int_arg(&args[1], "range()")?;
+            let start = require_int(&args[0])?;
+            let end = require_int(&args[1])?;
             (start, end, 1)
         }
         3 => {
-            let start = int_arg(&args[0], "range()")?;
-            let end = int_arg(&args[1], "range()")?;
-            let step = int_arg(&args[2], "range()")?;
+            let start = require_int(&args[0])?;
+            let end = require_int(&args[1])?;
+            let step = require_int(&args[2])?;
             if step == 0 {
                 return Err("ValueError: range() step must not be zero".to_string());
             }
@@ -284,13 +302,6 @@ fn builtin_range(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
         step,
     }))
 }
-
-fn int_arg(obj: &Object, ctx: &str) -> Result<i64, String> {
-    match obj {
-        Object::Int(n) => Ok(*n),
-        _ => Err(format!("TypeError: {} argument must be int", ctx)),
-    }
-}
 ```
 
 ### sorted 函数
@@ -298,37 +309,38 @@ fn int_arg(obj: &Object, ctx: &str) -> Result<i64, String> {
 ```rust
 fn builtin_sorted(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("sorted() requires 1 argument")?;
-    let mut items = match arg {
-        Object::Ref(ptr) => {
-            let tag = unsafe { (*(*ptr)).type_tag };
-            if tag == TypeTag::LIST as u8 {
-                unsafe { read_list(*ptr) }.clone()
-            } else if tag == TypeTag::TUPLE as u8 {
-                unsafe { read_tuple(*ptr) }.clone()
-            } else {
-                return Err(format!(
-                    "TypeError: '{}' object is not iterable",
-                    arg.type_name()
-                ))
+    // 统一走 to_iterator，接受任意可迭代对象（list/tuple/string/set/dict/range/iterator）。
+    let mut items: Vec<Object> = Vec::new();
+    let mut iter = to_iterator(arg)?;
+    while let Some(v) = iter.next() {
+        items.push(v);
+    }
+    // CmpOp 与 OpCode 解耦（task 21，object.rs:392/612）。
+    // 比较失败须上抛 TypeError（不可吞错致静默错序）。
+    let mut err: Option<String> = None;
+    items.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match a.compare(b, CmpOp::Less) {
+            Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
+            Ok(_) => match a.compare(b, CmpOp::Greater) {
+                Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
+                Ok(_) => std::cmp::Ordering::Equal,
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            },
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
             }
         }
-        _ => {
-            return Err(format!(
-                "TypeError: '{}' object is not iterable",
-                arg.type_name()
-            ))
-        }
-    };
-    items.sort_by(|a, b| {
-        match a.compare(b, &OpCode::Less) {
-            Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
-            Ok(Object::Bool(false)) => match a.compare(b, &OpCode::Greater) {
-                Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            },
-            _ => std::cmp::Ordering::Equal,
-        }
     });
+    if let Some(e) = err {
+        return Err(e);
+    }
     Ok(alloc_list(items))
 }
 ```
@@ -369,6 +381,12 @@ fn builtin_reversed(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
                 unsafe { read_list(*ptr) }.clone()
             } else if tag == TypeTag::TUPLE as u8 {
                 unsafe { read_tuple(*ptr) }.clone()
+            } else if tag == TypeTag::STRING as u8 {
+                // reversed("abc") -> ["c","b","a"]（Python 对等）
+                unsafe { read_str(*ptr) }
+                    .chars()
+                    .map(|c| alloc_string(&c.to_string()))
+                    .collect()
             } else {
                 return Err(format!(
                     "TypeError: '{}' object is not reversible",
@@ -392,6 +410,8 @@ fn builtin_reversed(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 ```
 
 ### map / filter 函数（Phase 3 存根）
+
+> **最终形态**：设计规格 `10-builtins.md:104-105` 规定 `map(fn, iterable) -> list`、`filter(fn, iterable) -> list`，即**急切求值返回 list**（非惰性迭代器）。本任务因依赖用户函数调用（CALL 用户函数 / 闭包，task 27/28）暂以存根返回 Err；task 27/28 完成后须实现为：对 `to_iterator(iterable)` 逐项调用 `fn`，收集结果为 list 返回。
 
 ```rust
 fn builtin_map(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
@@ -435,92 +455,69 @@ fn builtin_all(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 
 ### 容器构造函数
 
+> **替换 task 25 的同名函数**：task 25 已注册 `list/tuple/set/dict`（`builtins.rs:98-101`，arity 均为 1，且 `builtin_list` 缺 SET 分支）。本任务以其**迭代器统一版本覆盖**之（`globals.insert` 覆盖旧值），改为 arity 可变（`usize::MAX`），支持 0 参空构造，并统一走 `to_iterator` 接受全部可迭代对象（含 set，修复 task 25 的 SET 回退）。`dict` 单函数同时处理空构造与 dict 拷贝。
+
 ```rust
+/// 将任意可迭代对象消费为 Vec<Object>（DRY：供 list/tuple/set 构造复用）。
+fn collect_iter(arg: &Object) -> Result<Vec<Object>, String> {
+    let mut out = Vec::new();
+    let mut it = to_iterator(arg)?;
+    while let Some(v) = it.next() {
+        out.push(v);
+    }
+    Ok(out)
+}
+
 fn builtin_list(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     if args.is_empty() {
         return Ok(alloc_list(Vec::new()));
     }
-    let arg = &args[0];
-    match arg {
-        Object::Ref(ptr) => {
-            let tag = unsafe { (*(*ptr)).type_tag };
-            if tag == TypeTag::STRING as u8 {
-                let items: Vec<Object> = unsafe { read_str(*ptr) }
-                    .chars()
-                    .map(|c| alloc_string(&c.to_string()))
-                    .collect();
-                Ok(alloc_list(items))
-            } else if tag == TypeTag::LIST as u8 {
-                Ok(alloc_list(unsafe { read_list(*ptr) }.clone()))
-            } else if tag == TypeTag::TUPLE as u8 {
-                Ok(alloc_list(unsafe { read_tuple(*ptr) }.clone()))
-            } else {
-                Err(format!("TypeError: cannot convert {} to list", arg.type_name()))
-            }
-        }
-        _ => Err(format!("TypeError: cannot convert {} to list", arg.type_name())),
+    if args.len() > 1 {
+        return Err("list() takes 0 or 1 arguments".to_string());
     }
+    Ok(alloc_list(collect_iter(&args[0])?))
 }
 
 fn builtin_tuple(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     if args.is_empty() {
         return Ok(alloc_tuple(Vec::new()));
     }
-    let items = match &args[0] {
-        Object::Ref(ptr) => {
-            let tag = unsafe { (*(*ptr)).type_tag };
-            if tag == TypeTag::LIST as u8 {
-                unsafe { read_list(*ptr) }.clone()
-            } else if tag == TypeTag::TUPLE as u8 {
-                unsafe { read_tuple(*ptr) }.clone()
-            } else {
-                return Err(format!(
-                    "TypeError: cannot convert {} to tuple",
-                    args[0].type_name()
-                ))
-            }
-        }
-        _ => {
-            return Err(format!(
-                "TypeError: cannot convert {} to tuple",
-                args[0].type_name()
-            ))
-        }
-    };
-    Ok(alloc_tuple(items))
+    if args.len() > 1 {
+        return Err("tuple() takes 0 or 1 arguments".to_string());
+    }
+    Ok(alloc_tuple(collect_iter(&args[0])?))
 }
 
-fn builtin_set_fn(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+fn builtin_set(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     if args.is_empty() {
         return Ok(alloc_set(HashSet::new()));
     }
-    let mut inner = HashSet::new();
-    match &args[0] {
-        Object::Ref(ptr) => {
-            let tag = unsafe { (*(*ptr)).type_tag };
-            if tag == TypeTag::LIST as u8 {
-                for item in unsafe { read_list(*ptr) }.iter() {
-                    inner.insert(item.clone());
-                }
-            } else if tag == TypeTag::TUPLE as u8 {
-                for item in unsafe { read_tuple(*ptr) }.iter() {
-                    inner.insert(item.clone());
-                }
-            } else {
-                return Err(format!(
-                    "TypeError: cannot convert {} to set",
-                    args[0].type_name()
-                ))
-            }
-        }
-        _ => {
-            return Err(format!(
-                "TypeError: cannot convert {} to set",
-                args[0].type_name()
-            ))
-        }
+    if args.len() > 1 {
+        return Err("set() takes 0 or 1 arguments".to_string());
     }
-    Ok(alloc_set(inner))
+    let items = collect_iter(&args[0])?;
+    Ok(alloc_set(items.into_iter().collect()))
+}
+
+/// dict() 空字典；dict(d) dict 拷贝。
+/// 从 (k, v) 对可迭代对象构造（dict([(k,v),...])）依赖元组解包迭代，
+/// 随 task 30（多返回值与元组解包）完善，本 MVP 暂不支持并显式报错。
+fn builtin_dict(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.is_empty() {
+        return Ok(alloc_dict(DictMap::new()));
+    }
+    if args.len() > 1 {
+        return Err("dict() takes 0 or 1 arguments".to_string());
+    }
+    match &args[0] {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            Ok(alloc_dict(unsafe { read_dict(*ptr) }.clone()))
+        }
+        _ => Err(format!(
+            "TypeError: cannot convert '{}' to dict (MVP: only dict supported)",
+            args[0].type_name()
+        )),
+    }
 }
 ```
 
@@ -535,17 +532,25 @@ OpCode::Iterator => {
 }
 
 OpCode::ForIter => {
+    // offset 为相对「操作数后一字节」的前向偏移，与编译器 patch_jump
+    // （其他前向跳转同口径）一致；迭代结束时 ip += offset 跳到循环出口。
     let offset = self.read_u16() as usize;
-    let top = self.stack.len() - 1;
-    let done = match &mut self.stack[top] {
-        Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::ITERATOR as u8 => {
-            unsafe { read_iterator(*ptr) }.state.next().is_none()
+    // 先取出 next 值并结束 &mut stack 借用，再 push，避免与 self.push 冲突。
+    let next_val: Option<Object> = {
+        let top = self.stack.len() - 1;
+        match &mut self.stack[top] {
+            Object::Ref(ptr) if unsafe { (*(*ptr)).type_tag } == TypeTag::ITERATOR as u8 => {
+                unsafe { read_iterator(*ptr) }.state.next()
+            }
+            _ => return Err("RuntimeError: not an iterator".to_string()),
         }
-        _ => return Err("RuntimeError: not an iterator".to_string()),
     };
-    if done {
-        let frame = self.frames.last_mut().unwrap();
-        frame.ip += offset;
+    match next_val {
+        Some(v) => self.push(v),          // 迭代值留在迭代器之上，供 StoreLocal/Unpack 消费
+        None => {
+            let frame = self.frames.last_mut().unwrap();
+            frame.ip += offset;           // 耗尽：跳到循环出口（编译器已发 Pop 弹出迭代器）
+        }
     }
 }
 ```
@@ -554,7 +559,7 @@ OpCode::ForIter => {
 
 ### 内置函数注册扩展
 
-在 `register_builtins` 中追加：
+在 `register_builtins` 中追加。`globals.insert` 对同名键**覆盖**：`range/list/tuple/set/dict` 已在 task 25 注册，此处以其迭代器版本覆盖（range 改迭代器；构造函数改可变参数并走 `to_iterator`）；`sorted/reversed/enumerate/zip/map/filter/any/all` 为新增。`set`/`dict` 的函数名即 `builtin_set`/`builtin_dict`（**不是** `builtin_set_fn`/`builtin_dict_empty`——后者未定义）。
 
 ```rust
 ("range", usize::MAX, builtin_range),
@@ -568,8 +573,8 @@ OpCode::ForIter => {
 ("all", 1, builtin_all),
 ("list", usize::MAX, builtin_list),
 ("tuple", usize::MAX, builtin_tuple),
-("set", usize::MAX, builtin_set_fn),
-("dict", 0, builtin_dict_empty),
+("set", usize::MAX, builtin_set),
+("dict", usize::MAX, builtin_dict),
 ```
 
 ## 验证标准
