@@ -4,7 +4,10 @@
 Phase 3.1 - 函数 + 闭包
 
 ## 前置任务
-- 26-builtins-iterators（Phase 2.5 完成的内置函数与迭代器）
+- 19-compile-statements（FnDecl 当前为 stub，本 task 实装编译）
+- 23-vm-core（CallFrame/frames 现所在，本 task 重构为 closure 指针 + call_stack）
+- 25-builtins-basic（native CALL 的 `TypeTag::FUNCTION` 分支已落地，本 task 不改写、仅新增 CLOSURE 分支）
+- 26-builtins-iterators
 
 ## 目标
 实现 `CallFrame` 结构、`CALL` / `RETURN` 指令、函数声明的编译与调用编译，使 VM 能正确执行用户定义的函数并返回结果。
@@ -102,7 +105,7 @@ fn_def = "fn" IDENTIFIER "(" param_list? ")" block
 
 - `VM.call_stack: Vec<CallFrame>` 管理嵌套调用
 - 初始帧（顶层脚本）也作为一个 CallFrame 存在于调用栈底部
-- 调用栈最大深度限制（建议 256），防止栈溢出
+- 调用栈最大深度限制（`MAX_CALL_DEPTH`，建议 **1000**，对齐 Python 默认；256 过低会使 factorial(1000) 等深递归误触栈溢出），防止栈溢出。该常量被 task 28/31/36/37/70 共用
 - `defer_stack_base` 在 Phase 3.1 中暂不使用，预留即可
 
 ## 实现细节
@@ -136,9 +139,19 @@ impl CallFrame {
 }
 ```
 
-### 2. src/vm/object.rs — Function 对象
+### 2. src/vm/object.rs — Function / Closure 堆对象
+
+> **TypeTag 约定（订正 A2）**：`TypeTag::FUNCTION` 已被 task 25 的 `MsNativeFunction`（内置函数）占用。故用户可调用对象**必须**经 `TypeTag::CLOSURE` 表示。Phase 3.1 引入**最小 `MsClosure`**（包裹 `MsFunction`，`upvalues` 恒空）；完整 upvalue 机制由 task 28 实装。`MsFunction`（用户函数体）内部仍可用 `TypeTag::FUNCTION` 作存储 tag——但**绝不直接作为 CALL 的被调用者**（CALL 只认 CLOSURE；FUNCTION 分支属 task 25 native）。
 
 ```rust
+/// 用户函数体（堆对象，TypeTag::FUNCTION）。仅由 MsClosure 内部持有，
+/// CALL 不直接匹配此 tag（避免与 MsNativeFunction 混淆 — 订正 A2/V2）。
+#[repr(C)]
+pub struct MsFunction {
+    pub header: MsObjHeader,
+    pub function: Function,   // name/arity/code/constants/upvalue_count/source_file
+}
+
 pub struct Function {
     pub name: String,
     pub arity: usize,
@@ -151,8 +164,7 @@ pub struct Function {
 impl Function {
     pub fn new(name: String, arity: usize) -> Self {
         Self {
-            name,
-            arity,
+            name, arity,
             code: Vec::new(),
             constants: Vec::new(),
             upvalue_count: 0,
@@ -160,21 +172,87 @@ impl Function {
         }
     }
 }
+
+/// 分配 MsFunction 堆对象（TypeTag::FUNCTION），返回 Object::Ref。
+/// MVP：Box 分配；task 52-gc 替换为 TLAB bump 分配。
+pub fn alloc_function(function: Function) -> Object {
+    let ms_fn = Box::new(MsFunction {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::FUNCTION as u8,
+            size: std::mem::size_of::<MsFunction>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        function,
+    });
+    Object::Ref(Box::into_raw(ms_fn) as *mut MsObjHeader)
+}
+
+/// 读取 MsFunction（alloc_function 的对偶）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_function` 分配的、在 `'a` 期间有效的 `MsFunction`。
+pub unsafe fn read_function<'a>(ptr: *mut MsObjHeader) -> &'a MsFunction {
+    &*(ptr as *mut MsFunction)
+}
+
+/// 最小闭包（TypeTag::CLOSURE）。Phase 3.1：upvalues 恒空（task 28 实装真实上值）。
+/// 这是用户代码唯一可调用的形式 — CALL 的被调用者必须是 CLOSURE（订正 A2）。
+#[repr(C)]
+pub struct MsClosure {
+    pub header: MsObjHeader,
+    pub function: *mut MsObjHeader,      // 指向 MsFunction
+    pub upvalues: Vec<*mut MsObjHeader>, // Phase 3.1 为空
+}
+
+/// 分配 MsClosure（TypeTag::CLOSURE），包裹一个 MsFunction。
+pub fn alloc_closure(function: Object) -> Object {
+    let Object::Ref(func_ptr) = function else {
+        unreachable!("alloc_closure expects MsFunction Ref");
+    };
+    let cl = Box::new(MsClosure {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::CLOSURE as u8,
+            size: std::mem::size_of::<MsClosure>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        function: func_ptr,
+        upvalues: Vec::new(),
+    });
+    Object::Ref(Box::into_raw(cl) as *mut MsObjHeader)
+}
+
+/// 读取 MsClosure（alloc_closure 的对偶）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_closure` 分配的、在 `'a` 期间有效的 `MsClosure`。
+pub unsafe fn read_closure<'a>(ptr: *mut MsObjHeader) -> &'a MsClosure {
+    &*(ptr as *mut MsClosure)
+}
 ```
 
-Function 对象在堆上以 `MsFunction`（TypeTag::FUNCTION）存储，通过 `Object::Ref(*mut MsObjHeader)` 引用，类型由 type_tag 区分（参照 [20-object-system-basic](./20-object-system-basic.md) § 对象模型）。
+> **GC 前瞻（task 52）**：新增 `MsFunction`（含 `Vec<u8>` code、`Vec<Object>` constants）与 `MsClosure`（含 `Vec` upvalues + function 指针）。task 52 的 TypeDescriptor 须为 FUNCTION/CLOSURE 注册真实 `trace`/`copy_for_gc`（当前为 noop 占位）：MsClosure.trace 须遍历 `function` 与各 upvalue；MsFunction.trace 须遍历 constants 中的 Ref。
 
 ### 3. src/compiler/mod.rs — 函数声明编译
 
 ```rust
 fn compile_fn_decl(&mut self, node: &FnDecl) {
-    let func_idx = self.constant_pool.len();
-
     let mut func_unit = CompilationUnit::new();
     func_unit.name = node.name.clone();
     func_unit.arity = node.params.len();
 
-    for (i, param) in node.params.iter().enumerate() {
+    // 订正 A3/V1：预留 slot 0 给被调用者（closure 自身），与 CALL 的
+    // stack_base = callee_idx 自洽（slot 0 = stack[stack_base] = callee）。
+    // 参数从 slot 1 起注册（slot 1..arity）。否则 param0 会读到 callee。
+    func_unit.locals.push(Local {
+        name: "<self>".into(), // 占位 slot 0（closure 自身）
+        depth: 0,
+        is_captured: false,
+    });
+    for param in node.params.iter() {
         func_unit.locals.push(Local {
             name: param.clone(),
             depth: 0,
@@ -189,7 +267,7 @@ fn compile_fn_decl(&mut self, node: &FnDecl) {
 
     let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
-    // Function 存入常量池（task 28 中包装为 Closure/MsFunction 堆对象）
+    // MsFunction 存入常量池，再包装为 MsClosure（CLOSURE）— 用户可调用形式。
     let function = alloc_function(Function {
         name: func_unit.name,
         arity: func_unit.arity,
@@ -198,7 +276,8 @@ fn compile_fn_decl(&mut self, node: &FnDecl) {
         upvalue_count: 0,
         source_file: self.source_file.clone(),
     });
-    let idx = self.add_constant(function);
+    let closure = alloc_closure(function); // 订正 A2：发布的是 CLOSURE
+    let idx = self.add_constant(closure);
 
     self.emit_constant(idx);
     let name_idx = self.add_constant(alloc_string(&node.name));
@@ -209,59 +288,58 @@ fn compile_fn_decl(&mut self, node: &FnDecl) {
 ### 4. src/compiler/mod.rs — 函数调用编译
 
 ```rust
-fn compile_call(&mut self, callee: &Expr, args: &[Expr]) {
+fn compile_call(&mut self, callee: &Expr, args: &[Expr]) -> Result<(), String> {
+    // V3：argc 为单字节（CALL | argc(1)），>255 须编译期报错，避免 as u8 静默截断。
+    if args.len() > u8::MAX as usize {
+        return Err(format!(
+            "too many arguments ({} > max 255) in call", args.len()
+        ));
+    }
     self.compile_expr(callee);
     for arg in args {
         self.compile_expr(arg);
     }
     self.emit_with_operand(OpCode::CALL, args.len() as u8);
+    Ok(())
 }
 ```
 
 ### 5. src/vm/mod.rs — CALL 指令执行
 
+> **订正 A1/A2**：task 25 已实现 `TypeTag::FUNCTION`（native `MsNativeFunction`）分支（`mod.rs:519-544`），**本 task 不改写该分支**，仅**新增 `TypeTag::CLOSURE` 分支**处理用户函数。删除原先不存在的 `Object::BuiltinFunc` 分支（Object 无此变体）。下方仅展示新增的 CLOSURE 分支（与 task 25 的 FUNCTION 分支并列于同一 `OpCode::Call` match）。
+
 ```rust
-OpCode::CALL => {
-    let argc = self.read_byte() as usize;
-    let stack_top = self.stack.len();
-
-    let callee_idx = stack_top - argc - 1;
-    let callee = self.stack[callee_idx].clone();
-
-    match callee {
-        Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::FUNCTION as u8 => {
-            let func = unsafe { read_function(ptr) };
-            if argc != func.arity {
-                return self.runtime_error(
-                    &format!("expected {} arguments, got {}", func.arity, argc)
-                );
-            }
-
-            if self.call_stack.len() >= MAX_CALL_DEPTH {
-                return self.runtime_error("stack overflow");
-            }
-
-            let stack_base = callee_idx;
-            // Phase 3.1：将 Function 包装为无上值 Closure 帧
-            self.call_stack.push(CallFrame::new(
-                ptr,
-                self.current_frame().stack_base,
-            ));
-
-            let frame = self.call_stack.last_mut().unwrap();
-            frame.stack_base = stack_base;
-            frame.ip = 0;
-        }
-        Object::BuiltinFunc(builtin) => {
-            let args: Vec<Object> = self.stack.drain(stack_top - argc..).collect();
-            self.stack.pop();
-            let result = (builtin.func)(&args)?;
-            self.stack.push(result);
-        }
-        _ => return self.runtime_error("not a callable object"),
+// 新增分支（与 task 25 的 TypeTag::FUNCTION native 分支并列）：
+Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 => {
+    let (arity, func_ptr) = {
+        // SAFETY：type_tag 为 CLOSURE，指针由 alloc_closure 分配。
+        let closure = unsafe { read_closure(*ptr) };
+        // 经 closure.function 取 MsFunction 读 arity（不借用 self）。
+        let func = unsafe { read_function(closure.function) };
+        (func.function.arity, closure.function)
+    };
+    if argc != arity {
+        return self.runtime_error(
+            &format!("expected {} arguments, got {}", arity, argc)
+        );
     }
+    if self.call_stack.len() >= MAX_CALL_DEPTH {
+        return self.runtime_error("stack overflow");
+    }
+
+    // stack_base = callee_idx：slot 0 = callee（closure 自身），参数在 slot 1..argc
+    // （与 compile_fn_decl 的 slot-0 预留约定自洽 — 订正 A3/V1）。
+    let stack_base = callee_idx;
+    self.call_stack.push(CallFrame::new(*ptr, stack_base));
+    // CallFrame::new 已设 stack_base；ip 默认 0。不再二次赋值。
+    let _ = func_ptr; // Phase 3.1 不使用 upvalues；task 28 在此初始化上值
 }
+_ => {} // 其余 callable（FUNCTION native 已由 task 25 分支处理；BOUND_METHOD/INSTANCE __call__ 由 task 41/43）
 ```
+
+> **V3 修复（argc 溢出）**：编译侧 `compile_call` 须在 `args.len() as u8` 前断言 `args.len() <= u8::MAX as usize`，否则编译期报错（`"too many arguments (max 255)"`），避免静默截断致 arity 校验失真。CALL argc 为单字节（`11-bytecode-vm.md:47` `CALL | argc(1)`）。
+
+> **callee_idx 边界**：执行前须 `argc + 1 <= self.stack.len()` 校验（task 25 的 FUNCTION 分支已在 `mod.rs:522` 做了同样保护），CLOSURE 分支共用此前置校验。
 
 ### 6. src/vm/mod.rs — RETURN 指令执行
 
@@ -269,13 +347,17 @@ OpCode::CALL => {
 OpCode::RETURN => {
     let return_value = self.stack.pop().unwrap_or(Object::Nil);
 
+    // task 36 补：弹出本帧前须执行其 `[defer_stack_base..defer_stack.len())` 的
+    // defer 条目（EXEC_DEFER，LIFO）。Phase 3.1 defer_stack 恒空，此处暂不做。
     let old_base = self.call_stack.last().unwrap().stack_base;
-    self.stack.truncate(old_base);
+    self.stack.truncate(old_base);   // 移除 callee(slot0)+args+locals
     self.call_stack.pop();
 
-    self.stack.push(return_value);
+    self.stack.push(return_value);   // 返回值落在调用者栈顶（替代原 callee+args 区段）
 }
 ```
+
+> **值栈按帧分段不变量（R4）**：CALL/RETURN 经 `stack_base` 维持每帧 `[stack_base..stack_top)` 区段独立。生成器/async 的完整栈段快照（含区间拷贝）推迟到 task 39/53（与 task 23 声明一致）；本 task 的 `CallFrame::snapshot()` 仅 clone 字段。
 
 ### 7. 顶层脚本 CallFrame
 
@@ -285,11 +367,14 @@ VM 初始化时创建顶层 CallFrame：
 impl VM {
     pub fn new() -> Self {
         let main_function = Function::new("<main>".into(), 0);
-        // alloc_function 返回 Object::Ref(*mut MsObjHeader)；提取裸指针
-        let Object::Ref(main_ptr) = alloc_function(main_function) else { unreachable!() };
+        // main 也经 alloc_closure（CLOSURE）包装，与 CallFrame.closure 约定一致（订正 A2）。
+        let Object::Ref(main_ptr) = alloc_closure(alloc_function(main_function))
+            else { unreachable!() };
         let main_frame = CallFrame::new(main_ptr, 0);
         Self {
-            stack: Vec::new(),
+            // 预留 slot 0（callee 占位），修复 task 26 发现的「顶层预留 slot 0
+            // 但 VM 栈未预分配 → StoreLocal 1 越界」bug（订正 A3）。
+            stack: vec![Object::Nil],
             call_stack: vec![main_frame],
             globals: HashMap::new(),
             defer_stack: Vec::new(),
@@ -310,7 +395,7 @@ impl VM {
 6. 嵌套调用深度超过限制时抛出栈溢出错误
 7. 函数无显式 return 时返回 nil
 8. 递归调用正确工作
-9. `print` 等内置函数仍正常工作（通过 BuiltinFunc 分支）
+9. `print` 等内置函数仍正常工作（经 task 25 的 `TypeTag::FUNCTION` native 分支，本 task 不改写）
 10. CallFrame 可被 clone 用于帧快照（Phase 4 生成器和 Phase 7 async/await 依赖此能力）
 
 ## 测试用例
