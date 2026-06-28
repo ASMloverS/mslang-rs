@@ -494,6 +494,13 @@ pub struct Function {
     pub constants: Vec<Object>,
     pub upvalue_count: usize,
     pub source_file: Option<String>,
+    // --- task 31：默认参数 / 可变参数 ---
+    /// 编译期求值的默认值（每个默认参数一个，按序）。
+    pub default_values: Vec<Object>,
+    /// 是否有 `*rest` 可变参数。
+    pub has_variadic: bool,
+    /// 必需参数数量（普通参数，不含默认和可变）。
+    pub required_arity: usize,
 }
 
 impl Function {
@@ -505,6 +512,9 @@ impl Function {
             constants: Vec::new(),
             upvalue_count: 0,
             source_file: None,
+            default_values: Vec::new(),
+            has_variadic: false,
+            required_arity: arity,
         }
     }
 }

@@ -343,6 +343,52 @@ unsafe fn resolve_upvalue_in_unit(unit: *mut CompilationUnit, name: &str) -> Opt
         .map(|upvalue_idx| add_upvalue(unit, upvalue_idx, false))
 }
 
+// ---- task 31：默认参数 / 可变参数辅助 ----
+
+/// 校验参数顺序：普通 → 默认 → 可变（`04-functions.md:75`）。
+/// 违序时返回编译期错误。
+pub fn validate_param_order(params: &[crate::ast::node::Param]) -> Result<(), String> {
+    // 0=normal, 1=default, 2=variadic
+    let mut state = 0u8;
+    for p in params {
+        match (p.is_variadic, &p.default, state) {
+            (false, None, _) => {
+                if state > 0 {
+                    return Err(
+                        "positional parameter after default or variadic parameter".to_string()
+                    );
+                }
+            }
+            (false, Some(_), _) => {
+                if state > 1 {
+                    return Err("default parameter after variadic parameter".to_string());
+                }
+                state = 1;
+            }
+            // *rest 不应有 default（解析器不会产出 is_variadic=true && default=Some）
+            (true, _, _) => state = 2,
+        }
+    }
+    Ok(())
+}
+
+/// 编译期求值默认参数表达式。仅支持常量字面量（`04-functions.md:44`）。
+/// 非常量默认值（如 `items = []`）暂不支持，返回编译期错误。
+pub fn eval_default(expr: &crate::ast::node::Expr) -> Result<Object, String> {
+    use crate::ast::node::{Expr, Literal};
+    match expr {
+        Expr::Literal(Literal::Int(n)) => Ok(Object::Int(*n)),
+        Expr::Literal(Literal::Float(n)) => Ok(Object::Float(*n)),
+        Expr::Literal(Literal::String(s)) => Ok(crate::vm::object::alloc_string(s)),
+        Expr::Literal(Literal::Bool(b)) => Ok(Object::Bool(*b)),
+        Expr::Literal(Literal::Nil) => Ok(Object::Nil),
+        _ => Err(
+            "default parameter value must be a constant literal (non-literal defaults not yet supported)"
+                .to_string(),
+        ),
+    }
+}
+
 // ---- 编译入口 ----
 
 impl Compiler {

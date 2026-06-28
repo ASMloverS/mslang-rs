@@ -214,7 +214,21 @@ impl Compiler {
             scope_depth: 0,
             parent: std::ptr::null(),
         };
+        // task 31：参数顺序校验（普通 → 默认 → 可变）+ 默认/可变参数分类。
+        super::validate_param_order(params)?;
+        let mut required_arity = 0usize;
+        let mut default_values = Vec::new();
+        let mut has_variadic = false;
         for param in params {
+            if param.is_variadic {
+                has_variadic = true;
+            } else if param.default.is_some() {
+                let val = super::eval_default(param.default.as_ref().unwrap())?;
+                default_values.push(val);
+            } else {
+                required_arity += 1;
+            }
+            // 所有参数都注册为 local（含 variadic 和 default）。
             func_unit.locals.push(Local {
                 name: param.name.clone(),
                 depth: 0,
@@ -249,11 +263,15 @@ impl Compiler {
         // 存 Function（非 Closure）入常量池 —— CLOSURE 指令运行期包装。
         let function = Function {
             name: name.to_string(),
-            arity: params.len(),
+            // 固定参数总数（普通 + 默认，不含可变）。
+            arity: params.iter().filter(|p| !p.is_variadic).count(),
             code: func_unit.chunk.code,
             constants: func_unit.chunk.constants,
             upvalue_count: func_unit.upvalues.len(),
             source_file: self.source_file.clone(),
+            default_values,
+            has_variadic,
+            required_arity,
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)
@@ -707,6 +725,61 @@ mod tests {
             assert!(
                 compiler.compile(&program).is_err(),
                 "expected error for deferred statement: {:?}",
+                source
+            );
+        }
+    }
+
+    // ---- task 31：默认参数 / 可变参数编译期校验 ----
+
+    #[test]
+    fn test_param_order_default_before_positional_is_error() {
+        // 普通参数不能出现在默认参数之后 → 编译错误。
+        let program = parse("fn f(a = 1, b) { return a }");
+        let mut compiler = Compiler::new();
+        assert!(compiler.compile(&program).is_err());
+    }
+
+    #[test]
+    fn test_param_order_default_after_variadic_is_error() {
+        // 默认参数不能出现在可变参数之后 → 编译错误。
+        let program = parse("fn f(*rest, a = 1) { return a }");
+        let mut compiler = Compiler::new();
+        assert!(compiler.compile(&program).is_err());
+    }
+
+    #[test]
+    fn test_param_order_positional_after_variadic_is_error() {
+        // 普通参数不能出现在可变参数之后 → 编译错误。
+        let program = parse("fn f(*rest, a) { return a }");
+        let mut compiler = Compiler::new();
+        assert!(compiler.compile(&program).is_err());
+    }
+
+    #[test]
+    fn test_non_constant_default_is_error() {
+        // 非常量默认值（如 []）暂不支持 → 编译错误。
+        let program = parse("fn f(x = []) { return x }");
+        let mut compiler = Compiler::new();
+        assert!(compiler.compile(&program).is_err());
+    }
+
+    #[test]
+    fn test_constant_default_literals_compile_ok() {
+        // 合法的默认值（int/float/string/bool/nil）与合法参数顺序 → 编译成功。
+        let sources = [
+            "fn f(a, b = 10) { return b }",
+            "fn f(a, b = 3.14) { return b }",
+            "fn f(a, b = \"hi\") { return b }",
+            "fn f(a, b = true) { return b }",
+            "fn f(a, b = nil) { return b }",
+        ];
+        for source in sources {
+            let program = parse(source);
+            let mut compiler = Compiler::new();
+            assert!(
+                compiler.compile(&program).is_ok(),
+                "expected success for valid default: {:?}",
                 source
             );
         }

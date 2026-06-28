@@ -525,7 +525,20 @@ impl Compiler {
             scope_depth: 0,
             parent: std::ptr::null(),
         };
+        // task 31：参数顺序校验 + 默认/可变分类（镜像 compile_fn_decl）。
+        super::validate_param_order(params)?;
+        let mut required_arity = 0usize;
+        let mut default_values = Vec::new();
+        let mut has_variadic = false;
         for param in params {
+            if param.is_variadic {
+                has_variadic = true;
+            } else if param.default.is_some() {
+                let val = super::eval_default(param.default.as_ref().unwrap())?;
+                default_values.push(val);
+            } else {
+                required_arity += 1;
+            }
             func_unit.locals.push(Local {
                 name: param.name.clone(),
                 depth: 0,
@@ -559,11 +572,15 @@ impl Compiler {
         // 存 Function 入常量池，发 CLOSURE(func_idx) + 逐上值操作数。
         let function = Function {
             name: "<anonymous>".to_string(),
-            arity: params.len(), // task 31 前全部计为必需（见 spec §1 Param 说明）
+            // 固定参数总数（普通 + 默认，不含可变）。
+            arity: params.iter().filter(|p| !p.is_variadic).count(),
             code: func_unit.chunk.code,
             constants: func_unit.chunk.constants,
             upvalue_count: func_unit.upvalues.len(),
             source_file: self.source_file.clone(),
+            default_values,
+            has_variadic,
+            required_arity,
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)

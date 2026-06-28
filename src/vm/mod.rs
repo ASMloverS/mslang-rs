@@ -7,9 +7,9 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_function, alloc_iterator, alloc_tuple, alloc_upvalue, read_closure,
-    read_function, read_iterator, read_list, read_str, read_tuple, read_upvalue, CmpOp, Function,
-    MsObjHeader, MsUpvalue, Object, TypeTag,
+    alloc_closure, alloc_function, alloc_iterator, alloc_list, alloc_tuple, alloc_upvalue,
+    read_closure, read_function, read_iterator, read_list, read_str, read_tuple, read_upvalue,
+    CmpOp, Function, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -57,6 +57,9 @@ impl VM {
             constants: chunk.constants,
             upvalue_count: 0,
             source_file: None,
+            default_values: Vec::new(),
+            has_variadic: false,
+            required_arity: 0,
         };
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
@@ -754,30 +757,68 @@ impl VM {
                             let result = func(self, &args)?;
                             self.push(result)?;
                         }
-                        // 用户函数（task 27）：CLOSURE 分支，与 native FUNCTION 分支并列。
+                        // 用户函数（task 27/31）：CLOSURE 分支。支持默认参数与可变参数。
                         Object::Ref(ptr)
                             if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
                         {
-                            // 经 closure.function 取 MsFunction 读 arity（不借用 self）。
-                            let arity = {
+                            // 读出 arity / required_arity / has_variadic / func_ptr（不借用 self）。
+                            let (arity, required_arity, has_variadic, func_ptr) = {
                                 debug_assert!(!ptr.is_null(), "null Object::Ref");
                                 // SAFETY: type_tag 为 CLOSURE，指针由 alloc_closure 分配。
                                 let closure = unsafe { read_closure(*ptr) };
                                 // SAFETY: closure.function 由 alloc_function 分配。
                                 let func = unsafe { read_function(closure.function) };
-                                func.function.arity
+                                let f = &func.function;
+                                (f.arity, f.required_arity, f.has_variadic, closure.function)
                             };
-                            if argc != arity {
+
+                            // 实参数量校验（task 31：放宽为范围检查）。
+                            if has_variadic {
+                                if argc < required_arity {
+                                    return Err(format!(
+                                        "TypeError: expected at least {} arguments, got {}",
+                                        required_arity, argc
+                                    ));
+                                }
+                            } else if argc < required_arity || argc > arity {
                                 return Err(format!(
-                                    "TypeError: expected {} arguments, got {}",
-                                    arity, argc
+                                    "TypeError: expected {}-{} arguments, got {}",
+                                    required_arity, arity, argc
                                 ));
                             }
                             if self.call_stack.len() >= MAX_CALL_DEPTH {
                                 return Err("RecursionError: stack overflow".to_string());
                             }
+
+                            // 步骤 1：填充默认值（argc < arity 时）。
+                            // 默认值追加在固定参数之后（位置 argc..arity）。
+                            if argc < arity {
+                                let defaults_to_fill = arity - argc;
+                                let offset = argc - required_arity;
+                                // 先克隆所需默认值（裸指针引用堆，借用局限于本块）。
+                                let to_fill: Vec<Object> = unsafe {
+                                    let f = &read_function(func_ptr).function;
+                                    f.default_values[offset..offset + defaults_to_fill].to_vec()
+                                };
+                                for v in to_fill {
+                                    self.push(v)?;
+                                }
+                            }
+
+                            // 步骤 2：处理可变参数（*rest 收集多余实参为 list）。
+                            // 必须在填默认值之后：填完后栈长恰为 callee_idx+1+arity。
+                            if has_variadic {
+                                let fixed_end = callee_idx + 1 + arity;
+                                if self.stack.len() > fixed_end {
+                                    let varargs: Vec<Object> = self.stack.drain(fixed_end..).collect();
+                                    self.push(alloc_list(varargs))?;
+                                } else {
+                                    self.push(alloc_list(Vec::new()))?;
+                                }
+                            }
+
                             // stack_base = callee_idx：slot 0 = callee（closure 自身），
-                            // 参数在 slot 1..argc（与 compile_fn_decl 的 slot-0 预留约定自洽）。
+                            // 参数在 slot 1..（与 compile_fn_decl 的 slot-0 预留约定自洽）。
                             self.call_stack.push(CallFrame::new(*ptr, callee_idx));
                         }
                         _ => {
@@ -2311,6 +2352,9 @@ mod tests {
             constants: vec![],
             upvalue_count: 0,
             source_file: None,
+            default_values: Vec::new(),
+            has_variadic: false,
+            required_arity: 2,
         };
         let func_obj = alloc_function(func);
         let Object::Ref(func_ptr) = func_obj else {
@@ -2433,7 +2477,11 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expected 1 arguments, got 2"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("expected 1-1 arguments, got 2")
+        );
     }
 
     #[test]
@@ -2447,7 +2495,185 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("expected 2 arguments, got 1"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("expected 2-2 arguments, got 1")
+        );
+    }
+
+    // ---- task 31：默认参数 / 可变参数 ----
+
+    #[test]
+    fn test_default_param_basic() {
+        // 默认参数：省略时用默认值，提供时覆盖。
+        let result = compile_and_run(
+            r#"
+            fn greet(name, prefix = "Hello") {
+                return prefix + ", " + name
+            }
+            assert(greet("Alice") == "Hello, Alice")
+            assert(greet("Alice", "Hi") == "Hi, Alice")
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_default_param_int_and_nil() {
+        // 默认值类型覆盖：int / nil。
+        let result = compile_and_run(
+            r#"
+            fn fi(a, b = 42) {
+                return b
+            }
+            fn fnil(a, b = nil) {
+                return b
+            }
+            assert(fi(1) == 42)
+            assert(fi(1, 99) == 99)
+            assert(fnil(1) == nil)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_variadic_sum() {
+        // *rest 收集多余实参为 list。验证集合长度（for-in 循环在编译源码中有
+        // 已知 slot 冲突 bug，见 line 1947 注释，故用 len() 验证）。
+        let result = compile_and_run(
+            r#"
+            fn count_args(*numbers) {
+                return len(numbers)
+            }
+            assert(count_args(1, 2, 3) == 3)
+            assert(count_args(1, 2, 3, 4, 5) == 5)
+            assert(count_args() == 0)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_variadic_empty() {
+        // 无多余实参时 *rest 为空 list（len == 0）。
+        let result = compile_and_run(
+            r#"
+            fn collect(*args) {
+                return len(args)
+            }
+            assert(collect() == 0)
+            assert(collect(1) == 1)
+            assert(collect(1, 2, 3) == 3)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_combined_default_and_variadic() {
+        // 普通参数 + 默认参数 + 可变参数组合。
+        // 验证：c 用默认值/覆盖值，rest 长度正确。
+        let result = compile_and_run(
+            r#"
+            fn get_c(a, b, c = 10, *rest) {
+                return c
+            }
+            fn count_rest(a, b, c = 10, *rest) {
+                return len(rest)
+            }
+            assert(get_c(1, 2) == 10)
+            assert(get_c(1, 2, 3) == 3)
+            assert(get_c(1, 2, 3, 4, 5) == 3)
+            assert(count_rest(1, 2) == 0)
+            assert(count_rest(1, 2, 3) == 0)
+            assert(count_rest(1, 2, 3, 4, 5) == 2)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_default_param_anonymous_fn() {
+        // 匿名函数同样支持默认参数（镜像 compile_fn_decl）。
+        let result = compile_and_run(
+            r#"
+            adder = fn(x, y = 10) {
+                return x + y
+            }
+            assert(adder(5) == 15)
+            assert(adder(5, 20) == 25)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_variadic_anonymous_fn() {
+        // 匿名函数同样支持可变参数。
+        let result = compile_and_run(
+            r#"
+            collector = fn(*items) {
+                return len(items)
+            }
+            assert(collector() == 0)
+            assert(collector(1, 2) == 2)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_arity_error_too_few_with_defaults() {
+        // 默认参数不减少必需参数下限：f(a, b, c=10) 调用 f(1) → TypeError。
+        let result = compile_and_run(
+            r#"
+            fn f(a, b, c = 10) {
+                return c
+            }
+            f(1)
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("expected 2-3 arguments, got 1")
+        );
+    }
+
+    #[test]
+    fn test_arity_error_too_many_without_variadic() {
+        // 无可变参数时实参过多 → TypeError。
+        let result = compile_and_run(
+            r#"
+            fn f(a, b) {
+                return a
+            }
+            f(1, 2, 3)
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("expected 2-2 arguments, got 3")
+        );
+    }
+
+    #[test]
+    fn test_variadic_absorbs_extra_args() {
+        // 有可变参数时实参过多不报错，多余部分进 *rest（len 验证）。
+        let result = compile_and_run(
+            r#"
+            fn f(a, *rest) {
+                return len(rest)
+            }
+            assert(f(1, 2, 3, 4) == 3)
+            "#,
+        );
+        assert!(result.is_ok());
     }
 
     #[test]
