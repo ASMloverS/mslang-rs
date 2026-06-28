@@ -2596,4 +2596,153 @@ mod tests {
         );
         assert!(result.is_ok());
     }
+
+    // ---- task 29：匿名函数（函数字面量）----
+    //
+    // 匿名函数是一等公民：可赋值、传参、做返回值、存于集合。其编译为 name="<anonymous>"
+    // 的 Function + CLOSURE 指令，闭包值留栈作为表达式结果（不发 STORE_GLOBAL）。
+
+    #[test]
+    fn test_anon_fn_assignment_and_call() {
+        // double = fn(x) { return x * 2 }；通过变量名调用。
+        let result = compile_and_run(
+            r#"
+            double = fn(x) { return x * 2 }
+            assert(double(5) == 10)
+            assert(double(0) == 0)
+            assert(double(-3) == -6)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_higher_order() {
+        // 用户定义的高阶函数：匿名函数作为参数传递。
+        // apply(fn(x){ return x*x }, 4) == 16
+        let result = compile_and_run(
+            r#"
+            fn apply(f, x) { return f(x) }
+            assert(apply(fn(x) { return x * x }, 4) == 16)
+            assert(apply(fn(x) { return x + 1 }, 9) == 10)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_stored_value_called() {
+        // 匿名函数值存储后（赋值给变量）经变量取出调用 —— 一等公民「存储后调用」语义。
+        // 注：spec §验证标准 #6 的 dict/list 集合存储 + 下标调用（如 ops["add"](3,4)）
+        // 无法端到端验证：VM 尚未实装 BuildDict/BuildList/GetIndex 等集合构造与下标
+        // 操作码（属独立 VM 实装任务，非 task 29 范畴）。此处用变量存储验证同等的
+        // 「值存储 → 取出 → 调用」语义；集合场景的编译端由
+        // test_compile_anon_fn_in_dict_literal（expression.rs）覆盖。
+        let result = compile_and_run(
+            r#"
+            add = fn(a, b) { return a + b }
+            mul = fn(a, b) { return a * b }
+            assert(add(3, 4) == 7)
+            assert(mul(3, 4) == 12)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_closure_counter() {
+        // 匿名闭包经 nonlocal 捕获外层变量：counter() 返回 1、2。
+        let result = compile_and_run(
+            r#"
+            fn make_counter() {
+                count = 0
+                return fn() {
+                    nonlocal count
+                    count += 1
+                    return count
+                }
+            }
+            counter = make_counter()
+            assert(counter() == 1)
+            assert(counter() == 2)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_read_capture() {
+        // 匿名闭包只读捕获外层局部（无需 nonlocal）。
+        let result = compile_and_run(
+            r#"
+            fn make_reader() {
+                value = 42
+                return fn() { return value }
+            }
+            r = make_reader()
+            assert(r() == 42)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_implicit_return_nil() {
+        // 无显式 return 的匿名函数返回 nil。
+        let result = compile_and_run(
+            r#"
+            side = fn() { x = 1 }
+            assert(side() == nil)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_as_return_value() {
+        // 具名函数返回匿名函数，调用结果。
+        let result = compile_and_run(
+            r#"
+            fn make_adder(n) {
+                return fn(x) { return x + n }
+            }
+            add5 = make_adder(5)
+            assert(add5(10) == 15)
+            assert(add5(0) == 5)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_anon_fn_named_decl_regression() {
+        // 回归：具名函数声明 + 闭包（task 27/28）仍正常工作。
+        let result = compile_and_run(
+            r#"
+            fn fact(n) {
+                if n <= 1 {
+                    return 1
+                }
+                return n * fact(n - 1)
+            }
+            fn make_counter() {
+                count = 0
+                fn step() {
+                    nonlocal count
+                    count += 1
+                    return count
+                }
+                return step
+            }
+            assert(fact(5) == 120)
+            c = make_counter()
+            assert(c() == 1)
+            assert(c() == 2)
+            # 匿名与具名共存
+            sq = fn(x) { return x * x }
+            assert(sq(fact(3)) == 36)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
 }

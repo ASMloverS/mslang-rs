@@ -178,7 +178,10 @@ impl Compiler {
     }
 
     /// 编译 block 语句：顺序编译内部语句。
-    fn compile_block(&mut self, stmts: &[Stmt], line: usize) -> Result<(), String> {
+    ///
+    /// `pub(super)`：除本模块外，task 29 的 `compile_fn_literal`（expression.rs）也需
+    /// 编译匿名函数体（语句向量），与具名函数体编译路径一致。
+    pub(super) fn compile_block(&mut self, stmts: &[Stmt], line: usize) -> Result<(), String> {
         for stmt in stmts {
             self.compile_statement(stmt, line)?;
         }

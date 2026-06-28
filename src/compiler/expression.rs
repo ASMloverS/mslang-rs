@@ -5,10 +5,10 @@
 //!
 //! 参照 [18-compile-expressions](../../../docs/mslang/tasks/18-compile-expressions.md)。
 
-use crate::ast::node::{AssignOp, BinaryOp, Expr, Literal, UnaryOp};
-use crate::vm::object::{alloc_string, Object};
+use crate::ast::node::{AssignOp, BinaryOp, Expr, Literal, Stmt, UnaryOp};
+use crate::vm::object::{alloc_function, alloc_string, Function, Object};
 
-use super::{Chunk, Compiler, OpCode};
+use super::{Chunk, CompilationUnit, Compiler, Local, OpCode};
 
 // ---- 表达式编译入口与访问器 ----
 
@@ -62,10 +62,8 @@ impl Compiler {
             Expr::SetLiteral { elements } => self.compile_set_literal(elements, line),
             Expr::TupleLiteral { elements } => self.compile_tuple_literal(elements, line),
             Expr::Grouping { expr } => self.compile_expression(expr, line),
+            Expr::FnLiteral { params, body } => self.compile_fn_literal(params, body, line),
             // 以下类型由后续 task 实现
-            Expr::FnLiteral { .. } => {
-                Err("fn literal compilation not yet implemented (task 29)".to_string())
-            }
             Expr::ListComprehension { .. }
             | Expr::DictComprehension { .. }
             | Expr::SetComprehension { .. }
@@ -486,6 +484,87 @@ impl Compiler {
         self.emit_byte(count, line);
         Ok(())
     }
+
+    /// 编译匿名函数字面量（task 29）。
+    /// 镜像 compile_fn_decl（statement.rs），差异仅两点：(1) name="<anonymous>"；
+    /// (2) 不发 STORE_GLOBAL —— 匿名函数是表达式，闭包值留栈作为表达式结果，由外层
+    /// 赋值/传参/集合构造消费。上值机制（parent 链接、is_captured 回填、CLOSURE 发射）
+    /// 与具名函数完全一致，确保匿名闭包正确捕获外层变量。
+    fn compile_fn_literal(
+        &mut self,
+        params: &[crate::ast::node::Param],
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), String> {
+        let mut func_unit = CompilationUnit {
+            chunk: super::Chunk::new(),
+            // slot 0 预留给被调用者（closure 自身），与 CALL 的 stack_base=callee_idx 自洽。
+            // 参数从 slot 1 起（与 compile_fn_decl 一致 — task 27 订正 A3/V1）。
+            locals: vec![Local {
+                name: "<self>".to_string(),
+                depth: 0,
+                is_captured: false,
+            }],
+            upvalues: Vec::new(),
+            scope_depth: 0,
+            parent: std::ptr::null(),
+        };
+        for param in params {
+            func_unit.locals.push(Local {
+                name: param.name.clone(),
+                depth: 0,
+                is_captured: false,
+            });
+        }
+
+        // 换出父单元，编译函数体。parent 指向 saved_unit（裸指针，规避 self-referential
+        // 借用冲突 — task 28 方案），使 resolve_upvalue_recursive 可攀爬外层。
+        let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        self.unit.parent = std::ptr::addr_of!(saved_unit);
+        self.compile_block(body, line)?;
+        self.emit_byte(OpCode::Nil as u8, line); // 隐式 return nil
+        self.emit_byte(OpCode::Return as u8, line);
+        let func_unit = std::mem::replace(&mut self.unit, saved_unit);
+
+        // 上值捕获回填（task 28）：is_local=true 的上值对应父单元局部变量，
+        // 标记 is_captured 驱动 end_scope 发射 CLOSE_UPVALUE。先收集再写回以避开借用。
+        let captured_locals: Vec<usize> = func_unit
+            .upvalues
+            .iter()
+            .filter(|uv| uv.is_local)
+            .map(|uv| uv.index)
+            .collect();
+        for idx in captured_locals {
+            if idx < self.unit.locals.len() {
+                self.unit.locals[idx].is_captured = true;
+            }
+        }
+
+        // 存 Function 入常量池，发 CLOSURE(func_idx) + 逐上值操作数。
+        let function = Function {
+            name: "<anonymous>".to_string(),
+            arity: params.len(), // task 31 前全部计为必需（见 spec §1 Param 说明）
+            code: func_unit.chunk.code,
+            constants: func_unit.chunk.constants,
+            upvalue_count: func_unit.upvalues.len(),
+            source_file: self.source_file.clone(),
+        };
+        let func_idx = self.add_constant(alloc_function(function));
+        let func_idx = u16::try_from(func_idx)
+            .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+
+        self.emit_byte(OpCode::Closure as u8, line);
+        self.emit_bytes(&func_idx.to_be_bytes(), line);
+        for uv in &func_unit.upvalues {
+            self.emit_byte(if uv.is_local { 1 } else { 0 }, line);
+            let idx = u8::try_from(uv.index).map_err(|_| {
+                format!("upvalue index {} exceeds 255 (function too large)", uv.index)
+            })?;
+            self.emit_byte(idx, line);
+        }
+        // 不发 STORE_GLOBAL —— 闭包值留栈，作为表达式结果供外层消费。
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -871,13 +950,48 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_fn_literal_returns_error() {
+    fn test_compile_fn_literal() {
+        // task 29：匿名函数字面量编译为 CLOSURE 指令（闭包值留栈作为表达式结果，
+        // 不发 STORE_GLOBAL —— 与具名函数声明的关键差异）。
+        use crate::ast::node::Param;
         let mut compiler = Compiler::new();
         let expr = Expr::FnLiteral {
-            params: vec![],
+            params: vec![Param {
+                name: "x".to_string(),
+                default: None,
+                is_variadic: false,
+            }],
             body: vec![],
         };
-        assert!(compiler.compile_expression(&expr, 1).is_err());
+        compiler.compile_expression(&expr, 1).unwrap();
+        assert!(find_opcode(&compiler, OpCode::Closure).is_some());
+        // 匿名函数是表达式，不绑定全局名 → 不发 STORE_GLOBAL
+        assert!(find_opcode(&compiler, OpCode::StoreGlobal).is_none());
+    }
+
+    #[test]
+    fn test_compile_anon_fn_in_dict_literal() {
+        // spec §验证标准 #6 编译端覆盖：匿名函数作为集合（dict）值编译为 CLOSURE，
+        // 随后由 BuildDict 打包。注：dict/list 集合的「运行期」执行（BuildDict/
+        // GetIndex 操作码）尚未在 VM 实装（独立任务，非 task 29），故此处仅验证
+        // 编译端正确生成 CLOSURE + BuildDict，端到端 dict 下标调用待 VM 实装。
+        use crate::ast::node::Param;
+        let mut compiler = Compiler::new();
+        let expr = Expr::DictLiteral {
+            pairs: vec![(
+                Expr::Literal(Literal::String("add".into())),
+                Expr::FnLiteral {
+                    params: vec![
+                        Param { name: "a".to_string(), default: None, is_variadic: false },
+                        Param { name: "b".to_string(), default: None, is_variadic: false },
+                    ],
+                    body: vec![],
+                },
+            )],
+        };
+        compiler.compile_expression(&expr, 1).unwrap();
+        assert!(find_opcode(&compiler, OpCode::Closure).is_some());
+        assert!(find_opcode(&compiler, OpCode::BuildDict).is_some());
     }
 
     #[test]
