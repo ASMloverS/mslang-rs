@@ -283,7 +283,10 @@ impl Compiler {
         for uv in &func_unit.upvalues {
             self.emit_byte(if uv.is_local { 1 } else { 0 }, line);
             let idx = u8::try_from(uv.index).map_err(|_| {
-                format!("upvalue index {} exceeds 255 (function too large)", uv.index)
+                format!(
+                    "upvalue index {} exceeds 255 (function too large)",
+                    uv.index
+                )
             })?;
             self.emit_byte(idx, line);
         }
@@ -440,6 +443,20 @@ impl Compiler {
     }
 
     /// 编译 for..in 循环（单变量与双变量）。
+    ///
+    /// **迭代器存储在局部 slot 中**（非栈顶），通过 `FOR_ITER iter_slot offset`
+    /// 从局部读取。这使嵌套 for..in 不冲突——每个循环的迭代器在各自的 slot 中，
+    /// 不受内层循环栈操作影响（task 32 核心修复）。
+    ///
+    /// 栈布局（单变量 `for item in range(3)`，顶层）：
+    /// ```text
+    /// [Nil]      ← slot 0 (<self>)
+    /// [Nil]      ← slot 1 (__for_iter_X，迭代器占位，后存入迭代器)
+    /// [Nil]      ← slot 2 (item，循环变量占位)
+    /// ```
+    /// 编译 iterable 后 StoreLocal iter_slot 将迭代器写入 slot 1。
+    /// FOR_ITER 从 slot 1 读取迭代器，压入 next 值至栈顶。
+    /// StoreLocal 2 将值写入 item 的 slot，不影响迭代器。
     fn compile_for_in(
         &mut self,
         variable: &str,
@@ -448,35 +465,62 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
     ) -> Result<(), String> {
-        // 求值可迭代对象 → 创建迭代器（迭代器常驻栈上直至循环结束）
-        self.compile_expression(iterable, line)?;
-        self.emit_byte(OpCode::Iterator as u8, line);
+        // 1. 预留迭代器 slot：发射 Nil 占位 + 声明隐藏局部
+        self.emit_byte(OpCode::Nil as u8, line);
+        let iter_name = format!("__for_iter_{}", variable);
+        self.declare_local(&iter_name, line)?;
+        let iter_slot = self
+            .resolve_local(&iter_name)
+            .ok_or("internal: for-iter local not found after declare")?;
 
-        let loop_start = self.current_offset();
-        let for_iter_exit = self.emit_jump(OpCode::ForIter, line);
+        let loop_start;
+        let for_iter_exit;
 
         if let Some(var2) = second_variable {
-            // 双变量：UNPACK 2 拆出两个值，分别存入两个局部
-            self.emit_byte(OpCode::Unpack as u8, line);
-            self.emit_byte(2, line);
+            // 双变量：预留两个 slot
+            self.emit_byte(OpCode::Nil as u8, line); // reserve var1 slot
             self.declare_local(variable, line)?;
             let slot1 = self
                 .resolve_local(variable)
                 .ok_or("internal: loop var not found after declare")?;
-            self.emit_byte(OpCode::StoreLocal as u8, line);
-            self.emit_byte(slot1 as u8, line);
+            self.emit_byte(OpCode::Nil as u8, line); // reserve var2 slot
             self.declare_local(var2, line)?;
             let slot2 = self
                 .resolve_local(var2)
                 .ok_or("internal: loop var not found after declare")?;
+
+            // 2. 编译 iterable → ITERATOR → StoreLocal iter_slot
+            self.compile_expression(iterable, line)?;
+            self.emit_byte(OpCode::Iterator as u8, line);
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(iter_slot as u8, line);
+
+            // 3. FOR_ITER 从 iter_slot 读取迭代器
+            loop_start = self.current_offset();
+            for_iter_exit = self.emit_for_iter(iter_slot as u8, line);
+            self.emit_byte(OpCode::Unpack as u8, line);
+            self.emit_byte(2, line);
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(slot1 as u8, line);
             self.emit_byte(OpCode::StoreLocal as u8, line);
             self.emit_byte(slot2 as u8, line);
         } else {
-            // 单变量：直接存入局部
+            // 单变量：预留一个 slot
+            self.emit_byte(OpCode::Nil as u8, line); // reserve var slot
             self.declare_local(variable, line)?;
             let slot = self
                 .resolve_local(variable)
                 .ok_or("internal: loop var not found after declare")?;
+
+            // 2. 编译 iterable → ITERATOR → StoreLocal iter_slot
+            self.compile_expression(iterable, line)?;
+            self.emit_byte(OpCode::Iterator as u8, line);
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(iter_slot as u8, line);
+
+            // 3. FOR_ITER 从 iter_slot 读取迭代器
+            loop_start = self.current_offset();
+            for_iter_exit = self.emit_for_iter(iter_slot as u8, line);
             self.emit_byte(OpCode::StoreLocal as u8, line);
             self.emit_byte(slot as u8, line);
         }
@@ -499,12 +543,12 @@ impl Compiler {
         let back_edge = self.emit_jump(OpCode::JumpBack, line);
         self.patch_jump_back(back_edge, loop_start)?;
 
-        // 出口：FOR_ITER 耗尽与 break 跳到此处，统一弹出迭代器
+        // 出口：FOR_ITER 耗尽与 break 跳到此处。迭代器在局部 slot 中，
+        // 无需 Pop（与 task 26 栈顶方案不同）。
         self.patch_jump(for_iter_exit)?;
         for jump in &loop_ctx.break_jumps {
             self.patch_jump(*jump)?;
         }
-        self.emit_byte(OpCode::Pop as u8, line);
         Ok(())
     }
 

@@ -134,13 +134,16 @@ impl OpCode {
             | Self::Break
             | Self::Continue
             | Self::Closure
-            | Self::ForIter
             | Self::Class
             | Self::Method
             | Self::GetSuper
             | Self::TryEnter
             | Self::Catch
             | Self::Import => 2,
+
+            // FOR_ITER 特殊：iter_slot(1) + exit_offset(2)。
+            // 迭代器存储在局部 slot 中（非栈顶），使嵌套 for..in 不冲突。
+            Self::ForIter => 3,
 
             // 1 字节操作数：slot / argc / count / flags / buffer_size
             Self::LoadLocal
@@ -229,12 +232,27 @@ fn format_instruction(chunk: &Chunk, offset: usize) -> (String, usize) {
             )
         }
         3 => {
-            let name_idx = u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
-            let argc = chunk.code[offset + 3];
-            (
-                format!("{:04} {:?} {} {}", offset, opcode, name_idx, argc),
-                offset + 4,
-            )
+            if opcode == OpCode::ForIter {
+                // FOR_ITER: iter_slot(1) + exit_offset(2)
+                let iter_slot = chunk.code[offset + 1];
+                let exit_offset =
+                    u16::from_be_bytes([chunk.code[offset + 2], chunk.code[offset + 3]]);
+                (
+                    format!(
+                        "{:04} {:?} slot={} offset={}",
+                        offset, opcode, iter_slot, exit_offset
+                    ),
+                    offset + 4,
+                )
+            } else {
+                // INVOKE: name_idx(2) + argc(1)
+                let name_idx = u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
+                let argc = chunk.code[offset + 3];
+                (
+                    format!("{:04} {:?} {} {}", offset, opcode, name_idx, argc),
+                    offset + 4,
+                )
+            }
         }
         _ => (format!("{:04} {:?}", offset, opcode), offset + 1),
     }

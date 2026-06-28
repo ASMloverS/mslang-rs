@@ -193,6 +193,16 @@ impl Compiler {
         self.unit.chunk.code.len() - 2
     }
 
+    /// 发射 FOR_ITER 指令（iter_slot + 2 字节 exit_offset 占位）。
+    /// 返回 exit_offset 操作数起始位置，供 [`patch_jump`](Self::patch_jump) 补丁。
+    pub fn emit_for_iter(&mut self, iter_slot: u8, line: usize) -> usize {
+        self.emit_byte(OpCode::ForIter as u8, line);
+        self.emit_byte(iter_slot, line);
+        self.emit_byte(0xff, line); // exit_offset placeholder
+        self.emit_byte(0xff, line);
+        self.unit.chunk.code.len() - 2
+    }
+
     /// 补丁前向跳转（JUMP / JUMP_IF_FALSE / JUMP_IF_TRUE）。
     /// `offset` 为 [`emit_jump`](Self::emit_jump) 返回的操作数起始位置。
     pub fn patch_jump(&mut self, offset: usize) -> Result<(), String> {

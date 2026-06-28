@@ -324,10 +324,9 @@ impl Compiler {
                 self.emit_bytes(&name_idx.to_be_bytes(), line);
             }
             Expr::TupleLiteral { elements: targets } => {
-                let count = u8::try_from(targets.len())
-                    .map_err(|_| format!(
-                        "too many unpack targets (max 255, got {})", targets.len()
-                    ))?;
+                let count = u8::try_from(targets.len()).map_err(|_| {
+                    format!("too many unpack targets (max 255, got {})", targets.len())
+                })?;
                 self.emit_byte(OpCode::Unpack as u8, line);
                 self.emit_byte(count, line);
                 // UNPACK（mod.rs）逆序压入 elements，使 elements[0] 位于栈顶。
@@ -591,7 +590,10 @@ impl Compiler {
         for uv in &func_unit.upvalues {
             self.emit_byte(if uv.is_local { 1 } else { 0 }, line);
             let idx = u8::try_from(uv.index).map_err(|_| {
-                format!("upvalue index {} exceeds 255 (function too large)", uv.index)
+                format!(
+                    "upvalue index {} exceeds 255 (function too large)",
+                    uv.index
+                )
             })?;
             self.emit_byte(idx, line);
         }
@@ -909,10 +911,7 @@ mod tests {
         compiler.declare_local("a", 1).unwrap();
         compiler.declare_local("b", 1).unwrap();
         let target = Expr::TupleLiteral {
-            elements: vec![
-                Expr::Identifier("a".into()),
-                Expr::Identifier("b".into()),
-            ],
+            elements: vec![Expr::Identifier("a".into()), Expr::Identifier("b".into())],
         };
         compiler.compile_store_target(&target, 1).unwrap();
         let code = &compiler.chunk().code;
@@ -930,7 +929,9 @@ mod tests {
     fn test_compile_store_target_tuple_too_many_targets() {
         // 超过 255 个解包目标 → 编译错误（u8 溢出）。
         let mut compiler = Compiler::new();
-        let targets: Vec<Expr> = (0..256).map(|i| Expr::Identifier(format!("v{}", i))).collect();
+        let targets: Vec<Expr> = (0..256)
+            .map(|i| Expr::Identifier(format!("v{}", i)))
+            .collect();
         let target = Expr::TupleLiteral { elements: targets };
         let r = compiler.compile_store_target(&target, 1);
         assert!(r.is_err());
@@ -1061,8 +1062,16 @@ mod tests {
                 Expr::Literal(Literal::String("add".into())),
                 Expr::FnLiteral {
                     params: vec![
-                        Param { name: "a".to_string(), default: None, is_variadic: false },
-                        Param { name: "b".to_string(), default: None, is_variadic: false },
+                        Param {
+                            name: "a".to_string(),
+                            default: None,
+                            is_variadic: false,
+                        },
+                        Param {
+                            name: "b".to_string(),
+                            default: None,
+                            is_variadic: false,
+                        },
                     ],
                     body: vec![],
                 },

@@ -7,9 +7,9 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_function, alloc_iterator, alloc_list, alloc_tuple, alloc_upvalue,
-    read_closure, read_function, read_iterator, read_list, read_str, read_tuple, read_upvalue,
-    CmpOp, Function, MsObjHeader, MsUpvalue, Object, TypeTag,
+    alloc_closure, alloc_dict, alloc_function, alloc_iterator, alloc_list, alloc_set, alloc_tuple,
+    alloc_upvalue, read_closure, read_function, read_iterator, read_list, read_str, read_tuple,
+    read_upvalue, CmpOp, DictMap, Function, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -559,15 +559,24 @@ impl VM {
                     self.push(alloc_iterator(iter_state))?;
                 }
 
-                // FOR_ITER（task 26）：迭代器常驻栈顶；取下一值压入栈顶之上供
-                // StoreLocal/Unpack 消费。耗尽时 ip += offset 跳到循环出口
-                // （offset 为相对「操作数后一字节」的前向偏移，与 patch_jump 同口径）。
+                // FOR_ITER（task 32 修订）：迭代器存储在局部 slot（非栈顶）。
+                // 操作数：iter_slot(1) + exit_offset(2)。从 stack[base+iter_slot]
+                // 读取迭代器，取下一值压入栈顶供 StoreLocal/Unpack 消费。耗尽时
+                // ip += offset 跳到循环出口。slot 方式使嵌套 for..in 不冲突。
                 OpCode::ForIter => {
+                    let iter_slot = self.read_byte()? as usize;
                     let offset = self.read_u16()? as usize;
-                    // 先取出 next 值并结束 &mut stack 借用，再 push，避免借用冲突。
+                    let stack_base = self
+                        .call_stack
+                        .last()
+                        .ok_or("no call frame".to_string())?
+                        .stack_base;
+                    let location = stack_base + iter_slot;
+                    if location >= self.stack.len() {
+                        return Err("RuntimeError: FOR_ITER slot out of range".to_string());
+                    }
                     let next_val: Option<Object> = {
-                        let top = self.stack.len() - 1;
-                        match &mut self.stack[top] {
+                        match &mut self.stack[location] {
                             Object::Ref(ptr)
                                 if unsafe { (**ptr).type_tag } == TypeTag::ITERATOR as u8 =>
                             {
@@ -634,12 +643,65 @@ impl VM {
                 // 多返回值（statement.rs）发射。
                 OpCode::BuildTuple => {
                     let count = self.read_byte()? as usize;
-                    let start = self.stack
+                    let start = self
+                        .stack
                         .len()
                         .checked_sub(count)
                         .ok_or("RuntimeError: stack underflow in BUILD_TUPLE")?;
                     let elements: Vec<Object> = self.stack.drain(start..).collect();
                     self.push(alloc_tuple(elements))?;
+                }
+
+                // BUILD_LIST count：从栈顶弹出 count 个元素，构建 list 对象并压栈。
+                // 编译端由 compile_list_literal（expression.rs）发射。
+                // task 32 回填：此前 opcode 已定义且编译器已发射，但 VM 无 handler。
+                OpCode::BuildList => {
+                    let count = self.read_byte()? as usize;
+                    let start = self
+                        .stack
+                        .len()
+                        .checked_sub(count)
+                        .ok_or("RuntimeError: stack underflow in BUILD_LIST")?;
+                    let elements: Vec<Object> = self.stack.drain(start..).collect();
+                    self.push(alloc_list(elements))?;
+                }
+
+                // BUILD_DICT pairs：栈上已按 key0,val0,key1,val1,… 顺序压入 pairs 对
+                // 键值对。弹出 pairs*2 个值，构建 dict 对象并压栈。
+                // task 32 回填。
+                OpCode::BuildDict => {
+                    let pairs = self.read_byte()? as usize;
+                    let needed = pairs
+                        .checked_mul(2)
+                        .ok_or("RuntimeError: BUILD_DICT count overflow")?;
+                    let start = self
+                        .stack
+                        .len()
+                        .checked_sub(needed)
+                        .ok_or("RuntimeError: stack underflow in BUILD_DICT")?;
+                    let mut map = DictMap::new();
+                    let mut i = start;
+                    for _ in 0..pairs {
+                        let key = self.stack[i].clone();
+                        let value = self.stack[i + 1].clone();
+                        map.insert(key, value);
+                        i += 2;
+                    }
+                    self.stack.truncate(start);
+                    self.push(alloc_dict(map))?;
+                }
+
+                // BUILD_SET count：从栈顶弹出 count 个元素，构建 set 对象并压栈。
+                // task 32 回填。
+                OpCode::BuildSet => {
+                    let count = self.read_byte()? as usize;
+                    let start = self
+                        .stack
+                        .len()
+                        .checked_sub(count)
+                        .ok_or("RuntimeError: stack underflow in BUILD_SET")?;
+                    let elements: Vec<Object> = self.stack.drain(start..).collect();
+                    self.push(alloc_set(elements.into_iter().collect()))?;
                 }
 
                 // CLOSURE（task 28）：从常量池取出 Function，捕获上值，创建 Closure。
@@ -698,11 +760,7 @@ impl VM {
                 // STORE_UPVALUE（task 28）：将栈顶存入当前闭包的上值[idx]（peek，不弹）。
                 OpCode::StoreUpvalue => {
                     let idx = self.read_byte()? as usize;
-                    let value = self
-                        .stack
-                        .last()
-                        .cloned()
-                        .unwrap_or(Object::Nil); // peek 栈顶（不弹）
+                    let value = self.stack.last().cloned().unwrap_or(Object::Nil); // peek 栈顶（不弹）
                     let closure_ptr = self.call_stack.last().unwrap().closure;
                     // SAFETY: closure_ptr 指向当前帧的 MsClosure。
                     let closure = unsafe { read_closure(closure_ptr) };
@@ -810,7 +868,8 @@ impl VM {
                             if has_variadic {
                                 let fixed_end = callee_idx + 1 + arity;
                                 if self.stack.len() > fixed_end {
-                                    let varargs: Vec<Object> = self.stack.drain(fixed_end..).collect();
+                                    let varargs: Vec<Object> =
+                                        self.stack.drain(fixed_end..).collect();
                                     self.push(alloc_list(varargs))?;
                                 } else {
                                     self.push(alloc_list(Vec::new()))?;
@@ -1942,45 +2001,53 @@ mod tests {
         assert!(compile_and_run("max(1, 2, 3)").is_ok());
     }
 
-    // ---- task 26：ITERATOR / FOR_ITER / UNPACK VM 执行 ----
+    // ---- task 26/32：ITERATOR / FOR_ITER / UNPACK VM 执行 ----
     //
-    // 注：顶层=局部作用域的已知 bug（spec line 334-338，task 23 既有先例）使
-    // 真实编译的顶层 for..in 因 slot 1 越界而失败，故此处用合成 Chunk 直接
-    // 验证 opcode 语义（与 test_while_loop_iterations 同策略）；编译器侧由
-    // test_compiler_emits_for_in_opcodes 验证发射。
+    // task 32 修复后，真实编译的顶层 for..in 端到端可用（见 test_for_in_*）。
+    // 此处合成 Chunk 仍验证 FOR_ITER opcode 语义——迭代器存于局部 slot，
+    // FOR_ITER 从 slot 读取而非栈顶。
 
     /// 构造「统计可迭代对象元素个数」的 for..in 循环字节码并运行，返回计数。
     /// 覆盖 ITERATOR + FOR_ITER 对各可迭代类型的执行。
     fn count_iterations(iterable: Object) -> Result<Object, String> {
-        // 布局：slot1=count（slot0 为 callee 占位）；push iterable→ITERATOR；
-        // loop: FOR_ITER→Pop(弃值)→count+=1→JUMP_BACK；exit: Pop(iter)→LoadLocal 1→HALT。
+        // 布局：slot0=<self>, slot1=count, slot2=iterator。
+        // 先 Nil 预留 slot1/slot2，StoreLocal 将迭代器写入 slot2。
+        // loop: FOR_ITER(slot2)→Pop(弃值)→count+=1→JUMP_BACK；exit: LoadLocal1→HALT。
         let code = vec![
+            OpCode::Nil as u8, // 0: reserve slot1
+            OpCode::Nil as u8, // 1: reserve slot2
             OpCode::Constant as u8,
             0x00,
-            0x00, // Int(0) → slot1
-            OpCode::Constant as u8,
-            0x00,
-            0x01,                   // iterable
-            OpCode::Iterator as u8, // → iter
-            OpCode::ForIter as u8,
-            0x00,
-            0x0C,              // → exit (offset 12)
-            OpCode::Pop as u8, // 弃迭代值
-            OpCode::LoadLocal as u8,
-            0x01,
-            OpCode::Constant as u8,
-            0x00,
-            0x02, // Int(1)
-            OpCode::Add as u8,
+            0x00, // 2: Int(0) → stack
             OpCode::StoreLocal as u8,
-            0x01,
+            0x01, // 5: slot1 = 0
+            OpCode::Constant as u8,
+            0x00,
+            0x01,                   // 7: iterable → stack
+            OpCode::Iterator as u8, // 10: → iter
+            OpCode::StoreLocal as u8,
+            0x02, // 11: slot2 = iter
+            // loop_start = 13:
+            OpCode::ForIter as u8,
+            0x02,
+            0x00,
+            0x0C,              // 13: slot2, exit offset 12 → exit at 29
+            OpCode::Pop as u8, // 17: discard value
+            OpCode::LoadLocal as u8,
+            0x01, // 18: push count
+            OpCode::Constant as u8,
+            0x00,
+            0x02,              // 20: Int(1)
+            OpCode::Add as u8, // 23: count + 1
+            OpCode::StoreLocal as u8,
+            0x01, // 24: slot1 = count + 1
             OpCode::JumpBack as u8,
             0x00,
-            0x0F,              // → loop_start (offset 15)
-            OpCode::Pop as u8, // exit: 弹出迭代器
+            0x10, // 26: backward 16 → loop_start 13
+            // exit = 29:
             OpCode::LoadLocal as u8,
-            0x01,
-            OpCode::Halt as u8,
+            0x01,               // 29: push count
+            OpCode::Halt as u8, // 31
         ];
         run_chunk(code, vec![Object::Int(0), iterable, Object::Int(1)])
     }
@@ -2029,32 +2096,38 @@ mod tests {
     #[test]
     fn test_for_iter_sums_list_values() {
         // 验证 FOR_ITER 推送的值确为各元素（累加 [0,1,2,3,4] = 10）。
-        // 布局：slot1=sum（slot0 为 callee 占位）；push list→ITERATOR；
-        // loop: FOR_ITER→LoadLocal1→Add→StoreLocal1→JUMP_BACK；
-        // exit: Pop→LoadLocal1→HALT。
+        // 布局：slot0=<self>, slot1=sum, slot2=iterator。
         let code = vec![
+            OpCode::Nil as u8, // 0: reserve slot1
+            OpCode::Nil as u8, // 1: reserve slot2
             OpCode::Constant as u8,
             0x00,
-            0x00, // Int(0) → slot1 (sum)
-            OpCode::Constant as u8,
-            0x00,
-            0x01, // list [0,1,2,3,4]
-            OpCode::Iterator as u8,
-            OpCode::ForIter as u8,
-            0x00,
-            0x08, // → exit (offset 8)
-            OpCode::LoadLocal as u8,
-            0x01,              // push sum
-            OpCode::Add as u8, // value + sum
+            0x00, // 2: Int(0) → slot1
             OpCode::StoreLocal as u8,
-            0x01, // sum = value + sum
+            0x01, // 5: slot1 = 0
+            OpCode::Constant as u8,
+            0x00,
+            0x01,                   // 7: list → stack
+            OpCode::Iterator as u8, // 10: → iter
+            OpCode::StoreLocal as u8,
+            0x02, // 11: slot2 = iter
+            // loop_start = 13:
+            OpCode::ForIter as u8,
+            0x02,
+            0x00,
+            0x08, // 13: slot2, exit offset 8 → exit at 25
+            OpCode::LoadLocal as u8,
+            0x01,              // 17: push sum
+            OpCode::Add as u8, // 19: value + sum
+            OpCode::StoreLocal as u8,
+            0x01, // 20: sum = value + sum
             OpCode::JumpBack as u8,
             0x00,
-            0x0B,              // → loop_start (offset 11)
-            OpCode::Pop as u8, // exit: 弹出迭代器
+            0x0C, // 22: backward 12 → loop_start 13
+            // exit = 25:
             OpCode::LoadLocal as u8,
-            0x01,
-            OpCode::Halt as u8,
+            0x01,               // 25: push sum
+            OpCode::Halt as u8, // 27
         ];
         let list = alloc_list(vec![
             Object::Int(0),
@@ -2100,35 +2173,43 @@ mod tests {
     #[test]
     fn test_for_iter_with_unpack_sums_first_elements() {
         // 端到端模拟双变量 for..in：遍历 [(1,10),(2,20),(3,30)]，累加每对首元素 = 6。
-        // 验证 FOR_ITER + UNPACK + 多轮迭代协同。布局：slot1=sum（slot0 为 callee 占位）；
-        // push list→ITERATOR；loop: FOR_ITER→UNPACK 2→LoadLocal1→Add→StoreLocal1→
-        // Pop(弃次元素)→JUMP_BACK；exit: Pop→LoadLocal1→HALT。
+        // 验证 FOR_ITER + UNPACK + 多轮迭代协同。布局：slot0=<self>, slot1=sum,
+        // slot2=iterator。loop: FOR_ITER(slot2)→UNPACK 2→LoadLocal1→Add→StoreLocal1→
+        // Pop(弃次元素)→JUMP_BACK；exit: LoadLocal1→HALT。
         let code = vec![
+            OpCode::Nil as u8, // 0: reserve slot1
+            OpCode::Nil as u8, // 1: reserve slot2
             OpCode::Constant as u8,
             0x00,
-            0x00, // Int(0) → slot1
-            OpCode::Constant as u8,
-            0x00,
-            0x01, // list of tuples
-            OpCode::Iterator as u8,
-            OpCode::ForIter as u8,
-            0x00,
-            0x0B, // → exit (offset 11)
-            OpCode::Unpack as u8,
-            0x02, // → [iter, second, first]
-            OpCode::LoadLocal as u8,
-            0x01,              // push sum
-            OpCode::Add as u8, // first + sum
+            0x00, // 2: Int(0) → slot1
             OpCode::StoreLocal as u8,
-            0x01,              // sum = first + sum
-            OpCode::Pop as u8, // 弃 second
+            0x01, // 5: slot1 = 0
+            OpCode::Constant as u8,
+            0x00,
+            0x01,                   // 7: list of tuples → stack
+            OpCode::Iterator as u8, // 10: → iter
+            OpCode::StoreLocal as u8,
+            0x02, // 11: slot2 = iter
+            // loop_start = 13:
+            OpCode::ForIter as u8,
+            0x02,
+            0x00,
+            0x0B, // 13: slot2, exit offset 11 → exit at 28
+            OpCode::Unpack as u8,
+            0x02, // 17: → [second, first]
+            OpCode::LoadLocal as u8,
+            0x01,              // 19: push sum
+            OpCode::Add as u8, // 21: first + sum
+            OpCode::StoreLocal as u8,
+            0x01,              // 22: sum = first + sum
+            OpCode::Pop as u8, // 24: discard second
             OpCode::JumpBack as u8,
             0x00,
-            0x0E,              // → loop_start (offset 14)
-            OpCode::Pop as u8, // exit: 弹出迭代器
+            0x0F, // 25: backward 15 → loop_start 13
+            // exit = 28:
             OpCode::LoadLocal as u8,
-            0x01,
-            OpCode::Halt as u8,
+            0x01,               // 28: push sum
+            OpCode::Halt as u8, // 30
         ];
         let tuples = alloc_list(vec![
             alloc_tuple(vec![Object::Int(1), Object::Int(10)]),
@@ -2321,6 +2402,93 @@ mod tests {
         assert!(chunk2.code.contains(&(OpCode::Unpack as u8)));
     }
 
+    // ---- task 32：for..in 端到端（真实编译 + 真实 VM 执行）----
+    //
+    // 修复 compile_for_in slot 冲突 + 回填 BuildList/BuildDict/BuildSet handler
+    // 后，顶层 for..in 端到端可用。assert() 内联断言验证循环语义。
+
+    #[test]
+    fn test_for_in_range_end_to_end() {
+        // 核心回归：range(3) 遍历，累加 0+1+2 = 3
+        let src = "total = 0\nfor i in range(3) {\n    total = total + i\n}\nassert(total == 3)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_list_end_to_end() {
+        // 列表遍历：依赖 BuildList handler
+        let src =
+            "total = 0\nfor item in [1, 2, 3] {\n    total = total + item\n}\nassert(total == 6)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_string_end_to_end() {
+        // 字符串遍历：计数字符数
+        let src = "count = 0\nfor ch in \"abc\" {\n    count = count + 1\n}\nassert(count == 3)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_dict_keys_end_to_end() {
+        // 字典键遍历：依赖 BuildDict handler + DictKeys 迭代器
+        let src = "d = {\"a\": 1, \"b\": 2, \"c\": 3}\ncount = 0\nfor key in d {\n    count = count + 1\n}\nassert(count == 3)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_double_var_unpack_end_to_end() {
+        // 双变量解包：遍历 [(1,10),(2,20)]，累加首元素 = 3
+        let src = "total = 0\nfor k, v in [(1, 10), (2, 20)] {\n    total = total + k\n}\nassert(total == 3)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_var_retains_last_value() {
+        // 循环变量在循环结束后保持最后值（range(5) 最后值 = 4）
+        let src = "for x in range(5) {\n}\nassert(x == 4)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_break() {
+        // break 正确跳出循环（i==3 时跳出，last = 2 来自 i==2 的最后一次赋值）
+        // 注：mslang 在 {} 内抑制换行，故 last = i 必须在 if 块之后（否则
+        // `last = i if` 被解析为三元表达式）。
+        let src = "last = 0\nfor i in range(100) {\n    if i == 3 {\n        break\n    }\n    last = i\n}\nassert(last == 2)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_continue() {
+        // continue 跳到下一次迭代（跳过偶数，累加奇数 1+3 = 4）
+        let src = "total = 0\nfor i in range(5) {\n    if i % 2 == 0 {\n        continue\n    }\n    total = total + i\n}\nassert(total == 4)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_nested_loops() {
+        // 嵌套循环：3×3 = 9 次迭代
+        let src = "count = 0\nfor i in range(3) {\n    for j in range(3) {\n        count = count + 1\n    }\n}\nassert(count == 9)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_nested_break_only_inner() {
+        // 嵌套循环 break 只影响最内层：内层每次遍历到 j==0 就 break，
+        // 外层 3 次 → count = 3
+        let src = "count = 0\nfor i in range(3) {\n    for j in range(3) {\n        count = count + 1\n        break\n    }\n}\nassert(count == 3)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_for_in_non_iterable_type_error() {
+        // 对非可迭代类型（int）使用 for..in 抛出 TypeError
+        let result = compile_and_run("for i in 42 {\n}");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not iterable"));
+    }
+
     // ---- task 27：调用帧与函数调用 ----
 
     #[test]
@@ -2477,11 +2645,9 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("expected 1-1 arguments, got 2")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("expected 1-1 arguments, got 2"));
     }
 
     #[test]
@@ -2495,11 +2661,9 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("expected 2-2 arguments, got 1")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("expected 2-2 arguments, got 1"));
     }
 
     // ---- task 31：默认参数 / 可变参数 ----
@@ -2636,11 +2800,9 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("expected 2-3 arguments, got 1")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("expected 2-3 arguments, got 1"));
     }
 
     #[test]
@@ -2655,11 +2817,9 @@ mod tests {
             "#,
         );
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .contains("expected 2-2 arguments, got 3")
-        );
+        assert!(result
+            .unwrap_err()
+            .contains("expected 2-2 arguments, got 3"));
     }
 
     #[test]
@@ -2940,9 +3100,7 @@ mod tests {
     #[test]
     fn test_nonlocal_missing_binding_is_compile_error() {
         // nonlocal 声明的名字在外层作用域不存在 → 编译错误。
-        let program = parse(
-            "fn bad() {\n    nonlocal zzz\n    zzz = 1\n}\n",
-        );
+        let program = parse("fn bad() {\n    nonlocal zzz\n    zzz = 1\n}\n");
         let mut compiler = Compiler::new();
         let result = compiler.compile(&program);
         assert!(result.is_err());

@@ -58,7 +58,7 @@
 
 | # | 任务 | 状态 |
 |---|---|---|
-| 32 | [for..in 循环与迭代器协议](32-for-in-iterator.md) | ⬜ |
+| 32 | [for..in 循环与迭代器协议](32-for-in-iterator.md) | ✅ |
 | 33 | [列表推导式](33-list-comprehension.md) | ⬜ |
 | 34 | [Dict/Set 推导式](34-dict-set-comprehension.md) | ⬜ |
 | 35 | [切片操作](35-slicing.md) | ⬜ |
