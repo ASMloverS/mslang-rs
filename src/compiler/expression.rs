@@ -12,7 +12,7 @@ use super::{Chunk, Compiler, OpCode};
 
 // ---- 表达式编译入口与访问器 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 获取当前字节码偏移量。
     pub fn current_offset(&self) -> usize {
         self.unit.chunk.code.len()
@@ -88,7 +88,7 @@ impl Compiler<'_> {
 
 // ---- 字面量与标识符 ----
 
-impl Compiler<'_> {
+impl Compiler {
     fn compile_literal(&mut self, lit: &Literal, line: usize) -> Result<(), String> {
         match lit {
             Literal::Int(n) => self.emit_constant(Object::Int(*n), line)?,
@@ -121,7 +121,7 @@ impl Compiler<'_> {
 
 // ---- 二元与一元运算 ----
 
-impl Compiler<'_> {
+impl Compiler {
     fn compile_binary(
         &mut self,
         left: &Expr,
@@ -178,7 +178,7 @@ impl Compiler<'_> {
 // （`1 < x < 10` → `(1 < x) and (x < 10)`），因此以下方法暂无调用方。
 // 保留作为编译策略参考，待后续如需直接编译链式比较节点时使用。
 
-impl Compiler<'_> {
+impl Compiler {
     /// 将 BinaryOp 比较运算符映射到 OpCode。
     #[allow(dead_code)]
     fn comparison_opcode(&self, op: &BinaryOp) -> OpCode {
@@ -232,7 +232,7 @@ impl Compiler<'_> {
 
 // ---- 赋值表达式 ----
 
-impl Compiler<'_> {
+impl Compiler {
     fn compile_assignment(
         &mut self,
         target: &Expr,
@@ -287,7 +287,15 @@ impl Compiler<'_> {
     fn compile_store_target(&mut self, target: &Expr, line: usize) -> Result<(), String> {
         match target {
             Expr::Identifier(name) => {
-                if let Some(slot) = self.resolve_local(name) {
+                if self.nonlocal_names.contains(name) {
+                    // nonlocal 写语义：强制走上值路径，不存在则编译错误
+                    // （04-functions.md："no binding for nonlocal 'x'"）。
+                    let idx = self
+                        .resolve_upvalue(name)
+                        .ok_or_else(|| format!("no binding for nonlocal '{}'", name))?;
+                    self.emit_byte(OpCode::StoreUpvalue as u8, line);
+                    self.emit_byte(idx as u8, line);
+                } else if let Some(slot) = self.resolve_local(name) {
                     self.emit_byte(OpCode::StoreLocal as u8, line);
                     self.emit_byte(slot as u8, line);
                 } else if let Some(idx) = self.resolve_upvalue(name) {
@@ -322,7 +330,7 @@ impl Compiler<'_> {
 
 // ---- 三元、调用、下标、属性 ----
 
-impl Compiler<'_> {
+impl Compiler {
     fn compile_ternary(
         &mut self,
         condition: &Expr,
@@ -371,7 +379,7 @@ impl Compiler<'_> {
 
 // ---- 逻辑短路求值 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// `and` 短路求值：左操作数为假时直接跳过右操作数。
     fn compile_logical_and(
         &mut self,
@@ -400,7 +408,7 @@ impl Compiler<'_> {
 
 // ---- 切片 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 编译切片 `obj[start:stop:step]`。
     /// flags 位域：bit 0 = has_start, bit 1 = has_stop, bit 2 = has_step。
     fn compile_slice(
@@ -433,7 +441,7 @@ impl Compiler<'_> {
 
 // ---- 集合字面量 ----
 
-impl Compiler<'_> {
+impl Compiler {
     fn compile_list_literal(&mut self, elements: &[Expr], line: usize) -> Result<(), String> {
         for elem in elements {
             self.compile_expression(elem, line)?;
@@ -488,7 +496,7 @@ mod tests {
     use crate::compiler::{Compiler, OpCode};
 
     /// 在编译产物中查找指定 opcode 的字节码偏移。
-    fn find_opcode(compiler: &Compiler<'_>, opcode: OpCode) -> Option<usize> {
+    fn find_opcode(compiler: &Compiler, opcode: OpCode) -> Option<usize> {
         compiler
             .chunk()
             .code

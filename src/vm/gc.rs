@@ -453,8 +453,8 @@ static PLACEHOLDER_DESC: TypeDescriptor = TypeDescriptor {
 };
 
 /// 类型描述表查找：为每个 TypeTag 返回对应的 TypeDescriptor。
-/// 参照 14-gc.md — 所有 17 种 TypeTag 必须覆盖。当前仅 STRING/LIST/DICT/TUPLE/SET
-/// 由 GC 托管；FUNCTION..JOIN_HANDLE(6..=16) 与 LARGE_OBJECT(0xFF) 以占位 noop 注册，
+/// 参照 14-gc.md — 所有 TypeTag 必须覆盖。当前仅 STRING/LIST/DICT/TUPLE/SET
+/// 由 GC 托管；FUNCTION..UPVALUE(6..=17) 与 LARGE_OBJECT(0xFF) 以占位 noop 注册，
 /// 随对应 task 落地补真实 trace。仅对**真正未知**的字节值 debug panic（spec V7）。
 fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
     match tag {
@@ -463,13 +463,14 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::DICT as u8 => &DICT_DESC,
         t if t == TypeTag::TUPLE as u8 => &TUPLE_DESC,
         t if t == TypeTag::SET as u8 => &SET_DESC,
-        // 合法但当前未托管 TypeTag（6..=16 与 0xFF）→ 占位 noop trace。
-        // 这些类型不经 gc_alloc_* 分配，故 trace/copy/free 实际不被调用；防悬垂。
-        // TODO task 28: CLOSURE 真实 trace（function + upvalues）。
+        // 合法但当前未托管 TypeTag（6..=17 与 0xFF）→ 占位 noop trace。
+        // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE 用 Box::into_raw），故
+        // trace/copy/free 实际不被调用；防悬垂。
+        // CLOSURE/UPVALUE 真实 trace 待 GC 接管闭包堆分配后补全（future task）。
         // TODO task 40/41: CLASS/INSTANCE/BOUND_METHOD。
         // TODO task 45: MODULE。TODO task 52/26: ITERATOR。TODO task 39: GENERATOR。
         // TODO task 53: FUTURE/CHANNEL/JOIN_HANDLE。
-        t if (TypeTag::FUNCTION as u8..=TypeTag::JOIN_HANDLE as u8).contains(&t)
+        t if (TypeTag::FUNCTION as u8..=TypeTag::UPVALUE as u8).contains(&t)
             || t == TypeTag::LARGE_OBJECT as u8 =>
         {
             &PLACEHOLDER_DESC

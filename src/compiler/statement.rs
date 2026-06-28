@@ -6,13 +6,13 @@
 //! 参照 [19-compile-statements](../../../docs/mslang/tasks/19-compile-statements.md)。
 
 use crate::ast::node::{AssignOp, BinaryOp, Expr, Stmt, UnaryOp};
-use crate::vm::object::{alloc_closure, alloc_function, alloc_string, Function};
+use crate::vm::object::{alloc_function, alloc_string, Function};
 
 use super::{CompilationUnit, Compiler, Local, OpCode};
 
 // ---- 语句编译分发器 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 语句编译入口。根据 Stmt 变体路由到对应编译方法。
     pub fn compile_statement(&mut self, stmt: &Stmt, line: usize) -> Result<(), String> {
         match stmt {
@@ -62,7 +62,7 @@ impl Compiler<'_> {
 
 // ---- 声明、赋值、表达式语句、block、return、nonlocal/global ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 编译 var/短声明/const 声明。三者均：求值右值 → 声明局部 → 存入 slot。
     /// `is_const` 为 true 时先做常量表达式校验。
     ///
@@ -80,6 +80,18 @@ impl Compiler<'_> {
             self.validate_const_expr(init, line)?;
         }
         self.compile_expression(init, line)?;
+        // nonlocal 写语义（04-functions.md）：声明为 nonlocal 的名字强制走上值路径，
+        // 不在当前作用域创建新局部（否则会遮蔽外层变量而非写入它）。
+        if self.nonlocal_names.contains(name) {
+            return match self.resolve_upvalue(name) {
+                Some(idx) => {
+                    self.emit_byte(OpCode::StoreUpvalue as u8, line);
+                    self.emit_byte(idx as u8, line);
+                    Ok(())
+                }
+                None => Err(format!("no binding for nonlocal '{}'", name)),
+            };
+        }
         let slot = match self.resolve_local(name) {
             Some(slot) => slot,
             None => {
@@ -173,10 +185,11 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// 编译函数声明（task 27）。
-    /// 创建独立编译单元，预留 slot 0 给被调用者（closure 自身），参数从 slot 1 起。
-    /// 编译函数体后追加隐式 `NIL + RETURN`，构建 MsFunction→MsClosure 存入常量池，
-    /// 再经 CONSTANT + STORE_GLOBAL 绑定函数名到全局。
+    /// 编译函数声明（task 27/28）。
+    /// 创建独立编译单元（parent 链接父单元以启用上值解析），预留 slot 0 给被调用者
+    /// （closure 自身），参数从 slot 1 起。编译函数体后追加隐式 `NIL + RETURN`。
+    /// task 28 改造：存 **Function**（非 Closure）入常量池，发 `CLOSURE` 指令 +
+    /// 逐上值操作数（运行期包装），并写真值 `upvalue_count`。
     fn compile_fn_decl(
         &mut self,
         name: &str,
@@ -196,7 +209,7 @@ impl Compiler<'_> {
             }],
             upvalues: Vec::new(),
             scope_depth: 0,
-            parent: None,
+            parent: std::ptr::null(),
         };
         for param in params {
             func_unit.locals.push(Local {
@@ -206,23 +219,55 @@ impl Compiler<'_> {
             });
         }
 
+        // 换出父单元，编译函数体。期间 func_unit.parent 指向 saved_unit（裸指针，
+        // 规避 self-referential 借用冲突，见 CompilationUnit.parent 字段注释）。
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line);
         self.emit_byte(OpCode::Return as u8, line);
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
-        // MsFunction 存入常量池，再包装为 MsClosure（CLOSURE）— 用户可调用形式。
+        // 上值捕获回填：函数体中 is_local=true 的上值对应父单元的局部变量，
+        // 标记其 is_captured（驱动 end_scope 发射 CLOSE_UPVALUE）。此时 self.unit
+        // 已恢复为父单元，func_unit 为刚编译的子单元。先收集再写回以避开借用。
+        let captured_locals: Vec<usize> = func_unit
+            .upvalues
+            .iter()
+            .filter(|uv| uv.is_local)
+            .map(|uv| uv.index)
+            .collect();
+        for idx in captured_locals {
+            if idx < self.unit.locals.len() {
+                self.unit.locals[idx].is_captured = true;
+            }
+        }
+
+        // 存 Function（非 Closure）入常量池 —— CLOSURE 指令运行期包装。
         let function = Function {
             name: name.to_string(),
             arity: params.len(),
             code: func_unit.chunk.code,
             constants: func_unit.chunk.constants,
-            upvalue_count: 0,
+            upvalue_count: func_unit.upvalues.len(),
             source_file: self.source_file.clone(),
         };
-        let closure = alloc_closure(alloc_function(function));
-        self.emit_constant(closure, line)?;
+        let func_idx = self.add_constant(alloc_function(function));
+        let func_idx = u16::try_from(func_idx)
+            .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+
+        // 发 CLOSURE(func_idx) + 逐上值操作数（is_local:1 + index:1 每上值）。
+        self.emit_byte(OpCode::Closure as u8, line);
+        self.emit_bytes(&func_idx.to_be_bytes(), line);
+        for uv in &func_unit.upvalues {
+            self.emit_byte(if uv.is_local { 1 } else { 0 }, line);
+            let idx = u8::try_from(uv.index).map_err(|_| {
+                format!("upvalue index {} exceeds 255 (function too large)", uv.index)
+            })?;
+            self.emit_byte(idx, line);
+        }
+
+        // 绑定函数名到全局（与 task 27 一致）
         let name_idx = self.add_constant(alloc_string(name));
         let name_idx = u16::try_from(name_idx)
             .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
@@ -282,7 +327,7 @@ impl Compiler<'_> {
 
 // ---- 控制流：if / while / for..in / break / continue ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 编译 if/elif/else。
     fn compile_if(
         &mut self,

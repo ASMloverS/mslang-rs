@@ -7,8 +7,9 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_function, alloc_iterator, read_closure, read_function, read_iterator,
-    read_list, read_str, read_tuple, CmpOp, Function, Object, TypeTag,
+    alloc_closure, alloc_function, alloc_iterator, alloc_upvalue, read_closure, read_function,
+    read_iterator, read_list, read_str, read_tuple, read_upvalue, CmpOp, Function, MsObjHeader,
+    MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -23,6 +24,10 @@ pub struct VM {
     globals: HashMap<String, Object>,
     /// 内置函数参数个数表（`usize::MAX` = 可变参数），供 CALL 校验。
     native_arities: HashMap<String, usize>,
+    /// 开放上值列表（task 28）。每项指向 MsUpvalue（TypeTag::UPVALUE）。
+    /// **不变量**：按 `location` **升序**维护（最小在前）。
+    /// `close_upvalues_from` 从末尾向前扫描，依赖此序保证正确性（见 §6/§8）。
+    open_upvalues: Vec<*mut MsObjHeader>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
@@ -37,6 +42,7 @@ impl VM {
             call_stack: Vec::new(),
             globals: HashMap::new(),
             native_arities: HashMap::new(),
+            open_upvalues: Vec::new(),
             heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
@@ -52,7 +58,7 @@ impl VM {
             upvalue_count: 0,
             source_file: None,
         };
-        let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function)) else {
+        let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
         };
         self.call_stack.push(CallFrame::new(closure_ptr, 0));
@@ -156,6 +162,67 @@ impl VM {
 }
 
 impl VM {
+    /// 捕获（或复用）指向栈槽 `location` 的开放上值，返回 `*mut MsObjHeader` (MsUpvalue)。
+    /// 插入时维持 `open_upvalues` 按 `location` **升序**（最小在前）。
+    ///
+    /// 升序不变量是 `close_upvalues_from` 正确性的前提：它从末尾（最大 location）
+    /// 向前扫描，遇 `location < last` 即 break。若非升序，close 会提前中断或遗漏。
+    fn capture_upvalue(&mut self, location: usize) -> *mut MsObjHeader {
+        // 升序表中，第一个 location >= 新 location 的位置即插入点。
+        let insert_at = self.open_upvalues.iter().position(|&ptr| {
+            // SAFETY: ptr 指向由 alloc_upvalue 分配的有效 MsUpvalue。
+            let loc = unsafe { (*(ptr as *const MsUpvalue)).location };
+            loc >= location
+        });
+
+        if let Some(i) = insert_at {
+            let existing = self.open_upvalues[i];
+            // SAFETY: existing 指向由 alloc_upvalue 分配的有效 MsUpvalue。
+            let loc = unsafe { (*(existing as *const MsUpvalue)).location };
+            if loc == location {
+                return existing; // 复用已存在的开放上值（多个闭包共享同一变量）
+            }
+            // 插入新上值于 i（保持升序：新 location < existing[i].location）
+            let Object::Ref(ptr) = alloc_upvalue(location) else {
+                unreachable!()
+            };
+            self.open_upvalues.insert(i, ptr);
+            return ptr;
+        }
+
+        // 新 location 大于所有现存上值 → 追加末尾（升序保持）
+        let Object::Ref(ptr) = alloc_upvalue(location) else {
+            unreachable!()
+        };
+        self.open_upvalues.push(ptr);
+        ptr
+    }
+
+    /// 关闭所有 `location >= last` 的开放上值：将栈槽当前值拷贝到 `closed`。
+    /// 依赖 `open_upvalues` 按 location 升序：从末尾（最大 location）向前扫，
+    /// 遇 `location < last` 即停止（升序保证其前所有 location 更小，确属作用域外）。
+    ///
+    /// **必须在栈截断前调用**（`close` 读取 `stack[location]`，截断后越界）。
+    fn close_upvalues_from(&mut self, last: usize) {
+        let mut i = self.open_upvalues.len();
+        while i > 0 {
+            i -= 1;
+            let ptr = self.open_upvalues[i];
+            // SAFETY: ptr 指向由 alloc_upvalue 分配的有效 MsUpvalue。
+            let location = unsafe { (*(ptr as *const MsUpvalue)).location };
+            if location < last {
+                break;
+            }
+            // SAFETY: ptr 指向有效 MsUpvalue；close 仅读写其 closed 字段与（借）栈。
+            unsafe {
+                read_upvalue(ptr).close(&self.stack);
+            }
+            self.open_upvalues.remove(i);
+        }
+    }
+}
+
+impl VM {
     fn run(&mut self) -> Result<Object, String> {
         loop {
             // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
@@ -200,10 +267,13 @@ impl VM {
                         .stack_base
                         .checked_add(slot)
                         .ok_or_else(|| "local slot overflow".to_string())?;
-                    *self
-                        .stack
-                        .get_mut(idx)
-                        .ok_or_else(|| "local slot out of range".to_string())? = value;
+                    // task 28：新局部变量声明时（VarDecl/compile_var_decl），slot 尚不存在
+                    // 于栈上（StoreLocal 先 pop 再写）。以 Nil 填充至 idx 保证写入成功。
+                    // 已有 slot（赋值/复合赋值）不受影响：while 条件为 false，直接覆写。
+                    while self.stack.len() <= idx {
+                        self.stack.push(Object::Nil);
+                    }
+                    self.stack[idx] = value;
                 }
 
                 OpCode::LoadGlobal => {
@@ -556,6 +626,83 @@ impl VM {
                     }
                 }
 
+                // CLOSURE（task 28）：从常量池取出 Function，捕获上值，创建 Closure。
+                // 操作数：func_idx(2) + 每上值 (is_local:1, index:1)。
+                OpCode::Closure => {
+                    let func_idx = self.read_u16()? as usize;
+                    let func_obj = self.read_constant(func_idx)?;
+
+                    let func_ptr = match func_obj {
+                        Object::Ref(ptr)
+                            if unsafe { (*ptr).type_tag } == TypeTag::FUNCTION as u8 =>
+                        {
+                            ptr
+                        }
+                        _ => return Err("CLOSURE expects a Function".to_string()),
+                    };
+
+                    // task 27 嵌套布局：read_function(ptr).function.upvalue_count
+                    let upvalue_count = unsafe { read_function(func_ptr) }.function.upvalue_count;
+                    let mut upvalues: Vec<*mut MsObjHeader> = Vec::with_capacity(upvalue_count);
+
+                    for _ in 0..upvalue_count {
+                        let is_local = self.read_byte()? == 1;
+                        let index = self.read_byte()? as usize; // 编译期已断言 ≤ 255
+
+                        if is_local {
+                            // 直接外层局部变量：捕获当前帧栈槽。
+                            let stack_base = self.call_stack.last().unwrap().stack_base;
+                            let location = stack_base + index;
+                            upvalues.push(self.capture_upvalue(location));
+                        } else {
+                            // 外层上值：复用当前闭包的上值（上值链穿透）。
+                            let closure_ptr = self.call_stack.last().unwrap().closure;
+                            // SAFETY: closure_ptr 指向当前帧的 MsClosure。
+                            let closure = unsafe { read_closure(closure_ptr) };
+                            upvalues.push(closure.upvalues[index]);
+                        }
+                    }
+
+                    let closure_obj = alloc_closure(Object::Ref(func_ptr), upvalues);
+                    self.push(closure_obj)?;
+                }
+
+                // LOAD_UPVALUE（task 28）：将当前闭包的上值[idx]压栈。
+                OpCode::LoadUpvalue => {
+                    let idx = self.read_byte()? as usize;
+                    let closure_ptr = self.call_stack.last().unwrap().closure;
+                    // SAFETY: closure_ptr 指向当前帧的 MsClosure。
+                    let closure = unsafe { read_closure(closure_ptr) };
+                    let upvalue_ptr = closure.upvalues[idx];
+                    // SAFETY: upvalue_ptr 指向由 alloc_upvalue 分配的有效 MsUpvalue。
+                    let value = unsafe { read_upvalue(upvalue_ptr) }.get(&self.stack);
+                    self.push(value)?;
+                }
+
+                // STORE_UPVALUE（task 28）：将栈顶存入当前闭包的上值[idx]（peek，不弹）。
+                OpCode::StoreUpvalue => {
+                    let idx = self.read_byte()? as usize;
+                    let value = self
+                        .stack
+                        .last()
+                        .cloned()
+                        .unwrap_or(Object::Nil); // peek 栈顶（不弹）
+                    let closure_ptr = self.call_stack.last().unwrap().closure;
+                    // SAFETY: closure_ptr 指向当前帧的 MsClosure。
+                    let closure = unsafe { read_closure(closure_ptr) };
+                    let upvalue_ptr = closure.upvalues[idx];
+                    // SAFETY: upvalue_ptr 指向由 alloc_upvalue 分配的有效 MsUpvalue。
+                    // read_upvalue 返回独立 &mut（源自裸指针，不与 self.stack 借用重叠）。
+                    unsafe { read_upvalue(upvalue_ptr) }.set(&mut self.stack, value);
+                }
+
+                // CLOSE_UPVALUE（task 28）：关闭栈顶位置对应的开放上值，再弹栈。
+                OpCode::CloseUpvalue => {
+                    let stack_top = self.stack.len() - 1;
+                    self.close_upvalues_from(stack_top);
+                    self.stack.pop();
+                }
+
                 // CALL（task 25/27）：native 分支（TypeTag::FUNCTION）+ 用户函数分支（TypeTag::CLOSURE）。
                 OpCode::Call => {
                     let argc = self.read_byte()? as usize;
@@ -629,7 +776,7 @@ impl VM {
                     }
                 }
 
-                // RETURN（task 27）：弹出返回值，恢复调用者帧，截断值栈。
+                // RETURN（task 27/28）：弹出返回值，关闭本帧开放上值，恢复调用者帧，截断值栈。
                 OpCode::Return => {
                     let return_value = self.stack.pop().unwrap_or(Object::Nil);
                     // TODO(task 36)：弹出本帧前须执行其 defer 条目（EXEC_DEFER，LIFO）。
@@ -639,6 +786,8 @@ impl VM {
                         .last()
                         .ok_or("return outside function".to_string())?
                         .stack_base;
+                    // task 28：先关闭当前帧的所有开放上值（栈尚未截断，location 仍有效）。
+                    self.close_upvalues_from(old_base);
                     self.stack.truncate(old_base); // 移除 callee(slot0)+args+locals
                     self.call_stack.pop();
                     self.stack.push(return_value);
@@ -1971,15 +2120,17 @@ mod tests {
 
     #[test]
     fn test_function_decl_compiles_to_global_binding() {
-        // fn 声明编译为 CONSTANT(closure) + STORE_GLOBAL(name)。
+        // task 28：fn 声明编译为存 Function 入常量池 + 发 CLOSURE 指令（运行期包装）
+        // + STORE_GLOBAL(name)。常量池存 FUNCTION（非 CLOSURE）。
         let prog = parse("fn f(x) { return x }");
         let chunk = Compiler::new().compile(&prog).unwrap();
         assert!(chunk.code.contains(&(OpCode::StoreGlobal as u8)));
-        // 常量池中应存在 CLOSURE 对象（用户可调用形式）
+        assert!(chunk.code.contains(&(OpCode::Closure as u8)));
+        // 常量池中应存在 MsFunction（CLOSURE 指令运行期包装为 Closure）
         assert!(chunk.constants.iter().any(|c| {
             matches!(
                 c,
-                Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8
+                Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8
             )
         }));
     }
@@ -2008,7 +2159,7 @@ mod tests {
             assert_eq!(f.function.name, "test");
         }
 
-        let closure_obj = alloc_closure(func_obj);
+        let closure_obj = alloc_closure(func_obj, Vec::new());
         let Object::Ref(cl_ptr) = closure_obj else {
             panic!("expected Ref");
         };
@@ -2209,6 +2360,238 @@ mod tests {
                 return a + b
             }
             assert(add(add(1, 2), add(3, 4)) == 10)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    // ---- task 28：闭包与上值机制 ----
+    //
+    // 注：匿名 fn 字面量（`fn() {...}` 表达式）由 task 29 实现；本任务的闭包机制
+    // 经「命名函数声明」（编译期发 CLOSURE 指令）即可完整验证——CLOSURE 指令对命名/
+    // 匿名函数一致地捕获上值并运行期包装。
+
+    #[test]
+    fn test_closure_make_counter() {
+        // 经典计数器：nonlocal 写捕获。counter() 返回 1、2、3。
+        let result = compile_and_run(
+            r#"
+            fn make_counter() {
+                count = 0
+                fn step() {
+                    nonlocal count
+                    count += 1
+                    return count
+                }
+                return step
+            }
+            counter = make_counter()
+            assert(counter() == 1)
+            assert(counter() == 2)
+            assert(counter() == 3)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_closure_read_capture() {
+        // 只读捕获：内层函数读取外层局部（无需 nonlocal）。
+        let result = compile_and_run(
+            r#"
+            fn make_reader() {
+                value = 42
+                fn reader() {
+                    return value
+                }
+                return reader
+            }
+            r = make_reader()
+            assert(r() == 42)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_closure_shared_upvalue_getter_setter() {
+        // 多个闭包共享同一上值：setter 经 nonlocal 修改后 getter 可见。
+        // 验证 capture_upvalue 对相同 location 复用同一 MsUpvalue。
+        let result = compile_and_run(
+            r#"
+            fn make_pair() {
+                x = 10
+                fn getter() {
+                    return x
+                }
+                fn setter(v) {
+                    nonlocal x
+                    x = v
+                }
+                assert(getter() == 10)
+                setter(42)
+                assert(getter() == 42)
+                return getter()
+            }
+            assert(make_pair() == 42)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_closure_nested_upvalue_chain() {
+        // 三层嵌套：最内层经 is_local=false 复用中间层的上值（上值链穿透）。
+        let result = compile_and_run(
+            r#"
+            fn outer() {
+                x = 1
+                fn middle() {
+                    fn inner() {
+                        return x
+                    }
+                    return inner()
+                }
+                return middle()
+            }
+            assert(outer() == 1)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_closure_survives_return_close() {
+        // 外层函数返回后，被捕获变量仍存活：RETURN 在 truncate 前关闭上值（拷到堆）。
+        let result = compile_and_run(
+            r#"
+            fn make() {
+                x = 5
+                fn reader() {
+                    return x
+                }
+                return reader
+            }
+            g = make()
+            assert(g() == 5)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_closure_two_independent_counters() {
+        // 两次 make_counter 产生独立计数器（各自独立的 count 上值）。
+        let result = compile_and_run(
+            r#"
+            fn make_counter() {
+                count = 0
+                fn step() {
+                    nonlocal count
+                    count += 1
+                    return count
+                }
+                return step
+            }
+            a = make_counter()
+            b = make_counter()
+            assert(a() == 1)
+            assert(a() == 2)
+            assert(b() == 1)
+            assert(a() == 3)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_nonlocal_write_modifies_outer() {
+        // nonlocal 写入对外层可见（经 STORE_UPVALUE 修改共享上值）。
+        let result = compile_and_run(
+            r#"
+            fn outer() {
+                total = 0
+                fn add_one() {
+                    nonlocal total
+                    total += 1
+                }
+                add_one()
+                add_one()
+                add_one()
+                return total
+            }
+            assert(outer() == 3)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_no_nonlocal_creates_local_does_not_penetrate() {
+        // 无 nonlocal 声明时，赋值在内层创建新局部，不穿透外层（04-functions.md）。
+        let result = compile_and_run(
+            r#"
+            fn outer() {
+                x = 10
+                fn inner() {
+                    x = 99
+                    return x
+                }
+                assert(inner() == 99)
+                assert(x == 10)
+                return x
+            }
+            assert(outer() == 10)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_nonlocal_missing_binding_is_compile_error() {
+        // nonlocal 声明的名字在外层作用域不存在 → 编译错误。
+        let program = parse(
+            "fn bad() {\n    nonlocal zzz\n    zzz = 1\n}\n",
+        );
+        let mut compiler = Compiler::new();
+        let result = compiler.compile(&program);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("nonlocal"),
+            "expected nonlocal error"
+        );
+    }
+
+    #[test]
+    fn test_closure_recursion_regression() {
+        // 回归：递归仍正常工作（闭包机制不影响调用帧）。
+        let result = compile_and_run(
+            r#"
+            fn fact(n) {
+                if n <= 1 {
+                    return 1
+                }
+                return n * fact(n - 1)
+            }
+            assert(fact(5) == 120)
+            assert(fact(10) == 3628800)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_closure_builtins_regression() {
+        // 回归：内置函数（len/abs/range 等）仍正常工作。
+        // 注：for-in 循环经编译器在顶层有已知栈布局限制（spec 334-338，task 23
+        // 既有先例），此处不使用 for-in，仅验证 builtin 调用不受闭包机制影响。
+        let result = compile_and_run(
+            r#"
+            assert(len("hello") == 5)
+            assert(abs(-7) == 7)
+            assert(abs(7) == 7)
+            assert(min(3, 8) == 3)
+            assert(max(3, 8) == 8)
             "#,
         );
         assert!(result.is_ok());

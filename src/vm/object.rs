@@ -36,6 +36,8 @@ pub enum TypeTag {
     CHANNEL = 14,
     BOUND_METHOD = 15,
     JOIN_HANDLE = 16,
+    /// 上值堆对象（task 28 新增）。
+    UPVALUE = 17,
     LARGE_OBJECT = 0xFF,
 }
 
@@ -540,8 +542,9 @@ pub struct MsClosure {
     pub upvalues: Vec<*mut MsObjHeader>,
 }
 
-/// 分配 MsClosure（TypeTag::CLOSURE），包裹一个 MsFunction。
-pub fn alloc_closure(function: Object) -> Object {
+/// 分配 MsClosure（TypeTag::CLOSURE），包裹一个 MsFunction 与其上值列表。
+/// task 28 扩展：新增 upvalues 参数（task 27 原签名为单参、upvalues 恒空）。
+pub fn alloc_closure(function: Object, upvalues: Vec<*mut MsObjHeader>) -> Object {
     let Object::Ref(func_ptr) = function else {
         unreachable!("alloc_closure expects MsFunction Ref");
     };
@@ -554,7 +557,7 @@ pub fn alloc_closure(function: Object) -> Object {
             class_ptr: 0,
         },
         function: func_ptr,
-        upvalues: Vec::new(),
+        upvalues,
     });
     Object::Ref(Box::into_raw(cl) as *mut MsObjHeader)
 }
@@ -565,6 +568,82 @@ pub fn alloc_closure(function: Object) -> Object {
 /// `ptr` 必须指向由 `alloc_closure` 分配的、在 `'a` 期间有效的 `MsClosure`。
 pub unsafe fn read_closure<'a>(ptr: *mut MsObjHeader) -> &'a MsClosure {
     &*(ptr as *mut MsClosure)
+}
+
+// ---------------------------------------------------------------------------
+// Upvalue 堆对象（task 28）
+// ---------------------------------------------------------------------------
+
+/// 上值堆对象。开放时读 `location` 指向的栈槽；关闭后读 `closed`。
+///
+/// TypeTag::UPVALUE（= 17，本任务新增）。引用 [28-closures](../../docs/mslang/tasks/28-closures.md) §1。
+/// GC 所有权：由 `MsClosure.upvalues` 最终持有；`VM.open_upvalues` 在关闭后移除指针。
+/// task 52 GC 须为其注册 trace（遍历 `closed` 中的 `Object::Ref`）。
+#[repr(C)]
+pub struct MsUpvalue {
+    pub header: MsObjHeader,
+    /// 栈位置（开放态有效）。
+    pub location: usize,
+    /// 堆存储（关闭态有效）。
+    pub closed: Option<Object>,
+}
+
+impl MsUpvalue {
+    pub fn new(location: usize) -> Self {
+        Self {
+            header: MsObjHeader {
+                gc_meta: 0,
+                type_tag: TypeTag::UPVALUE as u8,
+                size: std::mem::size_of::<MsUpvalue>() as u16,
+                _padding: 0,
+                class_ptr: 0,
+            },
+            location,
+            closed: None,
+        }
+    }
+
+    /// 读取上值当前持有的值。开放时读栈槽，关闭时读 `closed`。
+    /// 调用方须保证栈在开放态下长度 > `location`。
+    pub fn get(&self, stack: &[Object]) -> Object {
+        match &self.closed {
+            Some(val) => val.clone(),
+            None => stack[self.location].clone(),
+        }
+    }
+
+    /// 写入上值。开放时写栈槽，关闭时写 `closed`。
+    pub fn set(&mut self, stack: &mut [Object], value: Object) {
+        if self.closed.is_some() {
+            self.closed = Some(value);
+        } else {
+            stack[self.location] = value;
+        }
+    }
+
+    /// 关闭上值：将栈槽当前值拷贝到 `closed`。已关闭则幂等（不覆盖）。
+    /// 调用方须保证此调用发生在栈截断之前（见 [28-closures] §8 RETURN 改造）。
+    pub fn close(&mut self, stack: &[Object]) {
+        if self.closed.is_none() {
+            self.closed = Some(stack[self.location].clone());
+        }
+    }
+}
+
+/// 分配 MsUpvalue 堆对象（TypeTag::UPVALUE），返回 Object::Ref。
+/// MVP：Box 分配；task 52-gc 替换为 TLAB bump 分配。
+pub fn alloc_upvalue(location: usize) -> Object {
+    let obj = Box::new(MsUpvalue::new(location));
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsUpvalue（alloc_upvalue 的对偶）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_upvalue` 分配的、在 `'a` 期间有效的 `MsUpvalue`。
+/// 生命周期由调用方约束（`'a`），**不得**用 `'static` — 遵循 task 20 read_* 约定。
+pub unsafe fn read_upvalue<'a>(ptr: *mut MsObjHeader) -> &'a mut MsUpvalue {
+    &mut *(ptr as *mut MsUpvalue)
 }
 
 // ---------------------------------------------------------------------------

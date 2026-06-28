@@ -43,7 +43,7 @@ impl Default for Chunk {
 }
 
 /// 编译单元。每个编译单元对应一个函数或脚本顶层。
-pub struct CompilationUnit<'a> {
+pub struct CompilationUnit {
     /// 字节码块（常量池 + 字节码 + 行号）
     pub chunk: Chunk,
     /// 局部变量表
@@ -52,8 +52,13 @@ pub struct CompilationUnit<'a> {
     pub upvalues: Vec<Upvalue>,
     /// 当前作用域深度
     pub scope_depth: usize,
-    /// 父编译单元（用于闭包上值解析）
-    pub parent: Option<&'a CompilationUnit<'a>>,
+    /// 父编译单元（用于闭包上值解析）。
+    ///
+    /// 采用裸指针（clox 风格）规避 `self.unit` 经 `mem::replace` 换出/换入时
+    /// 的 self-referential 借用冲突：`compile_fn_decl` 将 parent 指向被换出的
+    /// `saved_unit`（编译函数体期间该局部存活，指针有效）。空指针表示无父单元。
+    /// SAFETY: 仅在编译子函数体期间解引用（parent 指向存活的 saved_unit）。
+    pub parent: *const CompilationUnit,
 }
 
 /// 局部变量。
@@ -77,8 +82,8 @@ pub struct Upvalue {
 }
 
 /// 编译器。将 AST 编译为字节码。
-pub struct Compiler<'a> {
-    unit: CompilationUnit<'a>,
+pub struct Compiler {
+    unit: CompilationUnit,
     source_file: Option<String>,
     source_lines: Vec<String>,
     exports: Vec<String>,
@@ -98,7 +103,7 @@ struct LoopContext {
     break_jumps: Vec<usize>,
 }
 
-impl<'a> Compiler<'a> {
+impl Compiler {
     pub fn new() -> Self {
         let unit = CompilationUnit {
             chunk: Chunk::new(),
@@ -110,7 +115,7 @@ impl<'a> Compiler<'a> {
             }],
             upvalues: Vec::new(),
             scope_depth: 0,
-            parent: None,
+            parent: std::ptr::null(),
         };
         Compiler {
             unit,
@@ -131,7 +136,7 @@ impl<'a> Compiler<'a> {
     }
 }
 
-impl Default for Compiler<'_> {
+impl Default for Compiler {
     fn default() -> Self {
         Self::new()
     }
@@ -139,7 +144,7 @@ impl Default for Compiler<'_> {
 
 // ---- 常量池管理 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 添加常量到常量池（自动去重），返回索引。
     pub fn add_constant(&mut self, value: Object) -> usize {
         if let Some(idx) = self.unit.chunk.constants.iter().position(|c| c == &value) {
@@ -163,7 +168,7 @@ impl Compiler<'_> {
 
 // ---- 字节码发射 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 发射单字节并记录行号。
     pub fn emit_byte(&mut self, byte: u8, line: usize) {
         self.unit.chunk.code.push(byte);
@@ -227,18 +232,25 @@ impl Compiler<'_> {
 // mslang 使用函数级作用域（`if`/`while`/`for` 块不创建新作用域）。
 // begin_scope / end_scope 仅在函数边界和推导式隐式作用域中使用。
 
-impl Compiler<'_> {
+impl Compiler {
     /// 进入新作用域。
     pub fn begin_scope(&mut self) {
         self.unit.scope_depth += 1;
     }
 
     /// 离开作用域，弹出该作用域的局部变量。
-    pub fn end_scope(&mut self) {
+    /// 被闭包捕获的局部发射 `CLOSE_UPVALUE`（关闭对应开放上值再弹栈），
+    /// 其余发射 `POP`。
+    pub fn end_scope(&mut self, line: usize) {
         self.unit.scope_depth = self.unit.scope_depth.saturating_sub(1);
         while let Some(local) = self.unit.locals.last() {
             if local.depth > self.unit.scope_depth {
-                self.unit.locals.pop();
+                let local = self.unit.locals.pop().unwrap();
+                if local.is_captured {
+                    self.emit_byte(OpCode::CloseUpvalue as u8, line);
+                } else {
+                    self.emit_byte(OpCode::Pop as u8, line);
+                }
             } else {
                 break;
             }
@@ -248,7 +260,7 @@ impl Compiler<'_> {
 
 // ---- 局部变量表管理 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 在当前作用域声明局部变量。重复声明返回错误。
     pub fn declare_local(&mut self, name: &str, line: usize) -> Result<(), String> {
         let depth = self.unit.scope_depth;
@@ -278,44 +290,62 @@ impl Compiler<'_> {
         self.unit.locals.iter().rposition(|l| l.name == name)
     }
 
-    /// 解析上值。先递归查找 parent 链，再在上值表中去重。
+    /// 解析上值。委托给自由函数 `resolve_upvalue_in_unit`，后者沿 parent 链递归
+    /// 查找变量，并在中间单元中创建上值条目（clox 语义）。
+    ///
+    /// SAFETY: `self.unit.parent` 为裸指针。仅在编译子函数体期间解引用（此时 parent
+    /// 指向存活的 `saved_unit`）。空指针表示无父单元。
     pub fn resolve_upvalue(&mut self, name: &str) -> Option<usize> {
-        let upvalue = self.unit.resolve_upvalue_recursive(name)?;
-        if let Some(existing) = self
-            .unit
-            .upvalues
-            .iter()
-            .position(|u| u.index == upvalue.0 && u.is_local == upvalue.1)
-        {
-            return Some(existing);
-        }
-        let idx = self.unit.upvalues.len();
-        self.unit.upvalues.push(Upvalue {
-            index: upvalue.0,
-            is_local: upvalue.1,
-        });
-        Some(idx)
+        let unit_ptr: *mut CompilationUnit = &mut self.unit;
+        // SAFETY: 编译子函数体期间，仅 self.unit 处于活跃使用。parent 链中的
+        // CompilationUnit 经 mem::replace 保存，仅通过 parent 指针访问，无别名。
+        unsafe { resolve_upvalue_in_unit(unit_ptr, name) }
     }
 }
 
-impl CompilationUnit<'_> {
-    /// 递归查找上值。先在直接 parent 的 locals 中查找（is_local=true）；
-    /// 若未找到，递归在 parent 的上值链中查找（is_local=false）。
-    fn resolve_upvalue_recursive(&self, name: &str) -> Option<(usize, bool)> {
-        let parent = self.parent?;
-        if let Some(idx) = parent.locals.iter().rposition(|l| l.name == name) {
-            Some((idx, true))
-        } else {
-            parent
-                .resolve_upvalue_recursive(name)
-                .map(|(idx, _)| (idx, false))
-        }
+/// 向 `unit.upvalues` 去重添加上值条目，返回索引。
+fn add_upvalue(unit: &mut CompilationUnit, index: usize, is_local: bool) -> usize {
+    if let Some(existing) = unit
+        .upvalues
+        .iter()
+        .position(|u| u.index == index && u.is_local == is_local)
+    {
+        return existing;
     }
+    let idx = unit.upvalues.len();
+    unit.upvalues.push(Upvalue { index, is_local });
+    idx
+}
+
+/// 递归解析上值（clox resolveUpvalue 等价实现）。
+///
+/// 1. 检查直接 parent 的 locals → 命中则向 **当前** unit 添加 is_local=true 上值。
+/// 2. 未命中 → 递归在 parent 中解析（可能向 parent 添加上值），再向当前 unit
+///    添加 is_local=false 上值（复用 parent 的上值索引）。
+///
+/// SAFETY: `unit` 及其 parent 链中的 CompilationUnit 在编译期均存活，且仅通过
+/// 此函数的裸指针访问（无别名竞争）。
+unsafe fn resolve_upvalue_in_unit(unit: *mut CompilationUnit, name: &str) -> Option<usize> {
+    let unit = &mut *unit;
+    let parent_ptr = unit.parent;
+    if parent_ptr.is_null() {
+        return None;
+    }
+    let parent = &mut *(parent_ptr as *mut CompilationUnit);
+
+    // 1. 在直接 parent 的 locals 中查找
+    if let Some(idx) = parent.locals.iter().rposition(|l| l.name == name) {
+        return Some(add_upvalue(unit, idx, true));
+    }
+
+    // 2. 递归在 parent 的上值链中查找
+    resolve_upvalue_in_unit(parent_ptr as *mut CompilationUnit, name)
+        .map(|upvalue_idx| add_upvalue(unit, upvalue_idx, false))
 }
 
 // ---- 编译入口 ----
 
-impl Compiler<'_> {
+impl Compiler {
     /// 编译程序，返回字节码块。
     pub fn compile(&mut self, program: &Program) -> Result<Chunk, String> {
         for stmt in &program.statements {
