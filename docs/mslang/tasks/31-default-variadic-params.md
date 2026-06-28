@@ -4,317 +4,214 @@
 Phase 3.5 - 函数 + 闭包
 
 ## 前置任务
+- 14-parser-collection-literals（Param 结构体 + `parse_param_list` 已实现）
 - 27-call-frame（调用帧与函数调用）
+- 28-closures（compile_fn_decl + CLOSURE 机制）
+- 29-anonymous-functions（compile_fn_literal 镜像 compile_fn_decl）
 
 ## 目标
 实现函数默认参数值和可变参数（`*rest`），完善函数参数系统，使参数组合（普通 → 默认 → 可变）正确工作。
 
 ## 设计规格
 
-### 默认参数
+参照 [04-functions](../04-functions.md) § 默认参数 / 可变参数 / 参数组合 / 实参数量校验。
 
-参照 [04-functions](../04-functions.md) § 默认参数：
+## 已完成（勿重复实现）
 
-```ms
-fn greet(name, prefix = "Hello") {
-    return prefix + ", " + name
-}
-```
-
-- 默认参数值在**函数定义时**求值一次（与 Python 一致）
-- 调用时若省略带默认值的参数，使用定义时求得的默认值
-- 调用时若提供实参，覆盖默认值
-
-### 可变参数
-
-参照 [04-functions](../04-functions.md) § 可变参数：
-
-```ms
-fn sum(*numbers) {
-    total = 0
-    for n in numbers {
-        total += n
-    }
-    return total
-}
-```
-
-- `*rest` 将多余的位置参数收集为一个 list
-- `rest` 在函数体内作为普通局部变量使用，类型为 list
-
-### 参数组合
-
-参照 [04-functions](../04-functions.md) § 参数组合：
-
-```ms
-fn example(a, b, c = 10, *rest) {
-    # a, b: 必需参数
-    # c: 带默认值的参数
-    # rest: 可变参数（list）
-}
-```
-
-参数顺序规则：**普通参数 → 默认参数 → 可变参数**
-
-### 实参数量校验
-
-| 场景 | 有效实参数量 |
-|---|---|
-| `fn(a, b)` | 必须 == 2 |
-| `fn(a, b, c = 10)` | 2 或 3 |
-| `fn(*rest)` | >= 0 |
-| `fn(a, *rest)` | >= 1 |
-| `fn(a, b, c = 10, *rest)` | >= 2 |
+| 能力 | 实现位置 | 实现 task |
+|---|---|---|
+| `Param { name, default: Option<Expr>, is_variadic: bool }` | `src/ast/node.rs:65-68` | 09/14 |
+| 解析器 `parse_param_list`（`*name` / `name = expr` / 普通） | `src/parser/statement.rs:247-281` | 14 |
+| `compile_fn_decl`（CompilationUnit struct literal, slot-0, CLOSURE 发射） | `src/compiler/statement.rs:196-280` | 27/28 |
+| `compile_fn_literal`（匿名函数，镜像 compile_fn_decl） | `src/compiler/expression.rs:509-600` | 29 |
+| VM `OpCode::Call` handler（native + closure 分支, arity 校验） | `src/vm/mod.rs:720-790` | 25/27 |
 
 ## 实现细节
 
-### 1. Function 对象扩展
+### 1. Function 结构体扩展
+
+`src/vm/object.rs:490-496`，新增三个字段：
 
 ```rust
 pub struct Function {
     pub name: String,
-    pub arity: usize,
+    pub arity: usize,               // 固定参数总数（普通 + 默认）
     pub code: Vec<u8>,
     pub constants: Vec<Object>,
     pub upvalue_count: usize,
-
-    pub default_params: Vec<usize>,       // 默认参数在常量池中的起始索引列表
-    pub has_variadic: bool,               // 是否有可变参数
-    pub required_arity: usize,            // 必需参数数量（不含默认和可变）
+    pub source_file: Option<String>,
+    // --- 新增 ---
+    pub default_values: Vec<Object>, // 编译期求值的默认值（每个默认参数一个，按序）
+    pub has_variadic: bool,          // 是否有 *rest 参数
+    pub required_arity: usize,       // 必需参数数量（普通参数，不含默认和可变）
 }
 ```
 
-- `required_arity`：普通参数数量（必需）
-- `arity`：全部固定参数数量（普通 + 默认）
-- `default_params`：长度为默认参数数量，每个元素为对应默认值在函数自身常量池中的索引
-- `has_variadic`：是否有 `*rest` 参数
+- `default_values`：长度 = 默认参数数量。每个元素为编译期求值的常量值。
+- `required_arity`：普通参数数量（无默认值、非可变）。
+- `arity`：固定参数总数 = 普通参数 + 默认参数（不含可变）。**不含 slot-0 `<self>`**。
+- 所有现有 Function 构造点（`compile_fn_decl` statement.rs:250、`compile_fn_literal` expression.rs 对应处、`Function::new` object.rs:500）需补齐新字段。
 
-### 2. 解析器扩展
+### 2. 编译期默认值求值
 
-参数列表解析需要支持三种参数类型：
-
-```rust
-struct Param {
-    name: String,
-    kind: ParamKind,
-}
-
-enum ParamKind {
-    Normal,
-    Default(Expr),
-    Variadic,
-}
-```
-
-解析逻辑：
+`04-functions.md:44`：默认值在定义时求值一次。MVP 策略：**仅允许常量字面量**（Int/Float/String/Bool/Nil）。
 
 ```rust
-fn parse_param_list(&mut self) -> Result<Vec<Param>> {
-    let mut params = Vec::new();
-    let mut seen_variadic = false;
-
-    while !self.check(TokenKind::RightParen) {
-        if seen_variadic {
-            return self.error("variadic parameter must be last");
-        }
-
-        if self.match_token(TokenKind::Star) {
-            let name = self.expect_ident()?;
-            params.push(Param { name, kind: ParamKind::Variadic });
-            seen_variadic = true;
-        } else {
-            let name = self.expect_ident()?;
-            if self.match_token(TokenKind::Equal) {
-                let default_expr = self.parse_expr()?;
-                params.push(Param { name, kind: ParamKind::Default(default_expr) });
-            } else {
-                params.push(Param { name, kind: ParamKind::Normal });
-            }
-        }
-
-        if !self.match_token(TokenKind::Comma) {
-            break;
-        }
+/// 编译期求值默认参数表达式。仅支持常量字面量。
+fn eval_default(expr: &Expr) -> Result<Object, String> {
+    match expr {
+        Expr::Literal(Literal::Int(n)) => Ok(Object::Int(*n)),
+        Expr::Literal(Literal::Float(n)) => Ok(Object::Float(*n)),
+        Expr::Literal(Literal::String(s)) => Ok(alloc_string(s)),
+        Expr::Literal(Literal::Bool(b)) => Ok(Object::Bool(*b)),
+        Expr::Literal(Literal::Nil) => Ok(Object::Nil),
+        _ => Err("default parameter value must be a constant literal \
+                  (non-literal defaults not yet supported)".to_string()),
     }
-
-    self.validate_param_order(&params)?;
-    Ok(params)
 }
+```
 
-fn validate_param_order(&self, params: &[Param]) -> Result<()> {
-    let mut state = 0; // 0=normal, 1=default, 2=variadic
+> 非常量默认值（如 `items = []`）暂不支持——编译期报错。后续可编译为函数定义时执行的字节码。
+
+### 3. compile_fn_decl / compile_fn_literal 参数处理
+
+两个函数（statement.rs:196-280 + expression.rs:509-600）需同步修改。在 params 循环中（当前 statement.rs:217-223 仅 push Local），按 `param.is_variadic` 和 `param.default` 分类处理：
+
+```rust
+let mut required_arity = 0usize;
+let mut default_values = Vec::new();
+let mut has_variadic = false;
+
+for param in params {
+    if param.is_variadic {
+        has_variadic = true;
+    } else if param.default.is_some() {
+        // 默认参数：编译期求值
+        let val = Self::eval_default(param.default.as_ref().unwrap())?;
+        default_values.push(val);
+    } else {
+        // 普通参数
+        required_arity += 1;
+    }
+    // 所有参数都注册为 local（含 variadic 和 default）
+    func_unit.locals.push(Local {
+        name: param.name.clone(),
+        depth: 0,
+        is_captured: false,
+    });
+}
+```
+
+参数顺序校验（编译期）——在 params 循环前或后：
+
+```rust
+fn validate_param_order(params: &[Param]) -> Result<(), String> {
+    let mut state = 0u8; // 0=normal, 1=default, 2=variadic
     for p in params {
-        match p.kind {
-            ParamKind::Normal => {
-                if state > 0 { return self.error("normal parameter after default/variadic"); }
-            }
-            ParamKind::Default(..) => {
-                if state > 1 { return self.error("default parameter after variadic"); }
-                state = 1;
-            }
-            ParamKind::Variadic => {
-                state = 2;
-            }
+        match (p.is_variadic, &p.default, state) {
+            (false, None, _) => { if state > 0 { return Err("positional parameter after default/variadic".into()); } }
+            (false, Some(_), _) => { if state > 1 { return Err("default parameter after variadic".into()); } state = 1; }
+            (true, _, _) => { state = 2; }
+            // *rest 不应有 default（解析器不会产出 is_variadic=true && default=Some）
         }
     }
     Ok(())
 }
 ```
 
-### 3. 编译器 — 默认参数值
-
-默认参数值在函数定义时求值，存入函数的常量池：
+Function 构造时补齐新字段：
 
 ```rust
-fn compile_fn_decl(&mut self, node: &FnDecl) {
-    let mut func_unit = CompilationUnit::new();
-    func_unit.name = node.name.clone();
+let function = Function {
+    name: name.to_string(),
+    arity: params.iter().filter(|p| !p.is_variadic).count(), // 固定参数（不含 variadic）
+    code: func_unit.chunk.code,
+    constants: func_unit.chunk.constants,
+    upvalue_count: func_unit.upvalues.len(),
+    source_file: self.source_file.clone(),
+    default_values,     // ← 新增
+    has_variadic,       // ← 新增
+    required_arity,     // ← 新增
+};
+```
 
-    let mut required_arity = 0;
-    let mut default_param_values = Vec::new();
+### 4. VM CALL handler 扩展
 
-    for param in &node.params {
-        match &param.kind {
-            ParamKind::Normal => {
-                required_arity += 1;
-                func_unit.locals.push(Local {
-                    name: param.name.clone(),
-                    depth: 0,
-                    is_captured: false,
-                });
-            }
-            ParamKind::Default(expr) => {
-                let mut default_compiler = CompilationUnit::new();
-                self.compile_expr_in_unit(&mut default_compiler, expr);
-                let default_value = self.eval_constant(expr);
-                let const_idx = func_unit.constants.len();
-                func_unit.constants.push(default_value);
-                default_param_values.push(const_idx);
+修改 `src/vm/mod.rs:758-781` 的 CLOSURE 分支。当前（行 770）为严格 `argc != arity`，改为：
 
-                func_unit.locals.push(Local {
-                    name: param.name.clone(),
-                    depth: 0,
-                    is_captured: false,
-                });
-            }
-            ParamKind::Variadic => {
-                func_unit.has_variadic = true;
-                func_unit.locals.push(Local {
-                    name: param.name.clone(),
-                    depth: 0,
-                    is_captured: false,
-                });
-            }
+```rust
+Object::Ref(ptr)
+    if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
+{
+    // 读出 arity / required_arity / has_variadic / default_values（不借用 self）
+    let (arity, required_arity, has_variadic, func_ptr) = {
+        debug_assert!(!ptr.is_null());
+        let closure = unsafe { read_closure(*ptr) };
+        let func = unsafe { read_function(closure.function) };
+        let f = &func.function;
+        (f.arity, f.required_arity, f.has_variadic, closure.function)
+    };
+
+    // 实参数量校验
+    if has_variadic {
+        if argc < required_arity {
+            return Err(format!(
+                "TypeError: expected at least {} arguments, got {}", required_arity, argc));
+        }
+    } else {
+        if argc < required_arity || argc > arity {
+            return Err(format!(
+                "TypeError: expected {}-{} arguments, got {}", required_arity, arity, argc));
         }
     }
 
-    func_unit.required_arity = required_arity;
-    func_unit.arity = func_unit.locals.len();
-
-    // ... 编译函数体 ...
-}
-```
-
-### 4. 编译器 — 调用点处理
-
-调用时不需要特殊处理。实参数量校验和默认值填充在运行时的 CALL 指令中完成。
-
-### 5. VM — CALL 指令扩展
-
-```rust
-OpCode::CALL => {
-    let argc = self.read_byte() as usize;
-    let callee_idx = self.stack.len() - argc - 1;
-    let callee = self.stack[callee_idx].clone();
-
-    match callee {
-        Object::Closure(closure) => {
-            let func = &closure.function;
-            let required = func.required_arity;
-            let total_fixed = func.arity;
-            let has_variadic = func.has_variadic;
-
-            if has_variadic {
-                if argc < required {
-                    return self.runtime_error(&format!(
-                        "{} expects at least {} arguments, got {}",
-                        func.name, required, argc
-                    ));
-                }
-            } else {
-                if argc < required || argc > total_fixed {
-                    return self.runtime_error(&format!(
-                        "{} expects {}-{} arguments, got {}",
-                        func.name, required, total_fixed, argc
-                    ));
-                }
-            }
-
-            if self.call_stack.len() >= MAX_CALL_DEPTH {
-                return self.runtime_error("stack overflow");
-            }
-
-            // 填充默认参数值
-            if argc < total_fixed {
-                let defaults_to_fill = total_fixed - argc;
-                for i in 0..defaults_to_fill {
-                    let const_idx = func.default_params[argc - required + i];
-                    self.stack.push(func.constants[const_idx].clone());
-                }
-            }
-
-            // 处理可变参数：将多余实参收集为 list
-            let varargs_start = if has_variadic { total_fixed } else { argc };
-            if has_variadic && argc > total_fixed {
-                let extra = argc - total_fixed;
-                let varargs: Vec<Object> = self.stack.drain(
-                    self.stack.len() - extra - (callee_idx + 1)..self.stack.len()
-                ).collect();
-                // 修正：从 callee 之后、固定参数之后取出多余参数
-                let stack_len = self.stack.len();
-                let drain_start = callee_idx + 1 + total_fixed;
-                let varargs: Vec<Object> = self.stack.drain(drain_start..).collect();
-                self.stack.push(alloc_list(&varargs));
-            } else if has_variadic {
-                self.stack.push(alloc_list(&[]));
-            }
-
-            let stack_base = callee_idx;
-            self.call_stack.push(CallFrame::new_closure(
-                closure,
-                stack_base,
-            ));
-        }
-        // ... BuiltinFunc 等 ...
+    if self.call_stack.len() >= MAX_CALL_DEPTH {
+        return Err("RecursionError: stack overflow".to_string());
     }
+
+    // 步骤 1：填充默认值（argc < arity 时）
+    if argc < arity {
+        let func = unsafe { &(*read_function(func_ptr)).function };
+        let defaults_to_fill = arity - argc;
+        let offset = argc - required_arity;
+        for i in 0..defaults_to_fill {
+            self.stack.push(func.default_values[offset + i].clone());
+        }
+    }
+
+    // 步骤 2：处理可变参数
+    if has_variadic {
+        let fixed_end = callee_idx + 1 + arity;
+        if self.stack.len() > fixed_end {
+            // 多余实参收集为 list
+            let varargs: Vec<Object> = self.stack.drain(fixed_end..).collect();
+            self.push(alloc_list(varargs));
+        } else {
+            // 无多余实参 → 空 list
+            self.push(alloc_list(Vec::new()));
+        }
+    }
+
+    self.call_stack.push(CallFrame::new(*ptr, callee_idx));
 }
 ```
 
-### 6. 调用帧参数布局
+关键顺序：**先填默认值，再收集可变参数**。因为默认值追加在固定参数之后（位置 argc..arity），而可变参数 drain 从 `fixed_end = callee_idx + 1 + arity` 开始。填完默认值后栈长恰好等于 `callee_idx + 1 + arity`，若无多余实参则 push 空 list。
 
-调用新帧时栈布局：
+### 5. 调用帧栈布局
 
-```
-[callee] [arg0] [arg1] ... [argN-1] [defaults...] [varargs_list]
- ^                                                   ^
- stack_base                                      new stack_top
-```
-
-对于 `fn(a, b, c = 10, *rest)`，调用 `example(1, 2)` 时：
+对于 `fn example(a, b, c = 10, *rest)`：
 
 ```
-[closure] [1] [2] [10] []
- ^        a   b   c   rest
- stack_base
+调用 example(1, 2)：          调用 example(1, 2, 3, 4, 5)：
+[closure] [1] [2] [10] [[]]   [closure] [1] [2] [3] [list(4,5)]
+ ^         a   b   c   rest    ^         a   b   c   rest
+ callee_idx                     callee_idx
 ```
 
-### 7. Function 的 Display / Debug
+### 6. GC 注意
 
-带默认参数的函数打印信息应包含参数签名：
-
-```
-<function greet(name, prefix = "Hello")>
-```
+`Function.default_values: Vec<Object>` 包含 GC-managed 引用（如 `alloc_string` 产生的 `Object::Ref`）。task 52 的 GC trace（`src/vm/gc.rs`）已遍历 `Function.constants`，需**同步扩展**以遍历 `Function.default_values`。否则默认值为堆对象时可能被误回收。
 
 ## 验证标准
 
@@ -322,10 +219,11 @@ OpCode::CALL => {
 2. 省略默认参数时使用默认值，提供实参时覆盖
 3. `*rest` 将多余实参收集为 list
 4. 无多余实参时 `*rest` 为空 list `[]`
-5. 参数顺序强制：普通 → 默认 → 可变
-6. 实参数量不足必需参数时报错
+5. 参数顺序强制：普通 → 默认 → 可变（编译期报错）
+6. 实参数量不足必需参数时报 `TypeError`
 7. 实参数量超过固定参数且有可变参数时正确收集
-8. 实参数量超过固定参数且无 variadic 时报错
+8. 实参数量超过固定参数且无 variadic 时报 `TypeError`
+9. 非常量默认值（如 `[]`）编译期报错
 
 ## 测试用例
 
