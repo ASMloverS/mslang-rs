@@ -277,6 +277,9 @@ impl Compiler {
             Expr::Identifier(name) => self.compile_identifier(name, line),
             Expr::Index { object, index } => self.compile_index(object, index, line),
             Expr::Dot { object, name } => self.compile_dot(object, name, line),
+            Expr::TupleLiteral { .. } => {
+                Err("compound assignment cannot target a tuple".to_string())
+            }
             _ => Err("Invalid assignment target".to_string()),
         }
     }
@@ -319,6 +322,19 @@ impl Compiler {
                 self.compile_expression(object, line)?;
                 self.emit_byte(OpCode::SetAttr as u8, line);
                 self.emit_bytes(&name_idx.to_be_bytes(), line);
+            }
+            Expr::TupleLiteral { elements: targets } => {
+                let count = u8::try_from(targets.len())
+                    .map_err(|_| format!(
+                        "too many unpack targets (max 255, got {})", targets.len()
+                    ))?;
+                self.emit_byte(OpCode::Unpack as u8, line);
+                self.emit_byte(count, line);
+                // UNPACK（mod.rs）逆序压入 elements，使 elements[0] 位于栈顶。
+                // 因此按正序迭代 targets：targets[0] 在栈顶，先 store。
+                for target in targets {
+                    self.compile_store_target(target, line)?;
+                }
             }
             _ => return Err("Invalid assignment target".to_string()),
         }
@@ -866,6 +882,52 @@ mod tests {
         compiler.compile_expression(&expr, 1).unwrap();
         let pos = find_opcode(&compiler, OpCode::BuildTuple).unwrap();
         assert_eq!(compiler.chunk().code[pos + 1], 2);
+    }
+
+    #[test]
+    fn test_compile_store_target_tuple_emits_unpack_forward() {
+        // task 30：TupleLiteral 赋值目标发射 UNPACK + 正序 StoreLocal。
+        // slot 0 预留（callee），故 a→slot 1、b→slot 2。
+        let mut compiler = Compiler::new();
+        compiler.declare_local("a", 1).unwrap();
+        compiler.declare_local("b", 1).unwrap();
+        let target = Expr::TupleLiteral {
+            elements: vec![
+                Expr::Identifier("a".into()),
+                Expr::Identifier("b".into()),
+            ],
+        };
+        compiler.compile_store_target(&target, 1).unwrap();
+        let code = &compiler.chunk().code;
+        let pos = find_opcode(&compiler, OpCode::Unpack).unwrap();
+        // UNPACK 2，随后 StoreLocal a(槽1)、StoreLocal b(槽2)——正序。
+        assert_eq!(code[pos], OpCode::Unpack as u8);
+        assert_eq!(code[pos + 1], 2);
+        assert_eq!(code[pos + 2], OpCode::StoreLocal as u8);
+        assert_eq!(code[pos + 3], 1); // a = 槽 1
+        assert_eq!(code[pos + 4], OpCode::StoreLocal as u8);
+        assert_eq!(code[pos + 5], 2); // b = 槽 2
+    }
+
+    #[test]
+    fn test_compile_store_target_tuple_too_many_targets() {
+        // 超过 255 个解包目标 → 编译错误（u8 溢出）。
+        let mut compiler = Compiler::new();
+        let targets: Vec<Expr> = (0..256).map(|i| Expr::Identifier(format!("v{}", i))).collect();
+        let target = Expr::TupleLiteral { elements: targets };
+        let r = compiler.compile_store_target(&target, 1);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("too many unpack targets"));
+    }
+
+    #[test]
+    fn test_compile_load_target_tuple_errors() {
+        // task 30：复合赋值不能以 tuple 为目标（防御性）。
+        let mut compiler = Compiler::new();
+        let target = Expr::TupleLiteral { elements: vec![] };
+        let r = compiler.compile_load_target(&target, 1);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("tuple"));
     }
 
     #[test]

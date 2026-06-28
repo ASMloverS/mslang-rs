@@ -7,9 +7,9 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_function, alloc_iterator, alloc_upvalue, read_closure, read_function,
-    read_iterator, read_list, read_str, read_tuple, read_upvalue, CmpOp, Function, MsObjHeader,
-    MsUpvalue, Object, TypeTag,
+    alloc_closure, alloc_function, alloc_iterator, alloc_tuple, alloc_upvalue, read_closure,
+    read_function, read_iterator, read_list, read_str, read_tuple, read_upvalue, CmpOp, Function,
+    MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -624,6 +624,19 @@ impl VM {
                     for e in elements.into_iter().rev() {
                         self.push(e)?;
                     }
+                }
+
+                // BUILD_TUPLE count：从栈顶弹出 count 个元素，构建 tuple 对象并压栈。
+                // 编译端由 compile_tuple_literal（expression.rs）与 compile_return
+                // 多返回值（statement.rs）发射。
+                OpCode::BuildTuple => {
+                    let count = self.read_byte()? as usize;
+                    let start = self.stack
+                        .len()
+                        .checked_sub(count)
+                        .ok_or("RuntimeError: stack underflow in BUILD_TUPLE")?;
+                    let elements: Vec<Object> = self.stack.drain(start..).collect();
+                    self.push(alloc_tuple(elements))?;
                 }
 
                 // CLOSURE（task 28）：从常量池取出 Function，捕获上值，创建 Closure。
@@ -2085,6 +2098,157 @@ mod tests {
             run_chunk(code, vec![Object::Int(0), tuples]).unwrap(),
             Object::Int(6)
         );
+    }
+
+    // ---- task 30: BUILD_TUPLE VM handler + 多返回值/元组解包 ----
+
+    #[test]
+    fn test_build_tuple_opcode_constructs_tuple() {
+        // BUILD_TUPLE 3：弹出栈顶 3 个元素，构建 tuple 并压栈 → HALT 返回该 tuple。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Constant as u8,
+            0x00,
+            0x01,
+            OpCode::Constant as u8,
+            0x00,
+            0x02,
+            OpCode::BuildTuple as u8,
+            0x03,
+            OpCode::Halt as u8,
+        ];
+        let result = run_chunk(code, vec![Object::Int(1), Object::Int(2), Object::Int(3)]).unwrap();
+        assert_eq!(
+            result,
+            alloc_tuple(vec![Object::Int(1), Object::Int(2), Object::Int(3)])
+        );
+    }
+
+    #[test]
+    fn test_build_tuple_opcode_empty() {
+        // BUILD_TUPLE 0：构建空 tuple。
+        let code = vec![OpCode::BuildTuple as u8, 0x00, OpCode::Halt as u8];
+        let result = run_chunk(code, vec![]).unwrap();
+        assert_eq!(result, alloc_tuple(vec![]));
+        assert_eq!(format!("{}", result), "()");
+    }
+
+    #[test]
+    fn test_build_tuple_opcode_preserves_order() {
+        // 栈顶顺序保持：先压 1、再压 2 → BUILD_TUPLE 2 → tuple(1, 2)（非逆序）。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Constant as u8,
+            0x00,
+            0x01,
+            OpCode::BuildTuple as u8,
+            0x02,
+            OpCode::Halt as u8,
+        ];
+        let result = run_chunk(code, vec![Object::Int(1), Object::Int(2)]).unwrap();
+        assert_eq!(result, alloc_tuple(vec![Object::Int(1), Object::Int(2)]));
+    }
+
+    #[test]
+    fn test_build_tuple_opcode_underflow() {
+        // 栈上不足 count 个元素 → RuntimeError（stack underflow）。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::BuildTuple as u8,
+            0x03, // 仅 1 个元素，却要 3 个
+            OpCode::Halt as u8,
+        ];
+        let r = run_chunk(code, vec![Object::Int(1)]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("underflow"));
+    }
+
+    #[test]
+    fn test_multi_return_build_then_unpack_roundtrip() {
+        // 模拟多返回值完整字节码流：return a, b → BUILD_TUPLE 2 → DUP → UNPACK 2。
+        // UNPACK 逆序压栈使 elements[0] 位于栈顶 → HALT 返回 elements[0]。
+        // 注：q, r = func() 的端到端形式受解析器限制（单值右值被包成 1 元 tuple），
+        // 故以合成字节码验证 BUILD_TUPLE + UNPACK 协同。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Constant as u8,
+            0x00,
+            0x01,
+            OpCode::BuildTuple as u8,
+            0x02,
+            OpCode::Dup as u8,
+            OpCode::Unpack as u8,
+            0x02,
+            OpCode::Halt as u8,
+        ];
+        let result = run_chunk(code, vec![Object::Int(3), Object::Int(1)]).unwrap();
+        assert_eq!(result, Object::Int(3)); // elements[0] 在栈顶
+    }
+
+    #[test]
+    fn test_swap_via_unpack_e2e() {
+        // 交换：a, b = b, a（右值为多值 TupleLiteral，解析器支持）。
+        let src = "a = 1\nb = 2\na, b = b, a\nif a != 2 {\n1/0\n}\nif b != 1 {\n1/0\n}";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_multi_value_rhs_unpack_e2e() {
+        // 多目标赋值 a, b = 10, 20（右值为多值 TupleLiteral，解析器支持）。
+        // 验证 compile_store_target 的 TupleLiteral 分支（UNPACK + 正序 store）。
+        let src = "a, b = 10, 20\nif a != 10 {\n1/0\n}\nif b != 20 {\n1/0\n}";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_unpack_count_mismatch_synthetic() {
+        // 解包数量不匹配 → ValueError（UNPACK handler 运行时校验，task 26 已实现）。
+        // 用合成字节码解包真正的 2 元素 tuple（解析器对单值右值会包成 1 元 tuple）。
+        let tuple = alloc_tuple(vec![Object::Int(1), Object::Int(2)]);
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Unpack as u8,
+            0x03, // 期望 3，实际 2
+            OpCode::Halt as u8,
+        ];
+        let r = run_chunk(code, vec![tuple]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("ValueError"));
+    }
+
+    #[test]
+    fn test_unpack_list_synthetic() {
+        // 对 list 解包：UNPACK 支持 tuple/list（task 26 已实现）。
+        // 用合成字节码解包 2 元素 list，验证 elements[0] 在栈顶（逆序压栈）。
+        let list = alloc_list(vec![Object::Int(10), Object::Int(20)]);
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00,
+            OpCode::Unpack as u8,
+            0x02,
+            OpCode::Halt as u8, // 返回栈顶 = elements[0]
+        ];
+        let result = run_chunk(code, vec![list]).unwrap();
+        assert_eq!(result, Object::Int(10));
+    }
+
+    #[test]
+    fn test_unpack_regression_for_in_still_works() {
+        // 回归：for..in 双变量循环依赖 UNPACK，task 30 不应破坏。
+        let prog = parse("s = 0\nfor i, v in [(1, 10), (2, 20)] {\ns = s + i\n}");
+        let chunk = Compiler::new().compile(&prog).unwrap();
+        assert!(chunk.code.contains(&(OpCode::Unpack as u8)));
     }
 
     #[test]

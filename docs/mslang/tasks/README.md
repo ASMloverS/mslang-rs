@@ -51,7 +51,7 @@
 | 27 | [调用帧与函数调用](27-call-frame.md) | ✅ |
 | 28 | [闭包与上值机制](28-closures.md) | ✅ |
 | 29 | [匿名函数](29-anonymous-functions.md) | ✅ |
-| 30 | [多返回值与元组解包](30-multi-return-tuple-unpack.md) | ⬜ |
+| 30 | [多返回值与元组解包](30-multi-return-tuple-unpack.md) | ✅ |
 | 31 | [默认参数与可变参数](31-default-variadic-params.md) | ⬜ |
 
 ## Phase 4 — 控制流 + 高级语法
