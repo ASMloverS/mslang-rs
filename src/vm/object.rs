@@ -473,6 +473,101 @@ pub unsafe fn read_iterator<'a>(ptr: *mut MsObjHeader) -> &'a mut MsIterator {
 }
 
 // ---------------------------------------------------------------------------
+// Function / Closure 堆对象（task 27）
+// ---------------------------------------------------------------------------
+
+/// 用户函数体（堆对象，TypeTag::FUNCTION）。仅由 MsClosure 内部持有，
+/// CALL 不直接匹配此 tag（避免与 MsNativeFunction 混淆 — 订正 A2/V2）。
+#[repr(C)]
+pub struct MsFunction {
+    pub header: MsObjHeader,
+    pub function: Function,
+}
+
+/// 函数元数据：名称、参数数量、字节码、独立常量池、上值数量、源文件。
+pub struct Function {
+    pub name: String,
+    pub arity: usize,
+    pub code: Vec<u8>,
+    pub constants: Vec<Object>,
+    pub upvalue_count: usize,
+    pub source_file: Option<String>,
+}
+
+impl Function {
+    pub fn new(name: String, arity: usize) -> Self {
+        Self {
+            name,
+            arity,
+            code: Vec::new(),
+            constants: Vec::new(),
+            upvalue_count: 0,
+            source_file: None,
+        }
+    }
+}
+
+/// 分配 MsFunction 堆对象（TypeTag::FUNCTION），返回 Object::Ref。
+/// MVP：Box 分配；task 52-gc 替换为 TLAB bump 分配。
+pub fn alloc_function(function: Function) -> Object {
+    let ms_fn = Box::new(MsFunction {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::FUNCTION as u8,
+            size: std::mem::size_of::<MsFunction>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        function,
+    });
+    Object::Ref(Box::into_raw(ms_fn) as *mut MsObjHeader)
+}
+
+/// 读取 MsFunction（alloc_function 的对偶）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_function` 分配的、在 `'a` 期间有效的 `MsFunction`。
+pub unsafe fn read_function<'a>(ptr: *mut MsObjHeader) -> &'a MsFunction {
+    &*(ptr as *mut MsFunction)
+}
+
+/// 最小闭包（TypeTag::CLOSURE）。Phase 3.1：upvalues 恒空（task 28 实装真实上值）。
+/// 这是用户代码唯一可调用的形式 — CALL 的被调用者必须是 CLOSURE（订正 A2）。
+#[repr(C)]
+pub struct MsClosure {
+    pub header: MsObjHeader,
+    pub function: *mut MsObjHeader,
+    pub upvalues: Vec<*mut MsObjHeader>,
+}
+
+/// 分配 MsClosure（TypeTag::CLOSURE），包裹一个 MsFunction。
+pub fn alloc_closure(function: Object) -> Object {
+    let Object::Ref(func_ptr) = function else {
+        unreachable!("alloc_closure expects MsFunction Ref");
+    };
+    let cl = Box::new(MsClosure {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::CLOSURE as u8,
+            size: std::mem::size_of::<MsClosure>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        function: func_ptr,
+        upvalues: Vec::new(),
+    });
+    Object::Ref(Box::into_raw(cl) as *mut MsObjHeader)
+}
+
+/// 读取 MsClosure（alloc_closure 的对偶）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_closure` 分配的、在 `'a` 期间有效的 `MsClosure`。
+pub unsafe fn read_closure<'a>(ptr: *mut MsObjHeader) -> &'a MsClosure {
+    &*(ptr as *mut MsClosure)
+}
+
+// ---------------------------------------------------------------------------
 // Object 行为
 // ---------------------------------------------------------------------------
 

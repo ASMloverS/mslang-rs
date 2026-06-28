@@ -7,16 +7,19 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_iterator, read_iterator, read_list, read_str, read_tuple, CmpOp, Object, TypeTag,
+    alloc_closure, alloc_function, alloc_iterator, read_closure, read_function, read_iterator,
+    read_list, read_str, read_tuple, CmpOp, Function, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
 
 const STACK_MAX: usize = 1024;
+/// 调用栈最大深度（对齐 Python 默认；task 28/31/36/37/70 共用此常量）。
+pub const MAX_CALL_DEPTH: usize = 1000;
 
 pub struct VM {
     stack: Vec<Object>,
-    frames: Vec<CallFrame>,
+    call_stack: Vec<CallFrame>,
     globals: HashMap<String, Object>,
     /// 内置函数参数个数表（`usize::MAX` = 可变参数），供 CALL 校验。
     native_arities: HashMap<String, usize>,
@@ -28,8 +31,10 @@ pub struct VM {
 impl VM {
     pub fn new() -> Self {
         let mut vm = VM {
-            stack: Vec::with_capacity(STACK_MAX),
-            frames: Vec::new(),
+            // 预留 slot 0（callee 占位），修复 task 26 发现的「顶层预留 slot 0
+            // 但 VM 栈未预分配 → StoreLocal 1 越界」bug（订正 A3）。
+            stack: vec![Object::Nil],
+            call_stack: Vec::new(),
             globals: HashMap::new(),
             native_arities: HashMap::new(),
             heap: gc::MsHeap::new(),
@@ -39,12 +44,18 @@ impl VM {
     }
 
     pub fn interpret(&mut self, chunk: Chunk) -> Result<Object, String> {
-        let frame = CallFrame {
-            chunk,
-            ip: 0,
-            stack_base: 0,
+        let function = Function {
+            name: "<main>".to_string(),
+            arity: 0,
+            code: chunk.code,
+            constants: chunk.constants,
+            upvalue_count: 0,
+            source_file: None,
         };
-        self.frames.push(frame);
+        let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function)) else {
+            unreachable!()
+        };
+        self.call_stack.push(CallFrame::new(closure_ptr, 0));
         self.run()
     }
 }
@@ -90,10 +101,17 @@ impl VM {
 
 impl VM {
     fn read_byte(&mut self) -> Result<u8, String> {
-        let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
-        let b = *frame
-            .chunk
-            .code
+        let frame = self
+            .call_stack
+            .last_mut()
+            .ok_or("no call frame".to_string())?;
+        // SAFETY：frame.closure 由 alloc_closure 分配（CLOSURE），closure.function
+        // 指向 alloc_function 分配的 MsFunction，在帧生命周期内有效。
+        let code = unsafe {
+            let closure = read_closure(frame.closure);
+            read_function(closure.function).function.code.as_slice()
+        };
+        let b = *code
             .get(frame.ip)
             .ok_or_else(|| "ip past end of bytecode".to_string())?;
         frame.ip += 1;
@@ -101,19 +119,39 @@ impl VM {
     }
 
     fn read_u16(&mut self) -> Result<u16, String> {
-        let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
-        let lo = *frame
-            .chunk
-            .code
+        let frame = self
+            .call_stack
+            .last_mut()
+            .ok_or("no call frame".to_string())?;
+        let code = unsafe {
+            let closure = read_closure(frame.closure);
+            read_function(closure.function).function.code.as_slice()
+        };
+        let lo = *code
             .get(frame.ip)
             .ok_or_else(|| "ip past end of bytecode".to_string())?;
-        let hi = *frame
-            .chunk
-            .code
+        let hi = *code
             .get(frame.ip + 1)
             .ok_or_else(|| "ip past end of bytecode".to_string())?;
         frame.ip += 2;
         Ok(u16::from_be_bytes([lo, hi]))
+    }
+
+    /// 读取当前帧的常量池中的常量（克隆）。供 CONSTANT/LoadGlobal/StoreGlobal 使用。
+    fn read_constant(&self, idx: usize) -> Result<Object, String> {
+        let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
+        // SAFETY：同 read_byte，closure→MsFunction 在帧生命周期内有效。
+        let constants = unsafe {
+            let closure = read_closure(frame.closure);
+            read_function(closure.function)
+                .function
+                .constants
+                .as_slice()
+        };
+        constants
+            .get(idx)
+            .ok_or_else(|| "constant index out of range".to_string())
+            .cloned()
     }
 }
 
@@ -131,13 +169,7 @@ impl VM {
             match opcode {
                 OpCode::Constant => {
                     let idx = self.read_u16()? as usize;
-                    let frame = self.frames.last().unwrap();
-                    let value = frame
-                        .chunk
-                        .constants
-                        .get(idx)
-                        .ok_or_else(|| "constant index out of range".to_string())?
-                        .clone();
+                    let value = self.read_constant(idx)?;
                     self.push(value)?;
                 }
 
@@ -147,7 +179,7 @@ impl VM {
 
                 OpCode::LoadLocal => {
                     let slot = self.read_byte()? as usize;
-                    let frame = self.frames.last().unwrap();
+                    let frame = self.call_stack.last().unwrap();
                     let idx = frame
                         .stack_base
                         .checked_add(slot)
@@ -163,7 +195,7 @@ impl VM {
                 OpCode::StoreLocal => {
                     let slot = self.read_byte()? as usize;
                     let value = self.pop()?;
-                    let frame = self.frames.last().unwrap();
+                    let frame = self.call_stack.last().unwrap();
                     let idx = frame
                         .stack_base
                         .checked_add(slot)
@@ -176,13 +208,8 @@ impl VM {
 
                 OpCode::LoadGlobal => {
                     let name_idx = self.read_u16()? as usize;
-                    let frame = self.frames.last().unwrap();
-                    let constant = frame
-                        .chunk
-                        .constants
-                        .get(name_idx)
-                        .ok_or_else(|| "constant index out of range".to_string())?;
-                    let name = match constant {
+                    let constant = self.read_constant(name_idx)?;
+                    let name = match &constant {
                         // SAFETY：type_tag 守卫确认常量为 STRING，且由编译器经
                         // alloc_string 分配，生命周期与 Chunk/VM 一致；read_str
                         // 的借用仅用于 to_owned，立即结束。
@@ -201,13 +228,8 @@ impl VM {
                 OpCode::StoreGlobal => {
                     let name_idx = self.read_u16()? as usize;
                     let value = self.pop()?;
-                    let frame = self.frames.last().unwrap();
-                    let constant = frame
-                        .chunk
-                        .constants
-                        .get(name_idx)
-                        .ok_or_else(|| "constant index out of range".to_string())?;
-                    let name = match constant {
+                    let constant = self.read_constant(name_idx)?;
+                    let name = match &constant {
                         // SAFETY：同 LoadGlobal。
                         Object::Ref(ptr)
                             if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 =>
@@ -391,14 +413,20 @@ impl VM {
 
                 OpCode::Jump => {
                     let offset = self.read_u16()? as usize;
-                    let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
+                    let frame = self
+                        .call_stack
+                        .last_mut()
+                        .ok_or("no call frame".to_string())?;
                     frame.ip += offset;
                 }
 
                 OpCode::JumpIfFalse => {
                     let offset = self.read_u16()? as usize;
                     if !self.peek(0)?.is_truthy() {
-                        let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
+                        let frame = self
+                            .call_stack
+                            .last_mut()
+                            .ok_or("no call frame".to_string())?;
                         frame.ip += offset;
                     }
                 }
@@ -406,14 +434,20 @@ impl VM {
                 OpCode::JumpIfTrue => {
                     let offset = self.read_u16()? as usize;
                     if self.peek(0)?.is_truthy() {
-                        let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
+                        let frame = self
+                            .call_stack
+                            .last_mut()
+                            .ok_or("no call frame".to_string())?;
                         frame.ip += offset;
                     }
                 }
 
                 OpCode::JumpBack => {
                     let offset = self.read_u16()? as usize;
-                    let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
+                    let frame = self
+                        .call_stack
+                        .last_mut()
+                        .ok_or("no call frame".to_string())?;
                     frame.ip = frame
                         .ip
                         .checked_sub(offset)
@@ -423,14 +457,20 @@ impl VM {
                 // BREAK：前向跳到循环出口（编译器 patch_jump）
                 OpCode::Break => {
                     let offset = self.read_u16()? as usize;
-                    let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
+                    let frame = self
+                        .call_stack
+                        .last_mut()
+                        .ok_or("no call frame".to_string())?;
                     frame.ip += offset;
                 }
 
                 // CONTINUE：后向跳到循环头（编译器 patch_jump_back）
                 OpCode::Continue => {
                     let offset = self.read_u16()? as usize;
-                    let frame = self.frames.last_mut().ok_or("no call frame".to_string())?;
+                    let frame = self
+                        .call_stack
+                        .last_mut()
+                        .ok_or("no call frame".to_string())?;
                     frame.ip = frame
                         .ip
                         .checked_sub(offset)
@@ -466,8 +506,10 @@ impl VM {
                     match next_val {
                         Some(v) => self.push(v)?,
                         None => {
-                            let frame =
-                                self.frames.last_mut().ok_or("no call frame".to_string())?;
+                            let frame = self
+                                .call_stack
+                                .last_mut()
+                                .ok_or("no call frame".to_string())?;
                             frame.ip += offset;
                         }
                     }
@@ -514,8 +556,7 @@ impl VM {
                     }
                 }
 
-                // CALL（task 25）：仅原生函数分支（TypeTag::FUNCTION）。
-                // 用户函数 / 闭包调用（TypeTag::CLOSURE）由 task 27 扩展。
+                // CALL（task 25/27）：native 分支（TypeTag::FUNCTION）+ 用户函数分支（TypeTag::CLOSURE）。
                 OpCode::Call => {
                     let argc = self.read_byte()? as usize;
                     // 边界检查（D1）：防止 argc 过大导致下溢/越界。
@@ -553,12 +594,58 @@ impl VM {
                             let result = func(self, &args)?;
                             self.push(result)?;
                         }
+                        // 用户函数（task 27）：CLOSURE 分支，与 native FUNCTION 分支并列。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
+                        {
+                            // 经 closure.function 取 MsFunction 读 arity（不借用 self）。
+                            let arity = {
+                                debug_assert!(!ptr.is_null(), "null Object::Ref");
+                                // SAFETY: type_tag 为 CLOSURE，指针由 alloc_closure 分配。
+                                let closure = unsafe { read_closure(*ptr) };
+                                // SAFETY: closure.function 由 alloc_function 分配。
+                                let func = unsafe { read_function(closure.function) };
+                                func.function.arity
+                            };
+                            if argc != arity {
+                                return Err(format!(
+                                    "TypeError: expected {} arguments, got {}",
+                                    arity, argc
+                                ));
+                            }
+                            if self.call_stack.len() >= MAX_CALL_DEPTH {
+                                return Err("RecursionError: stack overflow".to_string());
+                            }
+                            // stack_base = callee_idx：slot 0 = callee（closure 自身），
+                            // 参数在 slot 1..argc（与 compile_fn_decl 的 slot-0 预留约定自洽）。
+                            self.call_stack.push(CallFrame::new(*ptr, callee_idx));
+                        }
                         _ => {
                             return Err(format!(
                                 "TypeError: '{}' object is not callable",
                                 callee.type_name()
                             ))
                         }
+                    }
+                }
+
+                // RETURN（task 27）：弹出返回值，恢复调用者帧，截断值栈。
+                OpCode::Return => {
+                    let return_value = self.stack.pop().unwrap_or(Object::Nil);
+                    // TODO(task 36)：弹出本帧前须执行其 defer 条目（EXEC_DEFER，LIFO）。
+                    // Phase 3.1 defer_stack 恒空，此处暂不做。
+                    let old_base = self
+                        .call_stack
+                        .last()
+                        .ok_or("return outside function".to_string())?
+                        .stack_base;
+                    self.stack.truncate(old_base); // 移除 callee(slot0)+args+locals
+                    self.call_stack.pop();
+                    self.stack.push(return_value);
+
+                    // 顶层帧 RETURN 后无更多调用者帧 → 终止执行（等价于隐式 HALT）。
+                    if self.call_stack.is_empty() {
+                        return Ok(self.stack.pop().unwrap_or(Object::Nil));
                     }
                 }
 
@@ -1304,16 +1391,16 @@ mod tests {
 
     #[test]
     fn test_while_loop_iterations() {
-        // 合成 while 循环：slot 0 为计数器（初始 0），每轮 +1，i<3 为限。
-        // 经 JumpBack 回边 3 轮后退出；Halt 弹出 slot 0 的最终值 → Int(3)。
-        // 用合成 Chunk 绕开顶层局部槽未预分配的限制（task 23 既有先例）。
+        // 合成 while 循环：slot 1 为计数器（初始 0），每轮 +1，i<3 为限。
+        // slot 0 为 VM 预分配的 callee 占位（Nil，task 27 订正 A3）。
+        // 经 JumpBack 回边 3 轮后退出；Halt 弹出 slot 1 的最终值 → Int(3)。
         let result = run_chunk(
             vec![
                 OpCode::Constant as u8,
                 0x00,
-                0x00, // push Int(0) → slot 0 占位/初值
+                0x00, // push Int(0) → slot 1 初值
                 OpCode::LoadLocal as u8,
-                0x00, // loop_start: push i
+                0x01, // loop_start: push i
                 OpCode::Constant as u8,
                 0x00,
                 0x01, // push Int(3)
@@ -1323,13 +1410,13 @@ mod tests {
                 0x0C, // → exit
                 OpCode::Pop as u8,
                 OpCode::LoadLocal as u8,
-                0x00, // push i
+                0x01, // push i
                 OpCode::Constant as u8,
                 0x00,
                 0x02, // push Int(1)
                 OpCode::Add as u8,
                 OpCode::StoreLocal as u8,
-                0x00, // i = i + 1
+                0x01, // i = i + 1
                 OpCode::JumpBack as u8,
                 0x00,
                 0x15,              // → loop_start
@@ -1354,13 +1441,14 @@ mod tests {
     fn test_continue_backward_jump() {
         // 合成循环：与 while 测试同构，但回边用 Continue（checked_sub 后向跳）。
         // 限界 2 → 两轮后退出 → Int(2)，验证 Continue 的后向跳转执行。
+        // slot 0 为 VM 预分配的 callee 占位（Nil，task 27 订正 A3）。
         let result = run_chunk(
             vec![
                 OpCode::Constant as u8,
                 0x00,
-                0x00, // push Int(0) → slot 0
+                0x00, // push Int(0) → slot 1
                 OpCode::LoadLocal as u8,
-                0x00, // loop_start: push i
+                0x01, // loop_start: push i
                 OpCode::Constant as u8,
                 0x00,
                 0x01, // push Int(2)
@@ -1370,13 +1458,13 @@ mod tests {
                 0x0C, // → exit
                 OpCode::Pop as u8,
                 OpCode::LoadLocal as u8,
-                0x00, // push i
+                0x01, // push i
                 OpCode::Constant as u8,
                 0x00,
                 0x02, // push Int(1)
                 OpCode::Add as u8,
                 OpCode::StoreLocal as u8,
-                0x00, // i = i + 1
+                0x01, // i = i + 1
                 OpCode::Continue as u8,
                 0x00,
                 0x15,              // → loop_start
@@ -1661,12 +1749,12 @@ mod tests {
     /// 构造「统计可迭代对象元素个数」的 for..in 循环字节码并运行，返回计数。
     /// 覆盖 ITERATOR + FOR_ITER 对各可迭代类型的执行。
     fn count_iterations(iterable: Object) -> Result<Object, String> {
-        // 布局：slot0=count；push iterable→ITERATOR；loop: FOR_ITER→Pop(弃值)→
-        // count+=1→JUMP_BACK；exit: Pop(iter)→LoadLocal 0→HALT。
+        // 布局：slot1=count（slot0 为 callee 占位）；push iterable→ITERATOR；
+        // loop: FOR_ITER→Pop(弃值)→count+=1→JUMP_BACK；exit: Pop(iter)→LoadLocal 1→HALT。
         let code = vec![
             OpCode::Constant as u8,
             0x00,
-            0x00, // Int(0) → slot0
+            0x00, // Int(0) → slot1
             OpCode::Constant as u8,
             0x00,
             0x01,                   // iterable
@@ -1676,19 +1764,19 @@ mod tests {
             0x0C,              // → exit (offset 12)
             OpCode::Pop as u8, // 弃迭代值
             OpCode::LoadLocal as u8,
-            0x00,
+            0x01,
             OpCode::Constant as u8,
             0x00,
             0x02, // Int(1)
             OpCode::Add as u8,
             OpCode::StoreLocal as u8,
-            0x00,
+            0x01,
             OpCode::JumpBack as u8,
             0x00,
             0x0F,              // → loop_start (offset 15)
             OpCode::Pop as u8, // exit: 弹出迭代器
             OpCode::LoadLocal as u8,
-            0x00,
+            0x01,
             OpCode::Halt as u8,
         ];
         run_chunk(code, vec![Object::Int(0), iterable, Object::Int(1)])
@@ -1738,12 +1826,13 @@ mod tests {
     #[test]
     fn test_for_iter_sums_list_values() {
         // 验证 FOR_ITER 推送的值确为各元素（累加 [0,1,2,3,4] = 10）。
-        // 布局：slot0=sum；push list→ITERATOR；loop: FOR_ITER→LoadLocal0→Add→
-        // StoreLocal0→JUMP_BACK；exit: Pop→LoadLocal0→HALT。
+        // 布局：slot1=sum（slot0 为 callee 占位）；push list→ITERATOR；
+        // loop: FOR_ITER→LoadLocal1→Add→StoreLocal1→JUMP_BACK；
+        // exit: Pop→LoadLocal1→HALT。
         let code = vec![
             OpCode::Constant as u8,
             0x00,
-            0x00, // Int(0) → slot0 (sum)
+            0x00, // Int(0) → slot1 (sum)
             OpCode::Constant as u8,
             0x00,
             0x01, // list [0,1,2,3,4]
@@ -1752,16 +1841,16 @@ mod tests {
             0x00,
             0x08, // → exit (offset 8)
             OpCode::LoadLocal as u8,
-            0x00,              // push sum
+            0x01,              // push sum
             OpCode::Add as u8, // value + sum
             OpCode::StoreLocal as u8,
-            0x00, // sum = value + sum
+            0x01, // sum = value + sum
             OpCode::JumpBack as u8,
             0x00,
             0x0B,              // → loop_start (offset 11)
             OpCode::Pop as u8, // exit: 弹出迭代器
             OpCode::LoadLocal as u8,
-            0x00,
+            0x01,
             OpCode::Halt as u8,
         ];
         let list = alloc_list(vec![
@@ -1808,13 +1897,13 @@ mod tests {
     #[test]
     fn test_for_iter_with_unpack_sums_first_elements() {
         // 端到端模拟双变量 for..in：遍历 [(1,10),(2,20),(3,30)]，累加每对首元素 = 6。
-        // 验证 FOR_ITER + UNPACK + 多轮迭代协同。布局：slot0=sum；push list→ITERATOR；
-        // loop: FOR_ITER→UNPACK 2→LoadLocal0→Add→StoreLocal0→Pop(弃次元素)→JUMP_BACK；
-        // exit: Pop→LoadLocal0→HALT。
+        // 验证 FOR_ITER + UNPACK + 多轮迭代协同。布局：slot1=sum（slot0 为 callee 占位）；
+        // push list→ITERATOR；loop: FOR_ITER→UNPACK 2→LoadLocal1→Add→StoreLocal1→
+        // Pop(弃次元素)→JUMP_BACK；exit: Pop→LoadLocal1→HALT。
         let code = vec![
             OpCode::Constant as u8,
             0x00,
-            0x00, // Int(0) → slot0
+            0x00, // Int(0) → slot1
             OpCode::Constant as u8,
             0x00,
             0x01, // list of tuples
@@ -1825,17 +1914,17 @@ mod tests {
             OpCode::Unpack as u8,
             0x02, // → [iter, second, first]
             OpCode::LoadLocal as u8,
-            0x00,              // push sum
+            0x01,              // push sum
             OpCode::Add as u8, // first + sum
             OpCode::StoreLocal as u8,
-            0x00,              // sum = first + sum
+            0x01,              // sum = first + sum
             OpCode::Pop as u8, // 弃 second
             OpCode::JumpBack as u8,
             0x00,
             0x0E,              // → loop_start (offset 14)
             OpCode::Pop as u8, // exit: 弹出迭代器
             OpCode::LoadLocal as u8,
-            0x00,
+            0x01,
             OpCode::Halt as u8,
         ];
         let tuples = alloc_list(vec![
@@ -1876,5 +1965,252 @@ mod tests {
         let prog2 = parse("for a, b in [(1, 2)] {\n}");
         let chunk2 = Compiler::new().compile(&prog2).unwrap();
         assert!(chunk2.code.contains(&(OpCode::Unpack as u8)));
+    }
+
+    // ---- task 27：调用帧与函数调用 ----
+
+    #[test]
+    fn test_function_decl_compiles_to_global_binding() {
+        // fn 声明编译为 CONSTANT(closure) + STORE_GLOBAL(name)。
+        let prog = parse("fn f(x) { return x }");
+        let chunk = Compiler::new().compile(&prog).unwrap();
+        assert!(chunk.code.contains(&(OpCode::StoreGlobal as u8)));
+        // 常量池中应存在 CLOSURE 对象（用户可调用形式）
+        assert!(chunk.constants.iter().any(|c| {
+            matches!(
+                c,
+                Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8
+            )
+        }));
+    }
+
+    #[test]
+    fn test_msfunction_msclosure_alloc_and_read() {
+        use crate::vm::object::{
+            alloc_closure, alloc_function, read_closure, read_function, Function,
+        };
+        let func = Function {
+            name: "test".to_string(),
+            arity: 2,
+            code: vec![OpCode::Halt as u8],
+            constants: vec![],
+            upvalue_count: 0,
+            source_file: None,
+        };
+        let func_obj = alloc_function(func);
+        let Object::Ref(func_ptr) = func_obj else {
+            panic!("expected Ref");
+        };
+        unsafe {
+            assert_eq!((*func_ptr).type_tag, TypeTag::FUNCTION as u8);
+            let f = read_function(func_ptr);
+            assert_eq!(f.function.arity, 2);
+            assert_eq!(f.function.name, "test");
+        }
+
+        let closure_obj = alloc_closure(func_obj);
+        let Object::Ref(cl_ptr) = closure_obj else {
+            panic!("expected Ref");
+        };
+        unsafe {
+            assert_eq!((*cl_ptr).type_tag, TypeTag::CLOSURE as u8);
+            let cl = read_closure(cl_ptr);
+            let f = read_function(cl.function);
+            assert_eq!(f.function.arity, 2);
+        }
+    }
+
+    #[test]
+    fn test_user_function_call_returns_value() {
+        // fn add(a, b) { return a + b }；验证 add(3,4) == 7。
+        // 这同时验证 param0 != callee（若 slot 1 指向闭包则返回闭包而非 3）。
+        let result = compile_and_run(
+            r#"
+            fn add(a, b) {
+                return a + b
+            }
+            assert(add(3, 4) == 7)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_user_function_single_param() {
+        // fn id(x) { return x }；验证 id(42) == 42（param0 = slot1 ≠ callee）。
+        let result = compile_and_run(
+            r#"
+            fn id(x) {
+                return x
+            }
+            assert(id(42) == 42)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_user_function_string_concat() {
+        // fn greet(name) { return "Hello, " + name }
+        let result = compile_and_run(
+            r#"
+            fn greet(name) {
+                return "Hello, " + name
+            }
+            assert(greet("World") == "Hello, World")
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_implicit_nil_return() {
+        // 无显式 return → 隐式 NIL + RETURN → 返回 nil。
+        let result = compile_and_run(
+            r#"
+            fn noop() {
+            }
+            assert(noop() == nil)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_implicit_nil_return_with_body() {
+        // 函数体有语句但无 return → 隐式返回 nil。
+        let result = compile_and_run(
+            r#"
+            fn side_effect(x) {
+                assert(x > 0)
+            }
+            assert(side_effect(1) == nil)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_recursion_factorial() {
+        // 递归调用：factorial(10) == 3628800。
+        let result = compile_and_run(
+            r#"
+            fn factorial(n) {
+                if n <= 1 {
+                    return 1
+                }
+                return n * factorial(n - 1)
+            }
+            assert(factorial(10) == 3628800)
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_arity_mismatch_too_many() {
+        let result = compile_and_run(
+            r#"
+            fn one(x) {
+                return x
+            }
+            one(1, 2)
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 1 arguments, got 2"));
+    }
+
+    #[test]
+    fn test_arity_mismatch_too_few() {
+        let result = compile_and_run(
+            r#"
+            fn two(a, b) {
+                return a
+            }
+            two(1)
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expected 2 arguments, got 1"));
+    }
+
+    #[test]
+    fn test_stack_overflow_at_max_depth() {
+        // 无限递归 → MAX_CALL_DEPTH(1000) 触发栈溢出。
+        let result = compile_and_run(
+            r#"
+            fn recurse() {
+                return recurse()
+            }
+            recurse()
+            "#,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("stack overflow"));
+    }
+
+    #[test]
+    fn test_call_non_callable_error() {
+        // 调用 int → TypeError: not callable。
+        let result = compile_and_run("42()");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not callable"));
+    }
+
+    #[test]
+    fn test_native_builtin_still_works_with_user_fn() {
+        // print 等内置函数仍正常工作（经 FUNCTION native 分支），与用户函数共存。
+        let result = compile_and_run(
+            r#"
+            fn double(x) {
+                return x + x
+            }
+            print(double(21))
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_spec_end_to_end_program() {
+        // spec 验证标准 §10 的完整测试程序（greet/add/factorial）须无错执行。
+        let result = compile_and_run(
+            r#"
+            fn greet(name) {
+                return "Hello, " + name
+            }
+
+            fn add(a, b) {
+                return a + b
+            }
+
+            print(greet("World"))
+            print(add(3, 4))
+
+            fn factorial(n) {
+                if n <= 1 {
+                    return 1
+                }
+                return n * factorial(n - 1)
+            }
+            print(factorial(10))
+            "#,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_nested_calls() {
+        // 嵌套调用：add(add(1, 2), add(3, 4)) == 10。
+        let result = compile_and_run(
+            r#"
+            fn add(a, b) {
+                return a + b
+            }
+            assert(add(add(1, 2), add(3, 4)) == 10)
+            "#,
+        );
+        assert!(result.is_ok());
     }
 }

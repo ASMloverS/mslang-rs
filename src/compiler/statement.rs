@@ -6,8 +6,9 @@
 //! 参照 [19-compile-statements](../../../docs/mslang/tasks/19-compile-statements.md)。
 
 use crate::ast::node::{AssignOp, BinaryOp, Expr, Stmt, UnaryOp};
+use crate::vm::object::{alloc_closure, alloc_function, alloc_string, Function};
 
-use super::{Compiler, OpCode};
+use super::{CompilationUnit, Compiler, Local, OpCode};
 
 // ---- 语句编译分发器 ----
 
@@ -42,10 +43,9 @@ impl Compiler<'_> {
             Stmt::Return { values } => self.compile_return(values, line),
             Stmt::Nonlocal { names } => self.compile_nonlocal(names, line),
             Stmt::Global { names } => self.compile_global(names, line),
-            // 以下类型由后续 task 实现
-            Stmt::FnDecl { .. } => {
-                Err("fn declaration compilation not yet implemented (task 27/29)".into())
-            }
+            Stmt::FnDecl {
+                name, params, body, ..
+            } => self.compile_fn_decl(name, params, body, line),
             Stmt::ClassDecl { .. } => Err("class compilation not yet implemented (task 40)".into()),
             Stmt::Defer { .. } => Err("defer compilation not yet implemented (task 36)".into()),
             Stmt::Try { .. } => {
@@ -170,6 +170,64 @@ impl Compiler<'_> {
         for stmt in stmts {
             self.compile_statement(stmt, line)?;
         }
+        Ok(())
+    }
+
+    /// 编译函数声明（task 27）。
+    /// 创建独立编译单元，预留 slot 0 给被调用者（closure 自身），参数从 slot 1 起。
+    /// 编译函数体后追加隐式 `NIL + RETURN`，构建 MsFunction→MsClosure 存入常量池，
+    /// 再经 CONSTANT + STORE_GLOBAL 绑定函数名到全局。
+    fn compile_fn_decl(
+        &mut self,
+        name: &str,
+        params: &[crate::ast::node::Param],
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), String> {
+        let mut func_unit = CompilationUnit {
+            chunk: super::Chunk::new(),
+            // 订正 A3/V1：预留 slot 0 给被调用者（closure 自身），与 CALL 的
+            // stack_base = callee_idx 自洽（slot 0 = stack[stack_base] = callee）。
+            // 参数从 slot 1 起注册（slot 1..arity）。
+            locals: vec![Local {
+                name: "<self>".to_string(),
+                depth: 0,
+                is_captured: false,
+            }],
+            upvalues: Vec::new(),
+            scope_depth: 0,
+            parent: None,
+        };
+        for param in params {
+            func_unit.locals.push(Local {
+                name: param.name.clone(),
+                depth: 0,
+                is_captured: false,
+            });
+        }
+
+        let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        self.compile_block(body, line)?;
+        self.emit_byte(OpCode::Nil as u8, line);
+        self.emit_byte(OpCode::Return as u8, line);
+        let func_unit = std::mem::replace(&mut self.unit, saved_unit);
+
+        // MsFunction 存入常量池，再包装为 MsClosure（CLOSURE）— 用户可调用形式。
+        let function = Function {
+            name: name.to_string(),
+            arity: params.len(),
+            code: func_unit.chunk.code,
+            constants: func_unit.chunk.constants,
+            upvalue_count: 0,
+            source_file: self.source_file.clone(),
+        };
+        let closure = alloc_closure(alloc_function(function));
+        self.emit_constant(closure, line)?;
+        let name_idx = self.add_constant(alloc_string(name));
+        let name_idx = u16::try_from(name_idx)
+            .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+        self.emit_byte(OpCode::StoreGlobal as u8, line);
+        self.emit_bytes(&name_idx.to_be_bytes(), line);
         Ok(())
     }
 
@@ -594,7 +652,8 @@ mod tests {
 
     #[test]
     fn test_deferred_statement_types_return_error() {
-        for source in ["fn f() { x = 1 }", "defer foo()", "throw e", "import os"] {
+        // fn 声明已由 task 27 实现，不再报错；其余语句类型仍为 stub。
+        for source in ["defer foo()", "throw e", "import os"] {
             let program = parse(source);
             let mut compiler = Compiler::new();
             assert!(
