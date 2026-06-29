@@ -5,7 +5,7 @@
 //!
 //! 参照 [18-compile-expressions](../../../docs/mslang/tasks/18-compile-expressions.md)。
 
-use crate::ast::node::{AssignOp, BinaryOp, Expr, Literal, Stmt, UnaryOp};
+use crate::ast::node::{AssignOp, BinaryOp, Expr, ForClause, Literal, Stmt, UnaryOp};
 use crate::vm::object::{alloc_function, alloc_string, Function, Object};
 
 use super::{Chunk, CompilationUnit, Compiler, Local, OpCode};
@@ -64,11 +64,15 @@ impl Compiler {
             Expr::Grouping { expr } => self.compile_expression(expr, line),
             Expr::FnLiteral { params, body } => self.compile_fn_literal(params, body, line),
             // 以下类型由后续 task 实现
-            Expr::ListComprehension { .. }
-            | Expr::DictComprehension { .. }
+            Expr::ListComprehension {
+                expr,
+                for_clauses,
+                condition,
+            } => self.compile_list_comprehension(expr, for_clauses, condition, line),
+            Expr::DictComprehension { .. }
             | Expr::SetComprehension { .. }
             | Expr::GeneratorExpression { .. } => {
-                Err("comprehension compilation not yet implemented (task 33/34)".to_string())
+                Err("comprehension compilation not yet implemented (task 34/35/38)".to_string())
             }
             Expr::SuperAccess { .. } => {
                 Err("super compilation not yet implemented (task 42)".to_string())
@@ -602,11 +606,163 @@ impl Compiler {
     }
 }
 
+// ---- 列表推导式（task 33）----
+
+/// 推导式单个 for 子句的预留 slot 信息：iterable 引用 + 迭代器 slot + 各目标 slot。
+/// 在 `compile_list_comprehension` 入口一次性收集，供递归编译嵌套循环时复用。
+struct CompClauseSlots<'a> {
+    iterable: &'a Expr,
+    iter: usize,
+    targets: Vec<usize>,
+}
+
+impl Compiler {
+    /// 编译列表推导式 `[expr for x in iter (if cond)?]`（含多变量与嵌套）。
+    ///
+    /// 语法糖：创建空 list，从左到右展开嵌套 for 循环，最内层按可选条件追加 `expr`。
+    /// 三条不变量（task 33 §2）：(1) iter 与结果 list 存局部 slot，复用 `emit_for_iter`；
+    /// (2) 整个 codegen 包裹 `begin_scope`/`end_scope`，循环变量不泄漏；(3) `end_scope`
+    /// 前发 `LOAD_LOCAL list_slot` 留结果于栈顶。
+    ///
+    /// **对 §2 伪代码的修正**：所有 for 子句的 iter/target slot 在进入任何循环之前一次性
+    /// 预留（Nil 占位 + declare_local），而非伪代码的逐子句延迟声明。必要性：(a) 嵌套子句
+    /// 的占位指令若位于外层循环体内，会随每次外层迭代重入而反复执行，导致栈泄漏并破坏
+    /// `end_scope` 的 POP 清理；(b) 多变量子句的 UNPACK 展开要求目标 slot 已位于栈低部，
+    /// 否则展开元素与目标 slot 位置重叠而互相覆盖。一次性预留使占位指令仅执行一次，循环体内
+    /// 仅 StoreLocal 写入固定 slot（净零栈效应），杜绝泄漏。
+    fn compile_list_comprehension(
+        &mut self,
+        expr: &Expr,
+        for_clauses: &[ForClause],
+        condition: &Option<Box<Expr>>,
+        line: usize,
+    ) -> Result<(), String> {
+        self.begin_scope();
+
+        // 结果 list：BUILD_LIST 0 压空 list，声明局部占据该栈位。
+        self.emit_byte(OpCode::BuildList as u8, line);
+        self.emit_byte(0, line);
+        self.declare_local("__comp_list", line)?;
+        let list_slot = self
+            .resolve_local("__comp_list")
+            .ok_or("internal: __comp_list not found after declare")?;
+
+        // 一次性预留所有子句的 iter/target slot（Nil 占位 + 声明），收集其 slot 索引。
+        let mut clauses: Vec<CompClauseSlots> = Vec::with_capacity(for_clauses.len());
+        for (i, clause) in for_clauses.iter().enumerate() {
+            let iter_name = format!("__comp_iter_{}", i);
+            self.emit_byte(OpCode::Nil as u8, line);
+            self.declare_local(&iter_name, line)?;
+            let iter = self
+                .resolve_local(&iter_name)
+                .ok_or("internal: comp iter slot not found after declare")?;
+            let mut targets = Vec::with_capacity(clause.targets.len());
+            for target in &clause.targets {
+                self.emit_byte(OpCode::Nil as u8, line);
+                self.declare_local(target, line)?;
+                targets.push(
+                    self.resolve_local(target)
+                        .ok_or("internal: comp target slot not found after declare")?,
+                );
+            }
+            clauses.push(CompClauseSlots {
+                iterable: clause.iterable.as_ref(),
+                iter,
+                targets,
+            });
+        }
+
+        // 递归编译嵌套循环（最内层执行过滤+追加）。
+        self.compile_comp_clause(expr, condition, 0, list_slot, &clauses, line)?;
+
+        // 结果副本留栈顶；end_scope 依次 POP 本作用域所有 local（list slot 上方的
+        // iter/target 与此 LOAD_LOCAL 副本），恰好留下原始 list slot 之值作为表达式结果。
+        self.emit_byte(OpCode::LoadLocal as u8, line);
+        self.emit_byte(list_slot as u8, line);
+        self.end_scope(line);
+        Ok(())
+    }
+
+    /// 编译第 `i` 个 for 子句的循环结构（递归至最内层）。所有 slot 已由调用方预留并打包进
+    /// `clauses`。
+    fn compile_comp_clause(
+        &mut self,
+        expr: &Expr,
+        condition: &Option<Box<Expr>>,
+        i: usize,
+        list_slot: usize,
+        clauses: &[CompClauseSlots],
+        line: usize,
+    ) -> Result<(), String> {
+        let clause = &clauses[i];
+        // 设置迭代器：编译 iterable → ITERATOR → 写入预留的 iter_slot。
+        self.compile_expression(clause.iterable, line)?;
+        self.emit_byte(OpCode::Iterator as u8, line);
+        self.emit_byte(OpCode::StoreLocal as u8, line);
+        self.emit_byte(clause.iter as u8, line);
+
+        // 循环头：FOR_ITER iter_slot exit_offset(2)。
+        let loop_start = self.current_offset();
+        let exit = self.emit_for_iter(clause.iter as u8, line);
+
+        // 存储循环目标（参照 compile_for_in：单变量直接存；多变量 UNPACK 后正序存）。
+        let targets = &clause.targets;
+        if targets.len() == 1 {
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(targets[0] as u8, line);
+        } else {
+            let n = u8::try_from(targets.len())
+                .map_err(|_| format!("too many unpack targets (max 255, got {})", targets.len()))?;
+            self.emit_byte(OpCode::Unpack as u8, line);
+            self.emit_byte(n, line);
+            for &slot in targets {
+                self.emit_byte(OpCode::StoreLocal as u8, line);
+                self.emit_byte(slot as u8, line);
+            }
+        }
+
+        if i + 1 < clauses.len() {
+            // 嵌套下一层 for 子句。
+            self.compile_comp_clause(expr, condition, i + 1, list_slot, clauses, line)?;
+        } else if let Some(cond) = condition {
+            // 最内层 + 过滤：JUMP_IF_FALSE 跳过追加。JumpIfFalse 仅 peek 不弹 cond，
+            // 故真/假两支各需一次 POP；真支追加后须 JUMP 越过假支的清理 POP。
+            // （§2 伪代码遗漏此 JUMP，会使真支跌入假支 POP 弹错值。）
+            self.compile_expression(cond, line)?;
+            let skip = self.emit_jump(OpCode::JumpIfFalse, line);
+            self.emit_byte(OpCode::Pop as u8, line);
+            self.comp_do_append(expr, list_slot, line)?;
+            let end_jump = self.emit_jump(OpCode::Jump, line);
+            self.patch_jump(skip)?;
+            self.emit_byte(OpCode::Pop as u8, line);
+            self.patch_jump(end_jump)?;
+        } else {
+            // 最内层无过滤：直接追加。
+            self.comp_do_append(expr, list_slot, line)?;
+        }
+
+        // 回边：跳回本子句循环头。
+        let back = self.emit_jump(OpCode::JumpBack, line);
+        self.patch_jump_back(back, loop_start)?;
+        // 出口：FOR_ITER 耗尽落地处。
+        self.patch_jump(exit)?;
+        Ok(())
+    }
+
+    /// 计算 `expr` 并追加到 `list_slot` 处的 list：编译 expr（压栈）+ LIST_APPEND slot（弹出）。
+    fn comp_do_append(&mut self, expr: &Expr, list_slot: usize, line: usize) -> Result<(), String> {
+        self.compile_expression(expr, line)?;
+        self.emit_byte(OpCode::ListAppend as u8, line);
+        self.emit_byte(list_slot as u8, line);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 // 3.14 是设计文档示例值（非 PI 近似），spec 指定保留。
 #[allow(clippy::approx_constant)]
 mod tests {
-    use crate::ast::node::{AssignOp, BinaryOp, Expr, Literal, UnaryOp};
+    use crate::ast::node::{AssignOp, BinaryOp, Expr, ForClause, Literal, UnaryOp};
     use crate::compiler::{Compiler, OpCode};
 
     /// 在编译产物中查找指定 opcode 的字节码偏移。
@@ -1089,5 +1245,77 @@ mod tests {
             expr: Box::new(Expr::Literal(Literal::Nil)),
         };
         assert!(compiler.compile_expression(&expr, 1).is_err());
+    }
+
+    // ---- task 33：列表推导式 ----
+
+    fn make_comp(expr: Expr, clauses: Vec<(&str, Expr)>, condition: Option<Expr>) -> Expr {
+        Expr::ListComprehension {
+            expr: Box::new(expr),
+            for_clauses: clauses
+                .into_iter()
+                .map(|(t, it)| ForClause {
+                    targets: vec![t.to_string()],
+                    iterable: Box::new(it),
+                })
+                .collect(),
+            condition: condition.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn test_compile_list_comprehension_emits_core_opcodes() {
+        // [x for x in xs]：应发射 BUILD_LIST、ITERATOR、FOR_ITER、LIST_APPEND，
+        // 并以 LOAD_LOCAL 收尾（结果留栈顶）。
+        let mut compiler = Compiler::new();
+        let expr = make_comp(
+            Expr::Identifier("x".into()),
+            vec![("x", Expr::Identifier("xs".into()))],
+            None,
+        );
+        compiler.compile_expression(&expr, 1).unwrap();
+        assert!(find_opcode(&compiler, OpCode::BuildList).is_some());
+        assert!(find_opcode(&compiler, OpCode::Iterator).is_some());
+        assert!(find_opcode(&compiler, OpCode::ForIter).is_some());
+        assert!(find_opcode(&compiler, OpCode::ListAppend).is_some());
+        assert!(find_opcode(&compiler, OpCode::LoadLocal).is_some());
+    }
+
+    #[test]
+    fn test_compile_list_comprehension_filter_emits_jump_if_false() {
+        // [x for x in xs if x > 0]：过滤分支发射 JUMP_IF_FALSE + JUMP（修正后的平衡结构）。
+        let mut compiler = Compiler::new();
+        let cond = Expr::Binary {
+            left: Box::new(Expr::Identifier("x".into())),
+            op: BinaryOp::Greater,
+            right: Box::new(Expr::Literal(Literal::Int(0))),
+        };
+        let expr = make_comp(
+            Expr::Identifier("x".into()),
+            vec![("x", Expr::Identifier("xs".into()))],
+            Some(cond),
+        );
+        compiler.compile_expression(&expr, 1).unwrap();
+        assert!(find_opcode(&compiler, OpCode::JumpIfFalse).is_some());
+        assert!(find_opcode(&compiler, OpCode::Jump).is_some());
+        assert!(find_opcode(&compiler, OpCode::ListAppend).is_some());
+    }
+
+    #[test]
+    fn test_compile_list_comprehension_nested_two_clauses() {
+        // [x for row in m for x in row]：两子句 → 两个 FOR_ITER + 两个 ITERATOR。
+        let mut compiler = Compiler::new();
+        let expr = make_comp(
+            Expr::Identifier("x".into()),
+            vec![
+                ("row", Expr::Identifier("m".into())),
+                ("x", Expr::Identifier("row".into())),
+            ],
+            None,
+        );
+        compiler.compile_expression(&expr, 1).unwrap();
+        let code = &compiler.chunk().code;
+        let iter_count = code.iter().filter(|&&b| b == OpCode::ForIter as u8).count();
+        assert_eq!(iter_count, 2);
     }
 }

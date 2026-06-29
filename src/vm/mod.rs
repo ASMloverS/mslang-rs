@@ -666,6 +666,38 @@ impl VM {
                     self.push(alloc_list(elements))?;
                 }
 
+                // LIST_APPEND slot（task 33）：弹出栈顶值，原地追加到 slot 处的 list
+                // 局部变量。不向栈顶 push 任何值（结果 list 由推导式末尾 LOAD_LOCAL 显式
+                // 取出）。编译端由 compile_list_comprehension（expression.rs）发射。
+                OpCode::ListAppend => {
+                    let slot = self.read_byte()? as usize;
+                    let value = self.pop()?;
+                    let stack_base = self
+                        .call_stack
+                        .last()
+                        .ok_or("no call frame".to_string())?
+                        .stack_base;
+                    let location = stack_base
+                        .checked_add(slot)
+                        .ok_or_else(|| "local slot overflow".to_string())?;
+                    if location >= self.stack.len() {
+                        return Err("RuntimeError: LIST_APPEND slot out of range".to_string());
+                    }
+                    match &self.stack[location] {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+                            debug_assert!(!ptr.is_null(), "null Object::Ref");
+                            // SAFETY：type_tag 守卫确认 ptr 指向由 alloc_list 分配的 MsList。
+                            unsafe { read_list(*ptr) }.push(value);
+                        }
+                        other => {
+                            return Err(format!(
+                                "TypeError: LIST_APPEND requires a list, got '{}'",
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+
                 // BUILD_DICT pairs：栈上已按 key0,val0,key1,val1,… 顺序压入 pairs 对
                 // 键值对。弹出 pairs*2 个值，构建 dict 对象并压栈。
                 // task 32 回填。
@@ -2487,6 +2519,115 @@ mod tests {
         let result = compile_and_run("for i in 42 {\n}");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not iterable"));
+    }
+
+    // ---- task 33：列表推导式 ----
+
+    #[test]
+    fn test_list_append_opcode_appends_in_place() {
+        // 合成字节码：slot 1 放空 list，LIST_APPEND 1 追加 99，LOAD_LOCAL 1 取出。
+        // 验证 LIST_APPEND 弹出栈顶值、原地追加、不 push 返回值。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8, // slot 1 占位
+                OpCode::BuildList as u8,
+                0, // 空列表
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = []
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // 99
+                OpCode::ListAppend as u8,
+                1, // append 99 to slot 1
+                OpCode::LoadLocal as u8,
+                1, // 取出结果列表
+                OpCode::Halt as u8,
+            ],
+            vec![Object::Int(99)],
+        )
+        .unwrap();
+        assert_eq!(result, alloc_list(vec![Object::Int(99)]));
+    }
+
+    #[test]
+    fn test_list_append_opcode_type_error_on_non_list() {
+        // slot 1 为 int（非 list）→ LIST_APPEND 抛 TypeError。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8,
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // 99
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = 99 (int)
+                OpCode::Constant as u8,
+                0x00,
+                0x01, // 7 (constant idx 1, big-endian)
+                OpCode::ListAppend as u8,
+                1,
+                OpCode::Halt as u8,
+            ],
+            vec![Object::Int(99), Object::Int(7)],
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("TypeError"));
+    }
+
+    #[test]
+    fn test_list_comprehension_basic() {
+        // [x*x for x in range(10)]
+        let src = "squares = [x * x for x in range(10)]\nassert(squares == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81])";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_filter() {
+        // [x for x in range(20) if x % 2 == 0]
+        let src = "evens = [x for x in range(20) if x % 2 == 0]\nassert(evens == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18])";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_filter_strings() {
+        // len() 内置支持字符串
+        let src = "names = [\"Alice\", \"Bob\", \"Charlie\", \"David\"]\nlong_names = [n for n in names if len(n) > 3]\nassert(long_names == [\"Alice\", \"Charlie\", \"David\"])";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_nested() {
+        // [x for row in matrix for x in row] — 展平矩阵
+        let src = "matrix = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]\nflat = [x for row in matrix for x in row]\nassert(flat == [1, 2, 3, 4, 5, 6, 7, 8, 9])";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_external_var() {
+        // 推导式内引用外部变量 factor
+        let src = "factor = 10\nscaled = [x * factor for x in range(5)]\nassert(scaled == [0, 10, 20, 30, 40])";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_multi_var() {
+        // 多变量解构：[a + b for a, b in pairs]
+        let src =
+            "pairs = [(1, 2), (3, 4)]\nsums = [a + b for a, b in pairs]\nassert(sums == [3, 7])";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_loop_var_not_leaked() {
+        // 验证 #4：推导式内循环变量不泄漏到外部作用域（顶层 x 未声明 → nil）。
+        let src = "[x for x in range(3)]\nassert(x == nil)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_list_comprehension_nested_with_filter() {
+        // 嵌套 + 过滤组合
+        let src = "matrix = [[1, 2, 3], [4, 5, 6]]\nevens = [x for row in matrix for x in row if x % 2 == 0]\nassert(evens == [2, 4, 6])";
+        assert!(compile_and_run(src).is_ok());
     }
 
     // ---- task 27：调用帧与函数调用 ----

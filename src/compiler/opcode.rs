@@ -87,6 +87,7 @@ pub enum OpCode {
     BuildTuple,
     BuildSet,
     Unpack,
+    ListAppend,
     // 类与实例
     Class,
     Method,
@@ -158,6 +159,7 @@ impl OpCode {
             | Self::BuildTuple
             | Self::BuildSet
             | Self::Unpack
+            | Self::ListAppend
             | Self::Channel => 1,
 
             // INVOKE 特殊：name_idx(2) + argc(1)
@@ -339,6 +341,7 @@ mod tests {
             OpCode::BuildTuple,
             OpCode::BuildSet,
             OpCode::Unpack,
+            OpCode::ListAppend,
             OpCode::Class,
             OpCode::Method,
             OpCode::Inherit,
@@ -376,6 +379,7 @@ mod tests {
         assert_eq!(OpCode::Call.operand_size(), 1);
         assert_eq!(OpCode::Invoke.operand_size(), 3);
         assert_eq!(OpCode::BuildList.operand_size(), 1);
+        assert_eq!(OpCode::ListAppend.operand_size(), 1);
         assert_eq!(OpCode::Halt.operand_size(), 0);
     }
 
