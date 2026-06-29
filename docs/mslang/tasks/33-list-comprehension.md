@@ -70,82 +70,111 @@ Expr::ListComprehension {
 2. **隐式作用域**（`03-syntax.md:528`）：推导式必须创建隐式作用域，循环变量不泄漏。整个 codegen 包裹 `begin_scope()` … `end_scope()`（`src/compiler/mod.rs:243-268`，注释已明确为「函数边界和推导式隐式作用域」预留）。`end_scope` 会按 `is_captured` 自动发 `CLOSE_UPVALUE` 或 `POP` 清理本作用域所有 local（iter slot / 循环变量 slot / list slot），满足验证 #4。
 3. **结果留栈顶**：推导式是表达式，`end_scope` 清理前需 `LOAD_LOCAL list_slot` 把结果 list 复制到栈顶作为表达式返回值。
 
-伪代码（单变量单层；多变量/多层见后续注释）：
+伪代码（含多变量与嵌套）：
 
 ```
 compile_list_comprehension(expr, for_clauses, condition):
     begin_scope()
 
     emit BUILD_LIST 0                      // 栈顶即空 list
-    declare_local("__comp_list")           // list_slot = 当前 local 数
-    list_slot = resolve_local("__comp_list")
+    declare_local("__comp_list"); list_slot = resolve_local("__comp_list")
 
-    compile_clause(0, list_slot)           // 递归各 for 子句，最内层追加
+    // ★ 关键：所有子句的 iter/target slot 在进入任何循环之前一次性预留。
+    // 若延迟到各 compile_clause 内声明，嵌套子句的 Nil 占位会随外层每次迭代
+    // 重入而反复 push，导致栈泄漏并破坏 end_scope 的 POP 清理；且多变量 UNPACK
+    // 展开要求目标 slot 已位于栈低部，否则展开元素与目标位置重叠互相覆盖。
+    clauses = []
+    for (i, clause) in for_clauses.enumerate():
+        emit Nil; declare_local("__comp_iter_<i>"); iter = resolve_local(...)
+        targets = []
+        for t in clause.targets:
+            emit Nil; declare_local(t); targets.push(resolve_local(t))
+        clauses.push({ iterable: clause.iterable, iter, targets })
+
+    compile_clause(0, list_slot, clauses)  // 递归各 for 子句，最内层追加
 
     emit LOAD_LOCAL list_slot              // 结果副本留栈顶
     end_scope()                            // 清理本作用域 local
 ```
 
-每层 for 子句（结构同 `compile_for_in`，省略错误处理）：
+每层 for 子句（结构同 `compile_for_in`，省略错误处理）；所有 slot 已由调用方预留：
 
 ```
-compile_clause(i, list_slot):
-    emit Nil; declare_local("__comp_iter_<i>"); iter_slot = resolve_local(...)
-    compile_expression(for_clauses[i].iterable)
+compile_clause(i, list_slot, clauses):
+    clause = clauses[i]
+    compile_expression(clause.iterable)    // 计算可迭代对象压栈
     emit ITERATOR
-    emit STORE_LOCAL iter_slot
+    emit STORE_LOCAL clause.iter           // 写入预留的 iter_slot（净零栈效应）
 
     loop_start = current_offset()
-    exit = emit_for_iter(iter_slot)        // FOR_ITER iter_slot exit_offset(2)
+    exit = emit_for_iter(clause.iter)      // FOR_ITER iter_slot exit_offset(2)
 
-    // 循环目标：参照 compile_for_in，每个 target 先 Nil 占位 + declare_local
-    if targets.len() == 1:
-        emit Nil; declare_local(targets[0]); slot = resolve_local(...)
-        emit STORE_LOCAL slot
+    // 循环目标：参照 compile_for_in（task #30 已定约：UNPACK 在 VM 内逆序压栈，
+    // 故编译器按 targets[0], targets[1], ... 正序 STORE，每次从栈顶弹出一个）
+    if clause.targets.len() == 1:
+        emit STORE_LOCAL clause.targets[0]
     else:
-        各 target 预留 Nil + declare_local → target_slots
-        emit UNPACK targets.len()
-        逆序 emit STORE_LOCAL target_slots[k]
+        emit UNPACK clause.targets.len()
+        for slot in clause.targets:        // 正序
+            emit STORE_LOCAL slot
 
-    if i < for_clauses.len() - 1:
-        compile_clause(i+1, list_slot)     // 嵌套下一层
+    if i < clauses.len() - 1:
+        compile_clause(i+1, list_slot, clauses)   // 嵌套下一层
     else:
         // 最内层：可选过滤 + 追加
         if let Some(cond) = condition:
             compile_expression(cond)
-            skip = emit_jump(JUMP_IF_FALSE)
-            emit POP                       // 弹出 cond（真值分支）
+            skip = emit_jump(JUMP_IF_FALSE)  // JumpIfFalse 仅 peek 不弹 cond
+            emit POP                         // 真支：弹出 cond
             do_append(list_slot, expr)
-            patch_jump(skip)
-            emit POP                       // 跳过分支落地：弹出残留 cond
+            end_jump = emit_jump(JUMP)       // ★ 越过假支的清理 POP（不可省略：
+                                              //   否则真支跌入假支 POP 弹错值）
+            patch_jump(skip)                 // 假支落地
+            emit POP                         // 假支：弹出 cond
+            patch_jump(end_jump)             // 真假两支汇合
         else:
             do_append(list_slot, expr)
 
     back = emit_jump(JUMP_BACK)
     patch_jump_back(back, loop_start)
-    patch_jump(exit)                       // FOR_ITER 耗尽落地处
+    patch_jump(exit)                         // FOR_ITER 耗尽落地处
 ```
 
-`do_append(list_slot, expr)`——将 `expr` 结果追加到 list。**本任务实现方案 A**：
+`do_append(list_slot, expr)`——将 `expr` 结果追加到 list。**本任务采用专用 `LIST_APPEND slot` 指令**（定义见 §3）：
 
 ```
 do_append(list_slot, expr):
-    emit LOAD_LOCAL list_slot              // list（作为接收者）
-    emit GET_ATTR "append"                 // 绑定方法
-    compile_expression(expr)               // 参数 value
-    emit CALL 1
-    emit POP                               // append 返回 nil/旧长度，弹出
+    compile_expression(expr)               // 计算元素值，压栈顶
+    emit LIST_APPEND list_slot             // 弹出栈顶值，追加到 list_slot 处的列表
 ```
+
+`LIST_APPEND slot` 弹出栈顶值并原地追加到 `slot` 处的 list 局部变量；指令不向栈顶 push 任何返回值（结果 list 由 §2 末尾 `LOAD_LOCAL list_slot` 显式取出）。此方案不依赖 GET_ATTR/绑定方法/CALL（属 task 41/43/50/51，Phase 5/6），使本任务（Phase 4）可端到端运行。
 
 **多变量**：`for_clauses[i].targets.len() > 1` 时，迭代器每次须产出恰好 `targets.len()` 个元素，否则运行时抛 `ValueError`（与 `03-syntax.md:228` for..in 双变量语义一致）。
 
 **多层嵌套**：`for_clauses` 按顺序对应嵌套循环——最外层先进入、最内层执行过滤与追加；每个子句的 `iter_slot`/`target_slot` 都在同一个 `begin_scope` 内声明，由 `end_scope` 统一清理。
 
-### 3. 专用追加指令（可选优化，暂不实施）
+### 3. 专用追加指令 `LIST_APPEND slot`
 
-可引入 `LIST_APPEND slot` 指令直接向 `slot` 处的列表追加栈顶值，避免每轮 `GET_ATTR "append"` + `CALL 1` 的方法查找开销（`11-bytecode-vm.md` 当前**未定义**此 opcode；若引入需同步修订 `11-bytecode-vm.md` 构造器表）。
+本任务采用专用 `LIST_APPEND slot` 指令作为追加机制（不使用早期考虑过的 GET_ATTR + CALL 方案——后者依赖未实现的属性访问 task 41/43 与 list.append 绑定方法 task 50/51，均属 Phase 5/6）。
 
-**本任务采用 §2 方案 A（GET_ATTR + CALL）**，`LIST_APPEND` 延后至性能优化阶段，届时一并更新规格文档。
+**指令定义**（已同步修订 `11-bytecode-vm.md` § 构造器表）：
+
+| OpCode | 操作数 | 说明 |
+|---|---|---|
+| `LIST_APPEND` | `slot(1)` | 弹出栈顶值，追加到 `slot` 处的 list 局部变量 |
+
+**VM 执行契约**（`src/vm/mod.rs` 的 `OpCode::ListAppend` 分支）：
+
+1. 读取 1 字节 `slot`。
+2. 弹出栈顶值 `value`。
+3. 从 `slot` 处局部读取 `list`；若非 list 类型，运行时抛 `TypeError`。
+4. 原地追加 `value` 到 list 内部 `Vec<Object>` 末尾（不创建新 list）。
+5. **不**向栈顶 push 任何值。
+
+**操作数大小**：`operand_size() = 1`（归入 `opcode.rs` 的「1 字节操作数」分组，与 `BUILD_LIST` 等 count 类指令一致）。
+
+> **GC 前瞻（task 52）**：原地修改 list 的 `Vec<Object>`；若 `value` 为 `Object::Ref`，task 52 已为 `TypeTag::LIST` 注册 trace，无需额外改动。
 
 ## 验证标准
 

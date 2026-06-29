@@ -138,6 +138,7 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | `BUILD_TUPLE` | `count(1)` | 从栈顶 count 个元素构建 tuple |
 | `BUILD_SET` | `count(1)` | 从栈顶 count 个元素构建 set |
 | `UNPACK` | `count(1)` | 解包序列到栈 |
+| `LIST_APPEND` | `slot(1)` | 弹出栈顶值，追加到 slot 处的 list 局部变量（列表推导式追加） |
 
 > **限制**：`count` 为单字节无符号整数（0-255）。超过 255 个元素的字面量由编译器自动分段构建。
 
