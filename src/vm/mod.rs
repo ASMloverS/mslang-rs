@@ -8,8 +8,9 @@ use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
     alloc_closure, alloc_dict, alloc_function, alloc_iterator, alloc_list, alloc_set, alloc_tuple,
-    alloc_upvalue, read_closure, read_function, read_iterator, read_list, read_str, read_tuple,
-    read_upvalue, CmpOp, DictMap, Function, MsObjHeader, MsUpvalue, Object, TypeTag,
+    alloc_upvalue, read_closure, read_dict, read_function, read_iterator, read_list, read_set,
+    read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function, MsObjHeader, MsUpvalue, Object,
+    TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -105,6 +106,21 @@ impl VM {
         self.stack
             .get_mut(idx)
             .ok_or_else(|| "stack underflow".to_string())
+    }
+}
+
+/// 从 `catch_unwind` 捕获的 panic payload 中提取「不可哈希」TypeError 消息。
+///
+/// `Object::hash`（`object.rs`）对 list/dict/set/NaN 发
+/// `panic!("TypeError: unhashable type: '...'")`，该消息已符合规范，直接转
+/// `Err` 返回，使 try/except（task 37）可捕获而非终止 VM 进程（spec §3）。
+fn unhashable_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        "TypeError: unhashable type".to_string()
     }
 }
 
@@ -692,6 +708,87 @@ impl VM {
                         other => {
                             return Err(format!(
                                 "TypeError: LIST_APPEND requires a list, got '{}'",
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+
+                // SET_ADD slot（task 34）：弹出栈顶元素，原地加入 slot 处的 set 局部变量。
+                // 不向栈顶 push 任何值（结果 set 由推导式末尾 LOAD_LOCAL 显式取出）。
+                // 编译端由 compile_set_comprehension（expression.rs）发射。
+                OpCode::SetAdd => {
+                    let slot = self.read_byte()? as usize;
+                    let elem = self.pop()?;
+                    let stack_base = self
+                        .call_stack
+                        .last()
+                        .ok_or("no call frame".to_string())?
+                        .stack_base;
+                    let location = stack_base
+                        .checked_add(slot)
+                        .ok_or_else(|| "local slot overflow".to_string())?;
+                    if location >= self.stack.len() {
+                        return Err("RuntimeError: SET_ADD slot out of range".to_string());
+                    }
+                    match &self.stack[location] {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+                            debug_assert!(!ptr.is_null(), "null Object::Ref");
+                            // SAFETY：type_tag 守卫确认 ptr 指向由 alloc_set 分配的 MsSet。
+                            // Object::hash 对 list/dict/set/NaN 元素会 panic；用 catch_unwind
+                            // 将其转为可被 try/except 捕获的 TypeError（见 spec §3 不可哈希值）。
+                            // panic 发生在 HashSet 哈希阶段（插入前），set 未被破坏。
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    unsafe { read_set(*ptr) }.insert(elem)
+                                }));
+                            if let Err(payload) = result {
+                                return Err(unhashable_message(payload));
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "TypeError: SET_ADD requires a set, got '{}'",
+                                other.type_name()
+                            ));
+                        }
+                    }
+                }
+
+                // DICT_INSERT slot（task 34）：先弹 val、再弹 key（编译端 key 先压栈，故
+                // val 在栈顶），原地插入 slot 处的 dict 局部变量。不向栈顶 push 任何值。
+                // 不可哈希 key 同样经 catch_unwind 转 TypeError。
+                OpCode::DictInsert => {
+                    let slot = self.read_byte()? as usize;
+                    let value = self.pop()?;
+                    let key = self.pop()?;
+                    let stack_base = self
+                        .call_stack
+                        .last()
+                        .ok_or("no call frame".to_string())?
+                        .stack_base;
+                    let location = stack_base
+                        .checked_add(slot)
+                        .ok_or_else(|| "local slot overflow".to_string())?;
+                    if location >= self.stack.len() {
+                        return Err("RuntimeError: DICT_INSERT slot out of range".to_string());
+                    }
+                    match &self.stack[location] {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+                            debug_assert!(!ptr.is_null(), "null Object::Ref");
+                            // SAFETY：type_tag 守卫确认 ptr 指向由 alloc_dict 分配的 MsDict。
+                            // 不可哈希 key 在哈希阶段 panic（插入前），dict 未被破坏。
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    unsafe { read_dict(*ptr) }.insert(key, value)
+                                }));
+                            if let Err(payload) = result {
+                                return Err(unhashable_message(payload));
+                            }
+                        }
+                        other => {
+                            return Err(format!(
+                                "TypeError: DICT_INSERT requires a dict, got '{}'",
                                 other.type_name()
                             ));
                         }
@@ -2573,6 +2670,175 @@ mod tests {
         assert!(result.unwrap_err().contains("TypeError"));
     }
 
+    // ---- task 34：SET_ADD / DICT_INSERT 辅助指令 ----
+
+    #[test]
+    fn test_set_add_opcode_adds_in_place() {
+        // 合成字节码：slot 1 放空 set，SET_ADD 1 加入 99，LOAD_LOCAL 1 取出。
+        // 验证 SET_ADD 弹出栈顶元素、原地加入、不 push 返回值。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8, // slot 1 占位（占住 slot 0，使 slot 1 可寻址）
+                OpCode::BuildSet as u8,
+                0, // 空 set
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = {}
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // 99
+                OpCode::SetAdd as u8,
+                1, // add 99 to slot 1
+                OpCode::LoadLocal as u8,
+                1, // 取出结果 set
+                OpCode::Halt as u8,
+            ],
+            vec![Object::Int(99)],
+        )
+        .unwrap();
+        let mut expected = HashSet::new();
+        expected.insert(Object::Int(99));
+        assert_eq!(result, alloc_set(expected));
+    }
+
+    #[test]
+    fn test_set_add_opcode_type_error_on_non_set() {
+        // slot 1 为 int（非 set）→ SET_ADD 抛 TypeError。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8,
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // 99
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = 99 (int)
+                OpCode::Constant as u8,
+                0x00,
+                0x01, // 7
+                OpCode::SetAdd as u8,
+                1,
+                OpCode::Halt as u8,
+            ],
+            vec![Object::Int(99), Object::Int(7)],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("set"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_set_add_opcode_unhashable_returns_type_error() {
+        // set 元素为 list（不可哈希）→ Object::hash panic，经 catch_unwind 转 TypeError。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8,
+                OpCode::BuildSet as u8,
+                0,
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = {}
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // []（不可哈希 list）
+                OpCode::SetAdd as u8,
+                1,
+                OpCode::Halt as u8,
+            ],
+            vec![alloc_list(vec![])],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("unhashable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_dict_insert_opcode_inserts_in_place() {
+        // 合成字节码：slot 1 放空 dict，先压 key(1) 再压 val(2)，DICT_INSERT 1 插入。
+        // 验证 DICT_INSERT 先弹 val 再弹 key、原地插入、不 push 返回值。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8, // slot 1 占位
+                OpCode::BuildDict as u8,
+                0, // 空 dict
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = {}
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // key = 1
+                OpCode::Constant as u8,
+                0x00,
+                0x01, // val = 2
+                OpCode::DictInsert as u8,
+                1, // insert 1→2 into slot 1
+                OpCode::LoadLocal as u8,
+                1, // 取出结果 dict
+                OpCode::Halt as u8,
+            ],
+            vec![Object::Int(1), Object::Int(2)],
+        )
+        .unwrap();
+        let mut expected = DictMap::new();
+        expected.insert(Object::Int(1), Object::Int(2));
+        assert_eq!(result, alloc_dict(expected));
+    }
+
+    #[test]
+    fn test_dict_insert_opcode_type_error_on_non_dict() {
+        // slot 1 为 int（非 dict）→ DICT_INSERT 抛 TypeError。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8,
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // 1
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = 1 (int)
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // key
+                OpCode::Constant as u8,
+                0x00,
+                0x01, // val
+                OpCode::DictInsert as u8,
+                1,
+                OpCode::Halt as u8,
+            ],
+            vec![Object::Int(1), Object::Int(2)],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("dict"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_dict_insert_opcode_unhashable_key_returns_type_error() {
+        // dict key 为 list（不可哈希）→ Object::hash panic，经 catch_unwind 转 TypeError。
+        let result = run_chunk(
+            vec![
+                OpCode::Nil as u8,
+                OpCode::BuildDict as u8,
+                0,
+                OpCode::StoreLocal as u8,
+                1, // slot 1 = {}
+                OpCode::Constant as u8,
+                0x00,
+                0x00, // key = []（不可哈希 list）
+                OpCode::Constant as u8,
+                0x00,
+                0x01, // val = 99
+                OpCode::DictInsert as u8,
+                1,
+                OpCode::Halt as u8,
+            ],
+            vec![alloc_list(vec![]), Object::Int(99)],
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("unhashable"), "got: {}", err);
+    }
+
     #[test]
     fn test_list_comprehension_basic() {
         // [x*x for x in range(10)]
@@ -2628,6 +2894,150 @@ mod tests {
         // 嵌套 + 过滤组合
         let src = "matrix = [[1, 2, 3], [4, 5, 6]]\nevens = [x for row in matrix for x in row if x % 2 == 0]\nassert(evens == [2, 4, 6])";
         assert!(compile_and_run(src).is_ok());
+    }
+
+    // ---- task 34：Dict / Set 推导式 ----
+    //
+    // 验证 #5（结果类型正确）隐含于 == 断言：dict/set 仅与同类型字面量相等；
+    // 验证 #4（消歧）见 test_dict_set_comprehension_disambiguation。
+    // 因 print(x) 等价于 format!("{}", x)（builtin_print），且相等对象 Display 相同，
+    // assert(d == 字面量) 同时保证了 spec 预期输出的逐行正确。
+
+    #[test]
+    fn test_dict_comprehension_basic() {
+        // 验证 #1：字典推导式正确生成键值对。
+        let src = "squares = {x: x * x for x in range(5)}\nassert(squares == {0: 0, 1: 1, 2: 4, 3: 9, 4: 16})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_dict_comprehension_filter() {
+        // 验证 #3：带过滤条件的 dict 推导式。
+        let src = "even_squares = {x: x * x for x in range(10) if x % 2 == 0}\nassert(even_squares == {0: 0, 2: 4, 4: 16, 6: 36, 8: 64})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_set_comprehension_dedup() {
+        // 验证 #2：集合推导式正确去重。
+        let src = "unique = {len(w) for w in [\"a\", \"bb\", \"ccc\", \"bb\"]}\nassert(unique == {1, 2, 3})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_set_comprehension_filter() {
+        // 验证 #3：带过滤条件的 set 推导式。
+        let src = "big = {x for x in [1, 5, 3, 8, 2, 9, 4] if x > 3}\nassert(big == {4, 5, 8, 9})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_dict_set_comprehension_disambiguation() {
+        // 验证 #4：四种 { 语法正确消歧——dict 推导式、set 推导式、dict 字面量、set 字面量。
+        let src = "d1 = {x: x for x in range(3)}\ns1 = {x for x in range(3)}\nd2 = {\"a\": 1, \"b\": 2}\ns2 = {1, 2, 3}\nassert(d1 == {0: 0, 1: 1, 2: 2})\nassert(s1 == {0, 1, 2})\nassert(d2 == {\"a\": 1, \"b\": 2})\nassert(s2 == {1, 2, 3})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_dict_comprehension_multi_var() {
+        // 验证 #7：多变量 for k, v in pairs。
+        let src =
+            "pairs = [(1, 2), (3, 4)]\nd = {k: v for k, v in pairs}\nassert(d == {1: 2, 3: 4})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_set_comprehension_nested() {
+        // 验证 #7：嵌套 for ... for ...。
+        let src =
+            "m = [[1, 2], [3, 4]]\ns = {x for row in m for x in row}\nassert(s == {1, 2, 3, 4})";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_dict_comprehension_loop_var_not_leaked() {
+        // 验证 #6：dict 推导式循环变量不泄漏到外部作用域（顶层 x 未声明 → nil）。
+        let src = "{x: x for x in range(3)}\nassert(x == nil)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_set_comprehension_loop_var_not_leaked() {
+        // 验证 #6：set 推导式循环变量不泄漏到外部作用域。
+        let src = "{x for x in range(3)}\nassert(x == nil)";
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_set_comprehension_unhashable_element_caught() {
+        // spec §3 不可哈希值端到端：{x for x in [[1], [2]]} 试图把 list 放入 set →
+        // Object::hash panic 经 catch_unwind 转为可捕获的 TypeError，而非终止 VM。
+        let src = "s = {x for x in [[1], [2]]}";
+        let result = compile_and_run(src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("unhashable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_dict_comprehension_unhashable_key_caught() {
+        // spec §3：dict 推导式以 list 为 key → 不可哈希 → TypeError（catch_unwind 路径）。
+        let src = "d = {x: 1 for x in [[1], [2]]}";
+        let result = compile_and_run(src);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("unhashable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_dict_set_comprehension_display_matches_spec() {
+        // 显式钉住 spec §测试用例的预期输出格式（builtin_print == format!("{}", x)）。
+        // 含验证 #5 与 Display 注：字符串键不带引号（{a: 1, b: 2}）。
+        let mut squares = DictMap::new();
+        for x in 0..5i64 {
+            squares.insert(Object::Int(x), Object::Int(x * x));
+        }
+        assert_eq!(
+            format!("{}", alloc_dict(squares)),
+            "{0: 0, 1: 1, 2: 4, 3: 9, 4: 16}"
+        );
+
+        let mut even = DictMap::new();
+        for x in [0i64, 2, 4, 6, 8] {
+            even.insert(Object::Int(x), Object::Int(x * x));
+        }
+        assert_eq!(
+            format!("{}", alloc_dict(even)),
+            "{0: 0, 2: 4, 4: 16, 6: 36, 8: 64}"
+        );
+
+        let lens: HashSet<Object> = [Object::Int(1), Object::Int(2), Object::Int(3)]
+            .into_iter()
+            .collect();
+        assert_eq!(format!("{}", alloc_set(lens)), "{1, 2, 3}");
+
+        let big: HashSet<Object> = [
+            Object::Int(4),
+            Object::Int(5),
+            Object::Int(8),
+            Object::Int(9),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(format!("{}", alloc_set(big)), "{4, 5, 8, 9}");
+
+        // dict 字面量：字符串键不加引号（既有 Display 行为）
+        let mut d = DictMap::new();
+        d.insert(alloc_string("a"), Object::Int(1));
+        d.insert(alloc_string("b"), Object::Int(2));
+        assert_eq!(format!("{}", alloc_dict(d)), "{a: 1, b: 2}");
+
+        let set_lit: HashSet<Object> = [Object::Int(1), Object::Int(2), Object::Int(3)]
+            .into_iter()
+            .collect();
+        assert_eq!(format!("{}", alloc_set(set_lit)), "{1, 2, 3}");
     }
 
     // ---- task 27：调用帧与函数调用 ----

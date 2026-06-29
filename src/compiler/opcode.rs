@@ -9,7 +9,7 @@ use crate::compiler::Chunk;
 
 /// 字节码操作码。
 ///
-/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(79)，
+/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(81)，
 /// 因此可通过 `transmute` 与 `u8` 之间安全转换（见 [`OpCode::from_byte`]）。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +88,8 @@ pub enum OpCode {
     BuildSet,
     Unpack,
     ListAppend,
+    SetAdd,
+    DictInsert,
     // 类与实例
     Class,
     Method,
@@ -160,6 +162,8 @@ impl OpCode {
             | Self::BuildSet
             | Self::Unpack
             | Self::ListAppend
+            | Self::SetAdd
+            | Self::DictInsert
             | Self::Channel => 1,
 
             // INVOKE 特殊：name_idx(2) + argc(1)
@@ -342,6 +346,8 @@ mod tests {
             OpCode::BuildSet,
             OpCode::Unpack,
             OpCode::ListAppend,
+            OpCode::SetAdd,
+            OpCode::DictInsert,
             OpCode::Class,
             OpCode::Method,
             OpCode::Inherit,
@@ -380,6 +386,8 @@ mod tests {
         assert_eq!(OpCode::Invoke.operand_size(), 3);
         assert_eq!(OpCode::BuildList.operand_size(), 1);
         assert_eq!(OpCode::ListAppend.operand_size(), 1);
+        assert_eq!(OpCode::SetAdd.operand_size(), 1);
+        assert_eq!(OpCode::DictInsert.operand_size(), 1);
         assert_eq!(OpCode::Halt.operand_size(), 0);
     }
 
