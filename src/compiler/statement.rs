@@ -47,7 +47,7 @@ impl Compiler {
                 name, params, body, ..
             } => self.compile_fn_decl(name, params, body, line),
             Stmt::ClassDecl { .. } => Err("class compilation not yet implemented (task 40)".into()),
-            Stmt::Defer { .. } => Err("defer compilation not yet implemented (task 36)".into()),
+            Stmt::Defer { expr } => self.compile_defer(expr, line),
             Stmt::Try { .. } => {
                 Err("try/except/finally compilation not yet implemented (task 37)".into())
             }
@@ -242,7 +242,7 @@ impl Compiler {
         self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line);
-        self.emit_byte(OpCode::Return as u8, line);
+        self.emit_return(line);
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
         // 上值捕获回填：函数体中 is_local=true 的上值对应父单元的局部变量，
@@ -316,7 +316,28 @@ impl Compiler {
                 self.emit_byte(count, line);
             }
         }
-        self.emit_byte(OpCode::Return as u8, line);
+        self.emit_return(line);
+        Ok(())
+    }
+
+    /// 编译 defer 语句（task 36）。值绑定方案：求值 callee + 各参数（注册时求值，
+    /// 满足规则 3），BUILD_TUPLE 打成单个 tuple，DEFER 弹出入当前帧 defer 栈。
+    /// 要求 `expr` 为 Call 表达式（`defer f(args...)`）。
+    fn compile_defer(&mut self, expr: &Expr, line: usize) -> Result<(), String> {
+        let (callee, args) = match expr {
+            Expr::Call { callee, args } => (callee.as_ref(), args.as_slice()),
+            _ => return Err("SyntaxError: defer requires a call expression".into()),
+        };
+        self.compile_expression(callee, line)?;
+        for arg in args {
+            self.compile_expression(arg, line)?;
+        }
+        // tuple(callee, arg1, ..., argN)：count = N+1。
+        let count = u8::try_from(args.len() + 1)
+            .map_err(|_| format!("too many defer arguments (max 254, got {})", args.len()))?;
+        self.emit_byte(OpCode::BuildTuple as u8, line);
+        self.emit_byte(count, line);
+        self.emit_byte(OpCode::Defer as u8, line);
         Ok(())
     }
 
@@ -762,8 +783,8 @@ mod tests {
 
     #[test]
     fn test_deferred_statement_types_return_error() {
-        // fn 声明已由 task 27 实现，不再报错；其余语句类型仍为 stub。
-        for source in ["defer foo()", "throw e", "import os"] {
+        // fn/defer 声明已实现，不再报错；其余语句类型仍为 stub。
+        for source in ["throw e", "import os"] {
             let program = parse(source);
             let mut compiler = Compiler::new();
             assert!(
@@ -827,5 +848,64 @@ mod tests {
                 source
             );
         }
+    }
+
+    // ---- task 36：defer 编译 ----
+
+    #[test]
+    fn test_compile_defer_emits_defer_opcode() {
+        // defer f(args)：求值 callee+args → BUILD_TUPLE → DEFER。
+        let source = "defer print(\"hi\")";
+        let chunk = compile(source);
+        assert!(chunk.code.contains(&(OpCode::Defer as u8)));
+        assert!(chunk.code.contains(&(OpCode::BuildTuple as u8)));
+    }
+
+    #[test]
+    fn test_compile_return_emits_exec_defer() {
+        // 函数每个 RETURN 前须 emit EXEC_DEFER（含函数末尾隐式 RETURN）。
+        // 函数体字节码在常量池中的 MsFunction 里（非顶层 chunk），需取出校验。
+        use crate::vm::object::{read_function, Object, TypeTag};
+        let source = "fn f() { return 1 }";
+        let chunk = compile(source);
+        let func_code = chunk
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                Object::Ref(ptr)
+                    if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 =>
+                {
+                    Some(unsafe { read_function(*ptr) }.function.code.clone())
+                }
+                _ => None,
+            })
+            .expect("function constant not found");
+        let ret_pos = func_code
+            .iter()
+            .position(|&b| b == OpCode::Return as u8)
+            .expect("return opcode");
+        assert!(ret_pos > 0);
+        assert_eq!(func_code[ret_pos - 1], OpCode::ExecDefer as u8);
+    }
+
+    #[test]
+    fn test_compile_top_level_emits_exec_defer_before_halt() {
+        // 顶层返回点（HALT）前亦须 emit EXEC_DEFER（§8）。
+        let source = "x = 1";
+        let chunk = compile(source);
+        let code = chunk.code;
+        let halt_pos = code
+            .iter()
+            .position(|&b| b == OpCode::Halt as u8)
+            .expect("halt opcode");
+        assert!(halt_pos > 0);
+        assert_eq!(code[halt_pos - 1], OpCode::ExecDefer as u8);
+    }
+
+    #[test]
+    fn test_compile_defer_non_call_is_error() {
+        let program = parse("defer 42");
+        let mut compiler = Compiler::new();
+        assert!(compiler.compile(&program).is_err());
     }
 }

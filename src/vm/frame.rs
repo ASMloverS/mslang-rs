@@ -8,15 +8,24 @@ pub struct CallFrame {
     pub ip: usize,
     pub stack_base: usize,
     pub defer_stack_base: usize,
+    /// task 36：EXEC_DEFER trampoline 状态。true 表示本帧正处于 defer 刷新中——
+    /// 下次进入 EXEC_DEFER 时须先弹出刚完成的 defer 调用返回值。每帧独立，
+    /// 避免 defer callee 自身的（空）EXEC_DEFER 误触发弹栈。
+    pub defer_flushing: bool,
 }
 
 impl CallFrame {
-    pub fn new(closure: *mut MsObjHeader, stack_base: usize) -> Self {
+    pub fn new(
+        closure: *mut MsObjHeader,
+        stack_base: usize,
+        defer_stack_base: usize,
+    ) -> Self {
         Self {
             closure,
             ip: 0,
             stack_base,
-            defer_stack_base: 0,
+            defer_stack_base,
+            defer_flushing: false,
         }
     }
 

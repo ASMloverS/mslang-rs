@@ -566,7 +566,7 @@ impl Compiler {
         self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line); // 隐式 return nil
-        self.emit_byte(OpCode::Return as u8, line);
+        self.emit_return(line);
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
         // 上值捕获回填（task 28）：is_local=true 的上值对应父单元局部变量，

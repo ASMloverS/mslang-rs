@@ -185,6 +185,13 @@ impl Compiler {
         }
     }
 
+    /// 发射函数返回点（task 36）：先 EXEC_DEFER 刷新本帧 defer（LIFO），再 RETURN。
+    /// 所有 RETURN 站点（显式 return、函数末尾隐式 return、fn 字面量末尾）统一经此。
+    pub fn emit_return(&mut self, line: usize) {
+        self.emit_byte(OpCode::ExecDefer as u8, line);
+        self.emit_byte(OpCode::Return as u8, line);
+    }
+
     /// 发射跳转指令（占位 0xFFFF），返回跳转操作数的起始偏移（供 patch_jump 使用）。
     pub fn emit_jump(&mut self, opcode: OpCode, line: usize) -> usize {
         self.emit_byte(opcode as u8, line);
@@ -421,6 +428,7 @@ impl Compiler {
                 }
             }
         }
+        self.emit_byte(OpCode::ExecDefer as u8, 0);
         self.emit_byte(OpCode::Halt as u8, 0);
         Ok(std::mem::take(&mut self.unit.chunk))
     }
@@ -437,8 +445,10 @@ mod tests {
         let mut compiler = Compiler::new();
         let program = Program { statements: vec![] };
         let chunk = compiler.compile(&program).unwrap();
-        assert_eq!(chunk.code.len(), 1);
-        assert_eq!(chunk.code[0], OpCode::Halt as u8);
+        // 顶层返回点：EXEC_DEFER（task 36 顶层 defer）+ HALT。
+        assert_eq!(chunk.code.len(), 2);
+        assert_eq!(chunk.code[0], OpCode::ExecDefer as u8);
+        assert_eq!(chunk.code[1], OpCode::Halt as u8);
     }
 
     #[test]

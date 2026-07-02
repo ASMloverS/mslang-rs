@@ -19,6 +19,13 @@ const STACK_MAX: usize = 1024;
 /// 调用栈最大深度（对齐 Python 默认；task 28/31/36/37/70 共用此常量）。
 pub const MAX_CALL_DEPTH: usize = 1000;
 
+/// defer 注册条目（task 36）。`call_tuple` = tuple(callee, arg1, ..., argN)，
+/// 在 defer 注册时已求值完毕（规则 3）。GC 须将其作根扫描（见 gc.rs）。
+#[derive(Clone)]
+pub struct DeferEntry {
+    pub call_tuple: Object,
+}
+
 pub struct VM {
     stack: Vec<Object>,
     call_stack: Vec<CallFrame>,
@@ -29,6 +36,9 @@ pub struct VM {
     /// **不变量**：按 `location` **升序**维护（最小在前）。
     /// `close_upvalues_from` 从末尾向前扫描，依赖此序保证正确性（见 §6/§8）。
     open_upvalues: Vec<*mut MsObjHeader>,
+    /// defer 栈（task 36）。每个 CallFrame 经 `defer_stack_base` 分区隔离；
+    /// EXEC_DEFER 按本帧区间 LIFO 刷新。
+    defer_stack: Vec<DeferEntry>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
@@ -44,6 +54,7 @@ impl VM {
             globals: HashMap::new(),
             native_arities: HashMap::new(),
             open_upvalues: Vec::new(),
+            defer_stack: Vec::new(),
             heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
@@ -65,7 +76,7 @@ impl VM {
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
         };
-        self.call_stack.push(CallFrame::new(closure_ptr, 0));
+        self.call_stack.push(CallFrame::new(closure_ptr, 0, self.defer_stack.len()));
         self.run()
     }
 }
@@ -447,6 +458,121 @@ impl VM {
             self.open_upvalues.remove(i);
         }
     }
+
+    /// CALL 子流程（task 25/27/36）：栈顶为 [callee, arg1, ..., arg(argc)]。
+    /// native（FUNCTION）同步执行并压结果；用户函数（CLOSURE）压入新帧（异步）。
+    /// 抽出以供 EXEC_DEFER 的 defer 调用复用（task 36）。
+    fn call_value(&mut self, argc: usize) -> Result<(), String> {
+        // 边界检查（D1）：防止 argc 过大导致下溢/越界。
+        if argc + 1 > self.stack.len() {
+            return Err("stack underflow for CALL arguments".to_string());
+        }
+        let callee_idx = self.stack.len() - argc - 1;
+        let callee = self.stack[callee_idx].clone();
+        match &callee {
+            Object::Ref(ptr)
+                if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 =>
+            {
+                // 读出函数指针与参数个数信息（借用堆对象，不借用 self）。
+                let (func, arity, name) = {
+                    debug_assert!(!ptr.is_null(), "null Object::Ref");
+                    // SAFETY: type_tag 为 FUNCTION，指针由 alloc_native_function 分配。
+                    let native = unsafe { read_native_function(*ptr) };
+                    let arity = self.native_arities.get(native.name()).copied();
+                    (native.func, arity, native.name().to_owned())
+                };
+                // 参数个数校验（C2）：固定 arity 须严格匹配。
+                if let Some(arity) = arity {
+                    if arity != usize::MAX && arity != argc {
+                        return Err(format!(
+                            "TypeError: {}() takes exactly {} argument{} but {} were given",
+                            name,
+                            arity,
+                            if arity == 1 { "" } else { "s" },
+                            argc
+                        ));
+                    }
+                }
+                let args = self.stack[self.stack.len() - argc..].to_vec();
+                self.stack.truncate(self.stack.len() - argc - 1);
+                let result = func(self, &args)?;
+                self.push(result)?;
+            }
+            // 用户函数（task 27/31）：CLOSURE 分支。支持默认参数与可变参数。
+            Object::Ref(ptr)
+                if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
+            {
+                // 读出 arity / required_arity / has_variadic / func_ptr（不借用 self）。
+                let (arity, required_arity, has_variadic, func_ptr) = {
+                    debug_assert!(!ptr.is_null(), "null Object::Ref");
+                    // SAFETY: type_tag 为 CLOSURE，指针由 alloc_closure 分配。
+                    let closure = unsafe { read_closure(*ptr) };
+                    // SAFETY: closure.function 由 alloc_function 分配。
+                    let func = unsafe { read_function(closure.function) };
+                    let f = &func.function;
+                    (f.arity, f.required_arity, f.has_variadic, closure.function)
+                };
+
+                // 实参数量校验（task 31：放宽为范围检查）。
+                if has_variadic {
+                    if argc < required_arity {
+                        return Err(format!(
+                            "TypeError: expected at least {} arguments, got {}",
+                            required_arity, argc
+                        ));
+                    }
+                } else if argc < required_arity || argc > arity {
+                    return Err(format!(
+                        "TypeError: expected {}-{} arguments, got {}",
+                        required_arity, arity, argc
+                    ));
+                }
+                if self.call_stack.len() >= MAX_CALL_DEPTH {
+                    return Err("RecursionError: stack overflow".to_string());
+                }
+
+                // 步骤 1：填充默认值（argc < arity 时）。
+                // 默认值追加在固定参数之后（位置 argc..arity）。
+                if argc < arity {
+                    let defaults_to_fill = arity - argc;
+                    let offset = argc - required_arity;
+                    // 先克隆所需默认值（裸指针引用堆，借用局限于本块）。
+                    let to_fill: Vec<Object> = unsafe {
+                        let f = &read_function(func_ptr).function;
+                        f.default_values[offset..offset + defaults_to_fill].to_vec()
+                    };
+                    for v in to_fill {
+                        self.push(v)?;
+                    }
+                }
+
+                // 步骤 2：处理可变参数（*rest 收集多余实参为 list）。
+                // 必须在填默认值之后：填完后栈长恰为 callee_idx+1+arity。
+                if has_variadic {
+                    let fixed_end = callee_idx + 1 + arity;
+                    if self.stack.len() > fixed_end {
+                        let varargs: Vec<Object> = self.stack.drain(fixed_end..).collect();
+                        self.push(alloc_list(varargs))?;
+                    } else {
+                        self.push(alloc_list(Vec::new()))?;
+                    }
+                }
+
+                // stack_base = callee_idx：slot 0 = callee（closure 自身），
+                // 参数在 slot 1..（与 compile_fn_decl 的 slot-0 预留约定自洽）。
+                // defer_stack_base = 当前 defer 栈长度，按帧分区隔离嵌套调用的 defer。
+                self.call_stack
+                    .push(CallFrame::new(*ptr, callee_idx, self.defer_stack.len()));
+            }
+            _ => {
+                return Err(format!(
+                    "TypeError: '{}' object is not callable",
+                    callee.type_name()
+                ))
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VM {
@@ -454,7 +580,7 @@ impl VM {
         loop {
             // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
             // 0，此调用为 no-op；接入后在此按阈值触发 minor/major GC（STW）。
-            gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals);
+            gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals, &mut self.defer_stack);
 
             let opcode_byte = self.read_byte()?;
             let opcode = OpCode::from_byte(opcode_byte)
@@ -1114,123 +1240,17 @@ impl VM {
                     self.stack.pop();
                 }
 
-                // CALL（task 25/27）：native 分支（TypeTag::FUNCTION）+ 用户函数分支（TypeTag::CLOSURE）。
+                // CALL（task 25/27）：native（FUNCTION）+ 用户函数（CLOSURE）。
+                // 子流程抽出为 call_value，供 EXEC_DEFER 的 defer 调用复用（task 36）。
                 OpCode::Call => {
                     let argc = self.read_byte()? as usize;
-                    // 边界检查（D1）：防止 argc 过大导致下溢/越界。
-                    if argc + 1 > self.stack.len() {
-                        return Err("stack underflow for CALL arguments".to_string());
-                    }
-                    let callee_idx = self.stack.len() - argc - 1;
-                    let callee = self.stack[callee_idx].clone();
-                    match &callee {
-                        Object::Ref(ptr)
-                            if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 =>
-                        {
-                            // 读出函数指针与参数个数信息（借用堆对象，不借用 self）。
-                            let (func, arity, name) = {
-                                debug_assert!(!ptr.is_null(), "null Object::Ref");
-                                // SAFETY: type_tag 为 FUNCTION，指针由 alloc_native_function 分配。
-                                let native = unsafe { read_native_function(*ptr) };
-                                let arity = self.native_arities.get(native.name()).copied();
-                                (native.func, arity, native.name().to_owned())
-                            };
-                            // 参数个数校验（C2）：固定 arity 须严格匹配。
-                            if let Some(arity) = arity {
-                                if arity != usize::MAX && arity != argc {
-                                    return Err(format!(
-                                        "TypeError: {}() takes exactly {} argument{} but {} were given",
-                                        name,
-                                        arity,
-                                        if arity == 1 { "" } else { "s" },
-                                        argc
-                                    ));
-                                }
-                            }
-                            let args = self.stack[self.stack.len() - argc..].to_vec();
-                            self.stack.truncate(self.stack.len() - argc - 1);
-                            let result = func(self, &args)?;
-                            self.push(result)?;
-                        }
-                        // 用户函数（task 27/31）：CLOSURE 分支。支持默认参数与可变参数。
-                        Object::Ref(ptr)
-                            if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
-                        {
-                            // 读出 arity / required_arity / has_variadic / func_ptr（不借用 self）。
-                            let (arity, required_arity, has_variadic, func_ptr) = {
-                                debug_assert!(!ptr.is_null(), "null Object::Ref");
-                                // SAFETY: type_tag 为 CLOSURE，指针由 alloc_closure 分配。
-                                let closure = unsafe { read_closure(*ptr) };
-                                // SAFETY: closure.function 由 alloc_function 分配。
-                                let func = unsafe { read_function(closure.function) };
-                                let f = &func.function;
-                                (f.arity, f.required_arity, f.has_variadic, closure.function)
-                            };
-
-                            // 实参数量校验（task 31：放宽为范围检查）。
-                            if has_variadic {
-                                if argc < required_arity {
-                                    return Err(format!(
-                                        "TypeError: expected at least {} arguments, got {}",
-                                        required_arity, argc
-                                    ));
-                                }
-                            } else if argc < required_arity || argc > arity {
-                                return Err(format!(
-                                    "TypeError: expected {}-{} arguments, got {}",
-                                    required_arity, arity, argc
-                                ));
-                            }
-                            if self.call_stack.len() >= MAX_CALL_DEPTH {
-                                return Err("RecursionError: stack overflow".to_string());
-                            }
-
-                            // 步骤 1：填充默认值（argc < arity 时）。
-                            // 默认值追加在固定参数之后（位置 argc..arity）。
-                            if argc < arity {
-                                let defaults_to_fill = arity - argc;
-                                let offset = argc - required_arity;
-                                // 先克隆所需默认值（裸指针引用堆，借用局限于本块）。
-                                let to_fill: Vec<Object> = unsafe {
-                                    let f = &read_function(func_ptr).function;
-                                    f.default_values[offset..offset + defaults_to_fill].to_vec()
-                                };
-                                for v in to_fill {
-                                    self.push(v)?;
-                                }
-                            }
-
-                            // 步骤 2：处理可变参数（*rest 收集多余实参为 list）。
-                            // 必须在填默认值之后：填完后栈长恰为 callee_idx+1+arity。
-                            if has_variadic {
-                                let fixed_end = callee_idx + 1 + arity;
-                                if self.stack.len() > fixed_end {
-                                    let varargs: Vec<Object> =
-                                        self.stack.drain(fixed_end..).collect();
-                                    self.push(alloc_list(varargs))?;
-                                } else {
-                                    self.push(alloc_list(Vec::new()))?;
-                                }
-                            }
-
-                            // stack_base = callee_idx：slot 0 = callee（closure 自身），
-                            // 参数在 slot 1..（与 compile_fn_decl 的 slot-0 预留约定自洽）。
-                            self.call_stack.push(CallFrame::new(*ptr, callee_idx));
-                        }
-                        _ => {
-                            return Err(format!(
-                                "TypeError: '{}' object is not callable",
-                                callee.type_name()
-                            ))
-                        }
-                    }
+                    self.call_value(argc)?;
                 }
 
-                // RETURN（task 27/28）：弹出返回值，关闭本帧开放上值，恢复调用者帧，截断值栈。
+                // RETURN（task 27/28/36）：弹出返回值，关闭本帧开放上值，恢复调用者帧，截断值栈。
+                // defer 已由编译端在 RETURN 前 emit 的 EXEC_DEFER 执行完毕，本帧 defer 区间为空。
                 OpCode::Return => {
                     let return_value = self.stack.pop().unwrap_or(Object::Nil);
-                    // TODO(task 36)：弹出本帧前须执行其 defer 条目（EXEC_DEFER，LIFO）。
-                    // Phase 3.1 defer_stack 恒空，此处暂不做。
                     let old_base = self
                         .call_stack
                         .last()
@@ -1245,6 +1265,64 @@ impl VM {
                     // 顶层帧 RETURN 后无更多调用者帧 → 终止执行（等价于隐式 HALT）。
                     if self.call_stack.is_empty() {
                         return Ok(self.stack.pop().unwrap_or(Object::Nil));
+                    }
+                }
+
+                // DEFER（task 36）：弹出栈顶 call_tuple，入当前帧 defer 区间（注册时求值）。
+                OpCode::Defer => {
+                    let call_tuple = self.pop()?;
+                    self.defer_stack.push(DeferEntry { call_tuple });
+                }
+
+                // EXEC_DEFER（task 36）：函数返回路径上唯一的 defer 刷新点（编译端在每个
+                // RETURN/HALT 前 emit）。按 LIFO 逆序执行当前帧 defer 区间内的条目。
+                //
+                // ip-rewind trampoline：闭包 callee 的 CALL 仅压帧、不同步返回，故不能在
+                // 循环内同步取结果。改为：弹出一条 defer → 置本帧 defer_flushing=true → 回退
+                // ip 1 字节（使本指令重派发）→ 经 call_value 发起调用（闭包压帧后返回；native
+                // 同步压结果）→ 控制流回到主循环。callee 执行完毕、帧弹回后 ip 仍指向 EXEC_DEFER
+                // → 重派发 → defer_flushing=true 弹出其返回值 → 处理下一条。defer_flushing 每帧
+                // 独立，避免 defer callee 自身的（空）EXEC_DEFER 误触发弹栈。
+                OpCode::ExecDefer => {
+                    let (base, was_flushing) = {
+                        let frame = self
+                            .call_stack
+                            .last()
+                            .ok_or("no call frame".to_string())?;
+                        (frame.defer_stack_base, frame.defer_flushing)
+                    };
+                    // 上一个 defer 调用刚完成（native 同步或闭包帧弹回），丢弃其返回值。
+                    if was_flushing {
+                        self.pop()?;
+                    }
+                    if self.defer_stack.len() > base {
+                        let entry = self.defer_stack.pop().unwrap();
+                        // 置本帧刷新态 + 回退 ip（本字节码已由 read_byte 推进过）。
+                        {
+                            let frame = self.call_stack.last_mut().unwrap();
+                            frame.defer_flushing = true;
+                            frame.ip = frame
+                                .ip
+                                .checked_sub(1)
+                                .ok_or("ip underflow in EXEC_DEFER")?;
+                        }
+                        // 拆开 call_tuple = (callee, arg1, ..., argN)，按序压栈后走标准 CALL 子流程。
+                        let items = match &entry.call_tuple {
+                            Object::Ref(ptr)
+                                if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 =>
+                            {
+                                unsafe { read_tuple(*ptr) }.clone()
+                            }
+                            _ => return Err("internal: defer call_tuple is not a tuple".into()),
+                        };
+                        let argc = items.len() - 1;
+                        for a in &items {
+                            self.push(a.clone())?;
+                        }
+                        self.call_value(argc)?;
+                    } else {
+                        // 本帧 defer 已全部执行，退出刷新态（不回退 ip → 下一条为 RETURN/HALT）。
+                        self.call_stack.last_mut().unwrap().defer_flushing = false;
                     }
                 }
 
@@ -4496,5 +4574,199 @@ assert(original == [99, 2, 3])
             "(1, 2)"
         );
         assert_eq!(format!("{}", Object::Nil), "nil");
+    }
+
+    // ---- task 36：defer 语句 ----
+    //
+    // 观测手段：`log` 为函数 `run` 的局部，defer callee（均为 CLOSURE）经 `nonlocal log`
+    // 追加（上值写），调用结束后在函数内 assert。同时覆盖 ip-rewind trampoline 的异步
+    // 返回路径；builtin callee（print）由冒烟测试覆盖。
+
+    /// 基本 LIFO 顺序（规则 2）：defer 按「后进先出」执行。
+    #[test]
+    fn test_defer_lifo_order() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn d(v) {
+        nonlocal log
+        log = log + v
+    }
+    fn example() {
+        defer d("first")
+        defer d("second")
+        defer d("third")
+    }
+    example()
+    assert(log == "thirdsecondfirst", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "defer LIFO failed: {:?}", r.err());
+    }
+
+    /// 参数在声明时求值（规则 3）：循环变量 i 每轮拷入 tuple，执行时见注册时的值。
+    /// 若误用「闭包 + upvalue」捕获单一 slot，将输出 "222"。
+    #[test]
+    fn test_defer_params_evaluated_at_registration() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn d(v) {
+        nonlocal log
+        log = log + str(v)
+    }
+    fn with_params() {
+        for i in range(3) {
+            defer d(i)
+        }
+    }
+    with_params()
+    assert(log == "210", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "defer rule-3 failed: {:?}", r.err());
+    }
+
+    /// defer 与 return：defer 先执行，返回值不被修改（规则 5）。
+    #[test]
+    fn test_defer_runs_before_return() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn d() {
+        nonlocal log
+        log = log + "D"
+    }
+    fn with_return() {
+        defer d()
+        return 42
+    }
+    r = with_return()
+    assert(r == 42)
+    assert(log == "D", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "defer before-return failed: {:?}", r.err());
+    }
+
+    /// 嵌套函数的 defer 互不干扰：内层 defer 在内层返回时执行，外层在外层返回时执行。
+    #[test]
+    fn test_defer_per_frame_isolation() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn d(v) {
+        nonlocal log
+        log = log + v
+    }
+    fn outer() {
+        defer d("O")
+        fn inner() {
+            defer d("I")
+        }
+        inner()
+        d("X")
+    }
+    outer()
+    assert(log == "IXO", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "defer per-frame failed: {:?}", r.err());
+    }
+
+    /// 用户函数（CLOSURE）作为 defer callee：callee 自身亦带空 EXEC_DEFER，
+    /// 验证 per-frame defer_flushing 不被 callee 的空 EXEC_DEFER 误触发。
+    /// （全局 flag 的朴素实现会在此错误地弹栈。）
+    #[test]
+    fn test_defer_user_function_callee() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn cleanup() {
+        nonlocal log
+        log = log + "cleaning up"
+    }
+    fn foo() {
+        defer cleanup()
+        return 42
+    }
+    r = foo()
+    assert(r == 42)
+    assert(log == "cleaning up", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "defer user-fn callee failed: {:?}", r.err());
+    }
+
+    /// 模块顶层 defer（§8）：脚本结束时按 LIFO 执行。
+    /// 顶层 defer callee 为 print（builtin），冒烟验证执行；LIFO 顺序由上方函数级
+    /// 测试覆盖（顶层与函数共用同一 EXEC_DEFER 机制）。
+    #[test]
+    fn test_defer_top_level_smoke() {
+        let src = r#"
+defer print("top defer 1")
+defer print("top defer 2")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 冒烟：spec §测试用例原样（print 版），验证不 panic、正常终止。
+    /// 用 --nocapture 可核对完整输出序列：
+    ///   body / third / second / first / 2 / 1 / 0 / deferred / 42 /
+    ///   inner defer / after inner / outer defer / top defer 2 / top defer 1
+    #[test]
+    fn test_defer_spec_smoke() {
+        let src = r#"
+fn example() {
+    defer print("first")
+    defer print("second")
+    defer print("third")
+    print("body")
+}
+example()
+fn with_params() {
+    for i in range(3) {
+        defer print(i)
+    }
+}
+with_params()
+fn with_return() {
+    defer print("deferred")
+    return 42
+}
+result = with_return()
+print(result)
+fn outer() {
+    defer print("outer defer")
+    fn inner() {
+        defer print("inner defer")
+    }
+    inner()
+    print("after inner")
+}
+outer()
+defer print("top defer 1")
+defer print("top defer 2")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// defer 非调用表达式 → 编译报错。
+    #[test]
+    fn test_defer_requires_call_expression() {
+        let src = "defer 42";
+        let program = parse(src);
+        let mut compiler = Compiler::new();
+        assert!(compiler.compile(&program).is_err());
     }
 }
