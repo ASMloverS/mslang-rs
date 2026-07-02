@@ -49,7 +49,7 @@ slice_part = expression?
 | OpCode | 操作数 | 栈布局（底→顶） | 说明 |
 |---|---|---|---|
 | `GET_INDEX` | — | `[obj, key]` → `[result]` | `obj[key]` |
-| `SET_INDEX` | — | `[obj, key, val]` → `[]` | `obj[key] = val` |
+| `SET_INDEX` | — | `[val, obj, key]` → `[]` | `obj[key] = val`（编译端 `compile_assignment` 先压 value+`DUP`，再 `compile_store_target` 压 obj、key；故 key 在栈顶） |
 | `GET_SLICE` | `flags(1)` | `[obj, start?, stop?, step?]` → `[result]` | `obj[start:stop:step]` |
 
 `GET_SLICE` 的 `flags` 位掩码：bit 0 = start 是否存在、bit 1 = stop 是否存在、bit 2 = step 是否存在。`obj` 固定在栈底，按 flags 依次压入存在的 start/stop/step；VM 按缺失参数填默认值。
@@ -148,11 +148,11 @@ fn get_item(obj: Object, key: Object) -> Result<Object, String> {
 #### SET_INDEX（obj[key] = val）
 
 ```
-OpCode::SetIndex => {  // 栈：[obj, key, val]
-    let val = self.pop()?;
+OpCode::SetIndex => {  // 栈（底→顶）：[val, obj, key]——compile_assignment 先压 value 并 DUP，再 compile_store_target 压 obj、key
     let key = self.pop()?;
     let obj = self.pop()?;
-    set_item(obj, key, val)?;   // 不压栈
+    let val = self.pop()?;
+    set_item(obj, key, val)?;   // 不压栈；DUP 保留的 value 副本留作赋值表达式返回值
 }
 
 fn set_item(obj: Object, key: Object, val: Object) -> Result<(), String> {
@@ -239,15 +239,18 @@ fn slice_object(obj: Object, start: Option<i64>, stop: Option<i64>, step: i64) -
 fn slice_bounds(len: usize, start: Option<i64>, stop: Option<i64>, step: i64) -> Result<(i64, i64, i64), String> {
     if step == 0 { return Err("ValueError: slice step cannot be zero".to_string()); }  // 非 panic
     let len = len as i64;
-    let mut start = start.unwrap_or(if step > 0 { 0 } else { len - 1 });
-    let mut stop  = stop.unwrap_or(if step > 0 { len } else { -1 });
-    // 归一化 + 裁剪：负索引加 len；再裁到 [lo, hi]
-    let adj = |idx: i64, lo: i64, hi: i64| -> i64 {
-        let mut i = if idx < 0 { idx + len } else { idx };
-        if i < lo { lo } else if i > hi { hi } else { i }
+    // 仅对用户「显式给出」的索引做「负索引 +len → 裁剪」；缺省值（None）直接取边界、
+    // 不经归一化（否则负步长缺省 stop=-1 会被误当用户负索引 +len → 使 [::-1] 退化为空）。
+    // 等价 CPython PySlice_AdjustIndices。
+    let norm = |idx: i64| -> i64 { if idx < 0 { idx + len } else { idx } };
+    let start = match start {
+        None    => if step > 0 { 0 }      else { len - 1 },
+        Some(i) => { let i = norm(i); if step > 0 { i.clamp(0, len) } else { i.clamp(-1, len - 1) } }
     };
-    if step > 0 { start = adj(start, 0, len); stop = adj(stop, 0, len); }
-    else        { start = adj(start, -1, len - 1); stop = adj(stop, -1, len - 1); }
+    let stop = match stop {
+        None    => if step > 0 { len }    else { -1 },
+        Some(i) => { let i = norm(i); if step > 0 { i.clamp(0, len) } else { i.clamp(-1, len - 1) } }
+    };
     Ok((start, stop, step))
 }
 

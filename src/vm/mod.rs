@@ -7,10 +7,10 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_dict, alloc_function, alloc_iterator, alloc_list, alloc_set, alloc_tuple,
-    alloc_upvalue, read_closure, read_dict, read_function, read_iterator, read_list, read_set,
-    read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function, MsObjHeader, MsUpvalue, Object,
-    TypeTag,
+    alloc_closure, alloc_dict, alloc_function, alloc_iterator, alloc_list, alloc_set, alloc_string,
+    alloc_tuple, alloc_upvalue, read_closure, read_dict, read_function, read_iterator, read_list,
+    read_set, read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function, MsObjHeader, MsUpvalue,
+    Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -121,6 +121,214 @@ fn unhashable_message(payload: Box<dyn std::any::Any + Send>) -> String {
         (*s).to_string()
     } else {
         "TypeError: unhashable type".to_string()
+    }
+}
+
+/// 取 `Object` 的整数值；非 int 抛 TypeError（下标/切片索引专用，消息与 range 不同）。
+fn require_int(obj: &Object) -> Result<i64, String> {
+    match obj {
+        Object::Int(n) => Ok(*n),
+        other => Err(format!(
+            "TypeError: indices must be integers, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+/// list/tuple/string 整数索引归一化：负索引加 len；越界抛 IndexError。
+fn normalize_index(idx: i64, len: usize) -> Result<usize, String> {
+    let len_i = len as i64;
+    let i = if idx < 0 { idx + len_i } else { idx };
+    if i < 0 || i >= len_i {
+        return Err(format!(
+            "IndexError: index {} out of range for length {}",
+            idx, len
+        ));
+    }
+    Ok(i as usize)
+}
+
+/// GET_INDEX 辅助：`obj[key]` 读取。
+/// list/tuple/string 需整数索引（负索引 + 越界 IndexError）；string 按字符返回单字符串；
+/// dict 命中返回值，缺失返回 nil，不可哈希 key 经 catch_unwind 转 TypeError。
+fn get_item(obj: Object, key: Object) -> Result<Object, String> {
+    match &obj {
+        Object::Ref(ptr) => {
+            // SAFETY：type_tag 守卫确认 ptr 指向对应集合类型（由 alloc_* 分配）。
+            let ptr = *ptr;
+            let tag = unsafe { (*ptr).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                let items = unsafe { read_list(ptr) };
+                let i = normalize_index(require_int(&key)?, items.len())?;
+                Ok(items[i].clone())
+            } else if tag == TypeTag::TUPLE as u8 {
+                let items = unsafe { read_tuple(ptr) };
+                let i = normalize_index(require_int(&key)?, items.len())?;
+                Ok(items[i].clone())
+            } else if tag == TypeTag::STRING as u8 {
+                let chars: Vec<char> = unsafe { read_str(ptr) }.chars().collect();
+                let i = normalize_index(require_int(&key)?, chars.len())?;
+                Ok(alloc_string(&chars[i].to_string()))
+            } else if tag == TypeTag::DICT as u8 {
+                // 不可哈希 key 在 HashMap 哈希阶段 panic（查询前），dict 未被破坏。
+                let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    unsafe { read_dict(ptr) }.get(&key).cloned()
+                }));
+                match got {
+                    Ok(v) => Ok(v.unwrap_or(Object::Nil)),
+                    Err(p) => Err(unhashable_message(p)),
+                }
+            } else {
+                Err(format!(
+                    "TypeError: '{}' object is not subscriptable",
+                    obj.type_name()
+                ))
+            }
+        }
+        _ => Err(format!(
+            "TypeError: '{}' object is not subscriptable",
+            obj.type_name()
+        )),
+    }
+}
+
+/// SET_INDEX 辅助：`obj[key] = val`。list 负索引 + 越界 IndexError；dict 设置/覆盖，
+/// 不可哈希 key 经 catch_unwind 转 TypeError；string/tuple 等不可变类型抛 TypeError。
+fn set_item(obj: Object, key: Object, val: Object) -> Result<(), String> {
+    match &obj {
+        Object::Ref(ptr) => {
+            // SAFETY：type_tag 守卫确认 ptr 指向对应集合类型。
+            let ptr = *ptr;
+            let tag = unsafe { (*ptr).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                let items = unsafe { read_list(ptr) };
+                let i = normalize_index(require_int(&key)?, items.len())?;
+                items[i] = val;
+                Ok(())
+            } else if tag == TypeTag::DICT as u8 {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    unsafe { read_dict(ptr) }.insert(key, val)
+                }));
+                match r {
+                    Ok(_) => Ok(()),
+                    Err(p) => Err(unhashable_message(p)),
+                }
+            } else {
+                Err(format!(
+                    "TypeError: '{}' object does not support item assignment",
+                    obj.type_name()
+                ))
+            }
+        }
+        _ => Err(format!(
+            "TypeError: '{}' object does not support item assignment",
+            obj.type_name()
+        )),
+    }
+}
+
+/// 切片边界调整（等价 CPython `PySlice_AdjustIndices`）。全程 i64 计算，杜绝负数
+/// `as usize` 回绕；仅在调用方取元素时 `as usize`（已确保 0 <= i < len）。
+/// step==0 返回 ValueError（非 panic）。
+///
+/// 注意：默认 stop（step<0 时为 -1）是「含下标 0」的哨兵边界，不可当作用户负索引
+/// 做 +len 归一化（否则 [::-1] 会得空切片）。故默认值与用户给定值分别处理：仅对
+/// 用户显式给定的索引做「负索引 +len → 裁剪」，None 直接填入正确边界。
+fn slice_bounds(
+    len: usize,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: i64,
+) -> Result<(i64, i64, i64), String> {
+    if step == 0 {
+        return Err("ValueError: slice step cannot be zero".to_string());
+    }
+    let len = len as i64;
+    // 负索引归一化（用户给定值）：-n 等价于 len-n
+    let norm = |idx: i64| -> i64 {
+        if idx < 0 {
+            idx + len
+        } else {
+            idx
+        }
+    };
+    if step > 0 {
+        let start = match start {
+            Some(i) => norm(i).clamp(0, len),
+            None => 0,
+        };
+        let stop = match stop {
+            Some(i) => norm(i).clamp(0, len),
+            None => len,
+        };
+        Ok((start, stop, step))
+    } else {
+        let start = match start {
+            Some(i) => norm(i).clamp(-1, len - 1),
+            None => len - 1,
+        };
+        let stop = match stop {
+            Some(i) => norm(i).clamp(-1, len - 1),
+            None => -1,
+        };
+        Ok((start, stop, step))
+    }
+}
+
+/// GET_SLICE 辅助：`obj[start:stop:step]` 切片，返回**同类型新对象**（不改原对象）。
+/// list/string/tuple 支持；string 按 char 切片（Unicode 安全）。
+fn slice_object(
+    obj: Object,
+    start: Option<i64>,
+    stop: Option<i64>,
+    step: i64,
+) -> Result<Object, String> {
+    match &obj {
+        Object::Ref(ptr) => {
+            // SAFETY：type_tag 守卫确认 ptr 指向对应集合类型。
+            let ptr = *ptr;
+            let tag = unsafe { (*ptr).type_tag };
+            if tag == TypeTag::LIST as u8 {
+                let items = unsafe { read_list(ptr) };
+                let (s, e, st) = slice_bounds(items.len(), start, stop, step)?;
+                let mut out = Vec::new();
+                let mut i = s;
+                while (st > 0 && i < e) || (st < 0 && i > e) {
+                    out.push(items[i as usize].clone());
+                    i += st;
+                }
+                Ok(alloc_list(out))
+            } else if tag == TypeTag::STRING as u8 {
+                let chars: Vec<char> = unsafe { read_str(ptr) }.chars().collect();
+                let (s, e, st) = slice_bounds(chars.len(), start, stop, step)?;
+                let mut out = String::new();
+                let mut i = s;
+                while (st > 0 && i < e) || (st < 0 && i > e) {
+                    out.push(chars[i as usize]);
+                    i += st;
+                }
+                Ok(alloc_string(&out))
+            } else if tag == TypeTag::TUPLE as u8 {
+                let items = unsafe { read_tuple(ptr) };
+                let (s, e, st) = slice_bounds(items.len(), start, stop, step)?;
+                let mut out = Vec::new();
+                let mut i = s;
+                while (st > 0 && i < e) || (st < 0 && i > e) {
+                    out.push(items[i as usize].clone());
+                    i += st;
+                }
+                Ok(alloc_tuple(out))
+            } else {
+                Err(format!(
+                    "TypeError: '{}' object is not sliceable",
+                    obj.type_name()
+                ))
+            }
+        }
+        _ => Err(format!(
+            "TypeError: '{}' object is not sliceable",
+            obj.type_name()
+        )),
     }
 }
 
@@ -1038,6 +1246,46 @@ impl VM {
                     if self.call_stack.is_empty() {
                         return Ok(self.stack.pop().unwrap_or(Object::Nil));
                     }
+                }
+
+                // GET_INDEX（task 35）：[obj, key] → [result]。obj[key] 读取。
+                OpCode::GetIndex => {
+                    let key = self.pop()?;
+                    let obj = self.pop()?;
+                    self.push(get_item(obj, key)?)?;
+                }
+
+                // SET_INDEX（task 35）：编译端 compile_assignment 先压 value（并 DUP 留结果），
+                // 再由 compile_store_target 压 obj、key，故栈底→顶为 [val, obj, key]。
+                // 按 LIFO 弹 key、obj、val；不压栈（DUP 的结果副本由上层 POP 处理）。
+                OpCode::SetIndex => {
+                    let key = self.pop()?;
+                    let obj = self.pop()?;
+                    let val = self.pop()?;
+                    set_item(obj, key, val)?;
+                }
+
+                // GET_SLICE（task 35）：flags(bit0=start/bit1=stop/bit2=step)。
+                // 编译端压栈顺序 obj→start→stop→step，故按 LIFO 弹 step/stop/start/obj。
+                OpCode::GetSlice => {
+                    let flags = self.read_byte()?;
+                    let step = if flags & 0b100 != 0 {
+                        Some(require_int(&self.pop()?)?)
+                    } else {
+                        None
+                    };
+                    let stop = if flags & 0b010 != 0 {
+                        Some(require_int(&self.pop()?)?)
+                    } else {
+                        None
+                    };
+                    let start = if flags & 0b001 != 0 {
+                        Some(require_int(&self.pop()?)?)
+                    } else {
+                        None
+                    };
+                    let obj = self.pop()?;
+                    self.push(slice_object(obj, start, stop, step.unwrap_or(1))?)?;
                 }
 
                 _ => {
@@ -3843,5 +4091,410 @@ mod tests {
             "#,
         );
         assert!(result.is_ok());
+    }
+
+    // ---- task 35：下标/切片运行时 ----
+
+    /// 由 i64 序列构造 list Object。
+    fn list_obj(items: Vec<i64>) -> Object {
+        alloc_list(items.into_iter().map(Object::Int).collect())
+    }
+
+    /// 合成字节码：obj[key] 读取。
+    fn index_run(obj: Object, key: Object) -> Result<Object, String> {
+        run_chunk(
+            vec![
+                OpCode::Constant as u8,
+                0,
+                0,
+                OpCode::Constant as u8,
+                0,
+                1,
+                OpCode::GetIndex as u8,
+                OpCode::Halt as u8,
+            ],
+            vec![obj, key],
+        )
+    }
+
+    /// 合成字节码：obj[start:stop:step] 切片。flags bit0=start/bit1=stop/bit2=step。
+    /// operands 按编译端压栈顺序（start, stop, step）传入其中存在者。
+    fn slice_run(obj: Object, operands: Vec<Object>, flags: u8) -> Result<Object, String> {
+        let mut code = vec![OpCode::Constant as u8, 0, 0]; // obj @ idx 0
+        let mut constants = vec![obj];
+        for (i, op) in operands.iter().enumerate() {
+            let idx = (i + 1) as u8;
+            code.extend([OpCode::Constant as u8, 0, idx]);
+            constants.push(op.clone());
+        }
+        code.extend([OpCode::GetSlice as u8, flags, OpCode::Halt as u8]);
+        run_chunk(code, constants)
+    }
+
+    #[test]
+    fn test_get_index_list() {
+        let lst = list_obj((0..10).collect());
+        // 正常索引
+        assert_eq!(
+            index_run(lst.clone(), Object::Int(0)).unwrap(),
+            Object::Int(0)
+        );
+        assert_eq!(
+            index_run(lst.clone(), Object::Int(5)).unwrap(),
+            Object::Int(5)
+        );
+        // 负索引
+        assert_eq!(
+            index_run(lst.clone(), Object::Int(-1)).unwrap(),
+            Object::Int(9)
+        );
+        assert_eq!(
+            index_run(lst.clone(), Object::Int(-10)).unwrap(),
+            Object::Int(0)
+        );
+        // 越界 → IndexError
+        let err = index_run(lst.clone(), Object::Int(100)).unwrap_err();
+        assert!(err.contains("IndexError"), "got: {}", err);
+        assert!(err.contains("out of range"), "got: {}", err);
+        let err = index_run(lst.clone(), Object::Int(-11)).unwrap_err();
+        assert!(err.contains("IndexError"), "got: {}", err);
+        // 非整数索引 → TypeError
+        let err = index_run(lst, alloc_string("x")).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("indices must be integers"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_get_index_tuple() {
+        let t = alloc_tuple((0..5).map(Object::Int).collect::<Vec<_>>());
+        assert_eq!(
+            index_run(t.clone(), Object::Int(0)).unwrap(),
+            Object::Int(0)
+        );
+        assert_eq!(
+            index_run(t.clone(), Object::Int(-1)).unwrap(),
+            Object::Int(4)
+        );
+        let err = index_run(t, Object::Int(5)).unwrap_err();
+        assert!(err.contains("IndexError"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_get_index_string_unicode() {
+        // 单字符 string（按 char，非字节）；含多字节字符验证 Unicode 安全
+        let s = alloc_string("hello");
+        assert_eq!(
+            index_run(s.clone(), Object::Int(0)).unwrap(),
+            alloc_string("h")
+        );
+        assert_eq!(
+            index_run(s.clone(), Object::Int(-1)).unwrap(),
+            alloc_string("o")
+        );
+        let err = index_run(s, Object::Int(100)).unwrap_err();
+        assert!(err.contains("IndexError"), "got: {}", err);
+        // 多字节：'世' 占一个 char
+        let uni = alloc_string("a世b");
+        assert_eq!(
+            index_run(uni.clone(), Object::Int(1)).unwrap(),
+            alloc_string("世")
+        );
+        assert_eq!(index_run(uni, Object::Int(-1)).unwrap(), alloc_string("b"));
+    }
+
+    #[test]
+    fn test_get_index_dict() {
+        let mut m = DictMap::new();
+        m.insert(alloc_string("a"), Object::Int(1));
+        m.insert(alloc_string("b"), Object::Int(2));
+        let d = alloc_dict(m);
+        // 命中
+        assert_eq!(
+            index_run(d.clone(), alloc_string("a")).unwrap(),
+            Object::Int(1)
+        );
+        // 缺失 → nil（不抛异常）
+        assert_eq!(
+            index_run(d.clone(), alloc_string("missing")).unwrap(),
+            Object::Nil
+        );
+        // 不可哈希 key（list）→ catch_unwind → TypeError unhashable
+        let err = index_run(d, list_obj(vec![1])).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("unhashable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_get_index_non_subscriptable() {
+        // int 不可下标 → TypeError
+        let err = index_run(Object::Int(5), Object::Int(0)).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("not subscriptable"), "got: {}", err);
+    }
+
+    /// 合成字节码：obj[key]=val 后读回 obj[key] 验证写入（共享同一 Ref）。
+    /// 压栈顺序对齐真实编译端 compile_assignment：先 val、再 obj、再 key
+    /// （栈底→顶 [val, obj, key]），SetIndex 弹 key/obj/val。
+    fn setindex_run(obj: Object, key: Object, val: Object) -> Result<Object, String> {
+        run_chunk(
+            vec![
+                OpCode::Constant as u8,
+                0,
+                0, // val @ idx 0
+                OpCode::Constant as u8,
+                0,
+                1, // obj @ idx 1
+                OpCode::Constant as u8,
+                0,
+                2, // key @ idx 2
+                OpCode::SetIndex as u8,
+                OpCode::Constant as u8,
+                0,
+                1,
+                OpCode::Constant as u8,
+                0,
+                2,
+                OpCode::GetIndex as u8,
+                OpCode::Halt as u8,
+            ],
+            vec![val, obj, key],
+        )
+    }
+
+    #[test]
+    fn test_set_index_list() {
+        let lst = list_obj((1..=3).collect());
+        // 正常写入
+        assert_eq!(
+            setindex_run(lst.clone(), Object::Int(0), Object::Int(99)).unwrap(),
+            Object::Int(99)
+        );
+        // 负索引写入
+        assert_eq!(
+            setindex_run(lst.clone(), Object::Int(-1), Object::Int(77)).unwrap(),
+            Object::Int(77)
+        );
+        // 越界 → IndexError
+        let err = setindex_run(lst, Object::Int(10), Object::Int(0)).unwrap_err();
+        assert!(err.contains("IndexError"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_set_index_dict() {
+        let d = alloc_dict(DictMap::new());
+        assert_eq!(
+            setindex_run(d.clone(), alloc_string("c"), Object::Int(3)).unwrap(),
+            Object::Int(3)
+        );
+        // 覆盖已有键（用非空 dict）
+        let mut m = DictMap::new();
+        m.insert(alloc_string("a"), Object::Int(1));
+        let d2 = alloc_dict(m);
+        assert_eq!(
+            setindex_run(d2, alloc_string("a"), Object::Int(42)).unwrap(),
+            Object::Int(42)
+        );
+        // 不可哈希 key → TypeError
+        let err = setindex_run(d, list_obj(vec![1]), Object::Int(0)).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("unhashable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_set_index_immutable() {
+        // string / tuple 不可变 → TypeError
+        let err = setindex_run(alloc_string("hi"), Object::Int(0), alloc_string("x")).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("item assignment"), "got: {}", err);
+        let err = setindex_run(
+            alloc_tuple(vec![Object::Int(1)]),
+            Object::Int(0),
+            Object::Int(9),
+        )
+        .unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("item assignment"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_get_slice_list() {
+        let lst = list_obj((0..10).collect());
+        // [2:5]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(2), Object::Int(5)], 0b011).unwrap(),
+            list_obj(vec![2, 3, 4])
+        );
+        // [:3]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(3)], 0b010).unwrap(),
+            list_obj(vec![0, 1, 2])
+        );
+        // [7:]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(7)], 0b001).unwrap(),
+            list_obj(vec![7, 8, 9])
+        );
+        // [::2]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(2)], 0b100).unwrap(),
+            list_obj(vec![0, 2, 4, 6, 8])
+        );
+        // [::-1]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(-1)], 0b100).unwrap(),
+            list_obj((0..10).rev().collect())
+        );
+        // [-5:-2]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(-5), Object::Int(-2)], 0b011).unwrap(),
+            list_obj(vec![5, 6, 7])
+        );
+        // [1::2]
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(1), Object::Int(2)], 0b101).unwrap(),
+            list_obj(vec![1, 3, 5, 7, 9])
+        );
+        // [8:2:-1]
+        assert_eq!(
+            slice_run(
+                lst.clone(),
+                vec![Object::Int(8), Object::Int(2), Object::Int(-1)],
+                0b111
+            )
+            .unwrap(),
+            list_obj(vec![8, 7, 6, 5, 4, 3])
+        );
+        // [0:100] 越界裁剪
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(0), Object::Int(100)], 0b011).unwrap(),
+            list_obj((0..10).collect())
+        );
+        // [100:200] → 空
+        assert_eq!(
+            slice_run(lst.clone(), vec![Object::Int(100), Object::Int(200)], 0b011).unwrap(),
+            list_obj(vec![])
+        );
+        // [::] 全默认
+        assert_eq!(
+            slice_run(lst, vec![], 0b000).unwrap(),
+            list_obj((0..10).collect())
+        );
+        // [][::] 空列表
+        assert_eq!(
+            slice_run(list_obj(vec![]), vec![], 0b000).unwrap(),
+            list_obj(vec![])
+        );
+    }
+
+    #[test]
+    fn test_get_slice_string() {
+        let s = alloc_string("hello world");
+        // [0:5] → "hello"
+        assert_eq!(
+            slice_run(s.clone(), vec![Object::Int(0), Object::Int(5)], 0b011).unwrap(),
+            alloc_string("hello")
+        );
+        // [-5:] → "world"
+        assert_eq!(
+            slice_run(s.clone(), vec![Object::Int(-5)], 0b001).unwrap(),
+            alloc_string("world")
+        );
+        // [::-1] → 反转
+        assert_eq!(
+            slice_run(s.clone(), vec![Object::Int(-1)], 0b100).unwrap(),
+            alloc_string("dlrow olleh")
+        );
+        // Unicode 按字符：'a世b'[::-1] → 'b世a'
+        let uni = alloc_string("a世b");
+        assert_eq!(
+            slice_run(uni, vec![Object::Int(-1)], 0b100).unwrap(),
+            alloc_string("b世a")
+        );
+    }
+
+    #[test]
+    fn test_get_slice_tuple() {
+        let t = alloc_tuple((0..5).map(Object::Int).collect::<Vec<_>>());
+        // [1:3] → (1, 2)
+        assert_eq!(
+            slice_run(t, vec![Object::Int(1), Object::Int(3)], 0b011).unwrap(),
+            alloc_tuple(vec![Object::Int(1), Object::Int(2)])
+        );
+    }
+
+    #[test]
+    fn test_get_slice_errors() {
+        let lst = list_obj((0..10).collect());
+        // step==0 → ValueError（非 panic）
+        let err = slice_run(lst.clone(), vec![Object::Int(0)], 0b100).unwrap_err();
+        assert!(err.contains("ValueError"), "got: {}", err);
+        assert!(err.contains("slice step cannot be zero"), "got: {}", err);
+        // 非整数索引 → TypeError
+        let err = slice_run(lst, vec![alloc_string("x")], 0b001).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("indices must be integers"), "got: {}", err);
+        // dict 不可切片 → TypeError
+        let d = alloc_dict(DictMap::new());
+        let err = slice_run(d, vec![], 0b000).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("not sliceable"), "got: {}", err);
+    }
+
+    /// 端到端：spec §测试用例的 22 条 print 全部转为 assert，跑通 parse_slice →
+    /// compile → GET_INDEX/SET_INDEX/GET_SLICE 全链路；末尾两条同时验证「切片返回
+    /// 新对象，不修改原对象」（spec 验证 #8）。
+    #[test]
+    fn test_slicing_end_to_end() {
+        let src = r#"
+lst = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+s = "hello world"
+t = (0, 1, 2, 3, 4)
+d = {"a": 1, "b": 2}
+assert(lst[2:5] == [2, 3, 4])
+assert(lst[:3] == [0, 1, 2])
+assert(lst[7:] == [7, 8, 9])
+assert(lst[::2] == [0, 2, 4, 6, 8])
+assert(lst[::-1] == [9, 8, 7, 6, 5, 4, 3, 2, 1, 0])
+assert(lst[-3:] == [7, 8, 9])
+assert(s[0:5] == "hello")
+assert(s[-5:] == "world")
+assert(t[1:3] == (1, 2))
+assert(lst[0:100] == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+assert(lst[100:200] == [])
+assert(lst[-5:-2] == [5, 6, 7])
+assert(lst[1::2] == [1, 3, 5, 7, 9])
+assert(lst[8:2:-1] == [8, 7, 6, 5, 4, 3])
+assert(lst[0] == 0)
+assert(lst[-1] == 9)
+assert(s[0] == "h")
+assert(t[-1] == 4)
+assert(d["a"] == 1)
+assert(d["missing"] == nil)
+original = [1, 2, 3]
+sliced = original[0:2]
+original[0] = 99
+assert(sliced == [1, 2])
+assert(original == [99, 2, 3])
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 显式钉住 spec 预期输出格式（builtin_print == format!("{}", x)）。
+    /// 验证 #5/#7（类型正确）与 Display 注（字符串无引号、list 空格分隔、tuple 圆括号）。
+    #[test]
+    fn test_slicing_display_matches_spec() {
+        assert_eq!(format!("{}", list_obj(vec![2, 3, 4])), "[2, 3, 4]");
+        assert_eq!(
+            format!("{}", list_obj((0..10).rev().collect())),
+            "[9, 8, 7, 6, 5, 4, 3, 2, 1, 0]"
+        );
+        assert_eq!(format!("{}", list_obj(vec![])), "[]");
+        assert_eq!(format!("{}", alloc_string("hello")), "hello");
+        assert_eq!(format!("{}", alloc_string("h")), "h");
+        assert_eq!(
+            format!("{}", alloc_tuple(vec![Object::Int(1), Object::Int(2)])),
+            "(1, 2)"
+        );
+        assert_eq!(format!("{}", Object::Nil), "nil");
     }
 }

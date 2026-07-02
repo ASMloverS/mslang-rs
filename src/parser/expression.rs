@@ -836,8 +836,39 @@ impl Parser {
         })
     }
 
-    fn parse_slice(&mut self, _object: Expr) -> Result<Expr> {
-        self.unimplemented_expr("parse_slice")
+    /// 切片解析 `obj[start:stop:step]`。调用前 `[` 已被消费；`is_slice()` 已确认
+    /// 含顶层 `:`。各分量用 `parse_expression()`（切片分量是完整表达式）。
+    fn parse_slice(&mut self, object: Expr) -> Result<Expr> {
+        // start（可空）
+        let start = if self.check(&TokenKind::Colon) {
+            None
+        } else {
+            Some(Box::new(self.parse_expression()?))
+        };
+        self.expect(TokenKind::Colon, "expected ':' in slice")?;
+        // stop（可空）
+        let stop = if self.check(&TokenKind::RightBracket) || self.check(&TokenKind::Colon) {
+            None
+        } else {
+            Some(Box::new(self.parse_expression()?))
+        };
+        // step（可空）：仅在出现第二个 ':' 时解析
+        let step = if self.match_token(&[TokenKind::Colon]) {
+            if self.check(&TokenKind::RightBracket) {
+                None
+            } else {
+                Some(Box::new(self.parse_expression()?))
+            }
+        } else {
+            None
+        };
+        self.expect(TokenKind::RightBracket, "expected ']' after slice")?;
+        Ok(Expr::Slice {
+            object: Box::new(object),
+            start,
+            stop,
+            step,
+        })
     }
 }
 
@@ -1176,5 +1207,83 @@ mod tests {
             Expr::Grouping { .. } => {}
             _ => panic!("expected grouping, got set or other"),
         }
+    }
+
+    // ---- task 35：切片解析 parse_slice ----
+
+    /// 断言切片 AST：object 为标识符，start/stop/step 的存在性符合预期。
+    fn assert_slice(src: &str, has_start: bool, has_stop: bool, has_step: bool) {
+        let expr = parse_expr(src).unwrap();
+        match expr {
+            Expr::Slice {
+                object,
+                start,
+                stop,
+                step,
+            } => {
+                assert!(
+                    matches!(*object, Expr::Identifier(_)),
+                    "expected identifier object, got {:?}",
+                    object
+                );
+                assert_eq!(start.is_some(), has_start, "start mismatch for {}", src);
+                assert_eq!(stop.is_some(), has_stop, "stop mismatch for {}", src);
+                assert_eq!(step.is_some(), has_step, "step mismatch for {}", src);
+            }
+            _ => panic!("expected Expr::Slice for {}, got {:?}", src, expr),
+        }
+    }
+
+    #[test]
+    fn test_parse_slice_basic() {
+        // [a:b] → start+stop，无 step
+        assert_slice("lst[a:b]", true, true, false);
+    }
+
+    #[test]
+    fn test_parse_slice_omit_start() {
+        // [:b]
+        assert_slice("lst[:b]", false, true, false);
+    }
+
+    #[test]
+    fn test_parse_slice_omit_stop() {
+        // [a:]
+        assert_slice("lst[a:]", true, false, false);
+    }
+
+    #[test]
+    fn test_parse_slice_all_default() {
+        // [::]
+        assert_slice("lst[::]", false, false, false);
+    }
+
+    #[test]
+    fn test_parse_slice_with_step() {
+        // [a:b:c]
+        assert_slice("lst[a:b:c]", true, true, true);
+    }
+
+    #[test]
+    fn test_parse_slice_step_only() {
+        // [::c]
+        assert_slice("lst[::c]", false, false, true);
+    }
+
+    #[test]
+    fn test_parse_slice_negative_step() {
+        // [::-1] → 仅 step（负整数字面量经 parse_expression 正常解析）
+        assert_slice("lst[::-1]", false, false, true);
+    }
+
+    #[test]
+    fn test_parse_index_not_slice() {
+        // lst[i] 无顶层 ':' → Expr::Index（由 task #12 下标分发构造，非 Slice）
+        let expr = parse_expr("lst[i]").unwrap();
+        assert!(
+            matches!(expr, Expr::Index { .. }),
+            "expected Expr::Index, got {:?}",
+            expr
+        );
     }
 }
