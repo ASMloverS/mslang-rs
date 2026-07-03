@@ -251,6 +251,8 @@ Dog -> Animal -> Object
 | `__enter__(self)` | 进入 `with` 块 |
 | `__exit__(self, err_type, err_msg, tb)` | 离开 `with` 块 |
 
+> **Phase 4.6 临时实现（task 38）**：在 Class/Instance（Phase 5 task 40-43）落地前，task 38 用 dict 模拟上下文管理器（`{"__enter__": fn(self){...}, "__exit__": fn(self, e, m, t){...}}`），并为 GET_ATTR 增加 TypeTag::DICT 临时分支（等价 dict[attr]，键不存在返回 nil）。Phase 5 task 41/43 完成后由 Instance 接管，临时分支删除。
+
 ### 可调用对象
 
 | 方法 | 触发时机 |

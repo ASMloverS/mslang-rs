@@ -172,6 +172,10 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | `RETHROW` | — | 重抛当前帧 current_exc |
 | `FINALLY_END` | — | finally 体结束：current_exc 非空则续抛，否则 fall-through |
 | `CLEAR_CURRENT_EXC` | — | 清除当前帧 current_exc（异常已处理） |
+| `LOAD_CURRENT_EXC` | — | [task 38] 压当前帧 current_exc（无异常时压 nil），供 with cleanup 读取 |
+| `LOAD_EXC_TYPE` | — | [task 38] 压 current_exc 的类名字符串（无异常时压 nil），with `__exit__` err_type 参数 |
+| `LOAD_EXC_MSG` | — | [task 38] 压 current_exc 的 message（无异常时压 nil），with `__exit__` err_msg 参数 |
+| `LOAD_EXC_TB` | — | [task 38] 压 current_exc 的 traceback（无异常时压 nil），with `__exit__` tb 参数 |
 
 ### 其他
 
