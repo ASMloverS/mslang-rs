@@ -53,7 +53,11 @@ impl Compiler {
                 except_clauses,
                 finally_block,
             } => self.compile_try(try_block, except_clauses, finally_block, line),
-            Stmt::With { .. } => Err("with compilation not yet implemented (task 38)".into()),
+            Stmt::With {
+                expression,
+                alias,
+                body,
+            } => self.compile_with(expression, alias, body, line),
             Stmt::Import { .. } | Stmt::FromImport { .. } => {
                 Err("import compilation not yet implemented (task 45)".into())
             }
@@ -488,6 +492,170 @@ impl Compiler {
             }
         }
 
+        Ok(())
+    }
+
+    /// task 38：编译 with 语句（上下文管理器协议）。
+    ///
+    /// 字节码布局（见 docs/mslang/tasks/38-with-statement.md §2）。关键约定：
+    /// - CALL 为 callee-below-args（`expression.rs:379-389`）：__enter__ 用 CALL 1，
+    ///   __exit__ 用 CALL 4（self + err_type/err_msg/tb）。
+    /// - handler 内不 emit TRY_EXIT：drive_unwind 命中 catch_address 时已 pop handler
+    ///   （`src/vm/mod.rs` drive_unwind），再 emit 会空栈 pop。
+    /// - try_depth++ 包裹 body，使内部 return/break/continue 插 TRY_EXIT 避免泄漏。
+    /// - `as name` 在外围函数作用域注册（with 不创建新作用域，`03-syntax.md:595`）。
+    /// - 用临时局部 `_with_ctx_N` 中转管理器，避免依赖不存在的 SWAP/ROT 指令。
+    ///
+    /// ```text
+    /// <expr>                          ; 求值 → [ctx]
+    /// STORE_LOCAL _with_ctx_N         ; → []
+    /// LOAD_LOCAL _with_ctx_N          ; → [ctx]
+    /// GET_ATTR "__enter__"            ; → [enter_fn]
+    /// LOAD_LOCAL _with_ctx_N          ; → [enter_fn, ctx]
+    /// CALL 1                          ; → [enter_result]
+    /// STORE_LOCAL name | POP          ; as 绑定（外围作用域）或弹出 → []
+    /// TRY_ENTER handler_off 0xFFFF    ; 无 finally
+    /// <body ; try_depth++>
+    /// TRY_EXIT                        ; 正常完成，注销 handler
+    /// JUMP cleanup                    ; 跳过 cleanup_exc 的 POP
+    /// cleanup_exc:                    ; 异常入口（drive_unwind 已设 current_exc、栈顶压异常）
+    ///   POP                           ; 弹栈顶异常（current_exc 仍持有）
+    /// cleanup:                        ; 正常/异常汇合
+    ///   LOAD_LOCAL _with_ctx_N        ; → [ctx]
+    ///   GET_ATTR "__exit__"           ; → [exit_fn]
+    ///   LOAD_LOCAL _with_ctx_N        ; → [exit_fn, ctx]
+    ///   LOAD_EXC_TYPE/MSG/TB          ; → [exit_fn, ctx, type|nil, msg|nil, tb|nil]
+    ///   CALL 4                        ; → [exit_result]
+    ///   LOAD_CURRENT_EXC              ; → [exit_result, exc_or_nil]
+    ///   JUMP_IF_FALSE normal_done     ; nil（正常）→ 跳（不弹）
+    ///   POP                           ; 异常路径：弹 exc
+    ///   JUMP_IF_FALSE rethrow         ; exit_result 假 → 重抛（不弹）
+    ///   POP; CLEAR_CURRENT_EXC; JUMP end   ; 抑制
+    /// rethrow:   POP; LOAD_CURRENT_EXC; THROW
+    /// normal_done: POP; POP           ; 弹 nil + exit_result
+    /// end:
+    /// ```
+    fn compile_with(
+        &mut self,
+        expression: &Expr,
+        alias: &Option<String>,
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), String> {
+        // —— 求值 expr，存入临时局部 _with_ctx_N（唯一名，支持嵌套）——
+        self.compile_expression(expression, line)?;
+        let tmp_name = format!("_with_ctx_{}", self.with_temp_counter);
+        self.with_temp_counter += 1;
+        self.declare_local(&tmp_name, line)?;
+        let tmp_slot = u8::try_from(self.resolve_local(&tmp_name).ok_or_else(|| {
+            format!("internal: with temp local '{}' not found after declare", tmp_name)
+        })?)
+        .map_err(|_| "too many locals for with temp".to_string())?;
+        self.emit_byte(OpCode::StoreLocal as u8, line);
+        self.emit_byte(tmp_slot, line);
+
+        // —— __enter__(ctx)：callee-below-args → CALL 1 ——
+        self.emit_byte(OpCode::LoadLocal as u8, line);
+        self.emit_byte(tmp_slot, line);
+        self.emit_byte(OpCode::GetAttr as u8, line);
+        let enter_idx = self.add_constant(alloc_string("__enter__"));
+        let enter_idx = u16::try_from(enter_idx)
+            .map_err(|_| "too many constants for __enter__".to_string())?;
+        self.emit_bytes(&enter_idx.to_be_bytes(), line);
+        self.emit_byte(OpCode::LoadLocal as u8, line); // self 实参
+        self.emit_byte(tmp_slot, line);
+        self.emit_byte(OpCode::Call as u8, line);
+        self.emit_byte(1, line);
+
+        // —— `as name`：外围作用域注册（已存在则复用 slot）；否则 POP ——
+        if let Some(name) = alias {
+            let slot = match self.resolve_local(name) {
+                Some(slot) => slot,
+                None => {
+                    self.declare_local(name, line)?;
+                    self.resolve_local(name).ok_or_else(|| {
+                        format!("internal: with alias '{}' not found after declare", name)
+                    })?
+                }
+            };
+            let slot =
+                u8::try_from(slot).map_err(|_| "too many locals for with alias".to_string())?;
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(slot, line);
+        } else {
+            self.emit_byte(OpCode::Pop as u8, line);
+        }
+
+        // —— TRY_ENTER：handler=cleanup_exc，无 finally（0xFFFF 哨兵）——
+        self.emit_byte(OpCode::TryEnter as u8, line);
+        let handler_patch = self.current_offset();
+        self.emit_bytes(&[0xff, 0xff], line);
+        let finally_patch = self.current_offset();
+        self.emit_bytes(&[0xff, 0xff], line);
+        let body_start = self.current_offset();
+
+        // —— body（try_depth++：early-exit 插 TRY_EXIT，避免 handler 泄漏）——
+        self.try_depth += 1;
+        for stmt in body {
+            self.compile_statement(stmt, line)?;
+        }
+        self.try_depth -= 1;
+
+        // —— 正常完成：TRY_EXIT，跳到 cleanup（跳过 cleanup_exc 的 POP）——
+        self.emit_byte(OpCode::TryExit as u8, line);
+        let normal_jump = self.emit_jump(OpCode::Jump, line);
+
+        // —— cleanup_exc：异常入口（栈顶=异常，current_exc 已设）——
+        let cleanup_exc_addr = self.current_offset();
+        self.emit_byte(OpCode::Pop as u8, line); // 弹栈顶异常（current_exc 仍持有）
+        // cleanup 合并点：normal_jump 跳到此处（跳过上面的 POP）。
+        self.patch_jump(normal_jump)?;
+
+        // —— __exit__(ctx, err_type, err_msg, tb)：callee-below-args → CALL 4 ——
+        self.emit_byte(OpCode::LoadLocal as u8, line);
+        self.emit_byte(tmp_slot, line);
+        self.emit_byte(OpCode::GetAttr as u8, line);
+        let exit_idx = self.add_constant(alloc_string("__exit__"));
+        let exit_idx = u16::try_from(exit_idx)
+            .map_err(|_| "too many constants for __exit__".to_string())?;
+        self.emit_bytes(&exit_idx.to_be_bytes(), line);
+        self.emit_byte(OpCode::LoadLocal as u8, line); // self 实参
+        self.emit_byte(tmp_slot, line);
+        // 三异常参数从 current_exc 派生（无异常时压 nil）。
+        self.emit_byte(OpCode::LoadExcType as u8, line);
+        self.emit_byte(OpCode::LoadExcMsg as u8, line);
+        self.emit_byte(OpCode::LoadExcTb as u8, line);
+        self.emit_byte(OpCode::Call as u8, line);
+        self.emit_byte(4, line);
+
+        // —— 抑制/重抛判定（正常路径 current_exc=nil，整段无副作用地 POP 收尾）——
+        self.emit_byte(OpCode::LoadCurrentExc as u8, line); // → [exit_result, exc_or_nil]
+        let jif_normal = self.emit_jump(OpCode::JumpIfFalse, line);
+        // 异常路径：POP exc，判定 exit_result 真值（JUMP_IF_FALSE 不弹栈）。
+        self.emit_byte(OpCode::Pop as u8, line);
+        let jif_rethrow = self.emit_jump(OpCode::JumpIfFalse, line);
+        // 抑制（truthy）：POP exit_result，清 current_exc。
+        self.emit_byte(OpCode::Pop as u8, line);
+        self.emit_byte(OpCode::ClearCurrentExc as u8, line);
+        let suppress_jump = self.emit_jump(OpCode::Jump, line);
+        // 重抛（falsy）：POP exit_result，LOAD_CURRENT_EXC + THROW。
+        self.patch_jump(jif_rethrow)?;
+        self.emit_byte(OpCode::Pop as u8, line);
+        self.emit_byte(OpCode::LoadCurrentExc as u8, line);
+        self.emit_byte(OpCode::Throw as u8, line);
+        // normal_done：[exit_result, nil]，POP nil + POP exit_result。
+        self.patch_jump(jif_normal)?;
+        self.emit_byte(OpCode::Pop as u8, line);
+        self.emit_byte(OpCode::Pop as u8, line);
+        // end。
+        self.patch_jump(suppress_jump)?;
+
+        // —— 回填 TRY_ENTER：handler_off 相对 body_start；finally=0xFFFF（已占位）——
+        let handler_off = u16::try_from(cleanup_exc_addr.wrapping_sub(body_start))
+            .map_err(|_| "with handler offset exceeds 65535".to_string())?;
+        self.unit.chunk.code[handler_patch..handler_patch + 2]
+            .copy_from_slice(&handler_off.to_be_bytes());
+        let _ = finally_patch; // 0xFFFF 哨兵已就位（无 finally），无需回填
         Ok(())
     }
 

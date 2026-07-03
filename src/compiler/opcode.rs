@@ -9,7 +9,7 @@ use crate::compiler::Chunk;
 
 /// 字节码操作码。
 ///
-/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(85)，
+/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(89)，
 /// 因此可通过 `transmute` 与 `u8` 之间安全转换（见 [`OpCode::from_byte`]）。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +107,11 @@ pub enum OpCode {
     Rethrow,
     FinallyEnd,
     ClearCurrentExc,
+    // 异常读取（task 38 with 语句）：从 per-frame current_exc 派生
+    LoadCurrentExc,
+    LoadExcType,
+    LoadExcMsg,
+    LoadExcTb,
     // 其他
     Assert,
     Import,
@@ -191,8 +196,8 @@ impl TryFrom<u8> for OpCode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         if value <= Self::Halt as u8 {
-            // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
-            // Constant=0 through Halt(85). value <= Halt guarantees validity.
+        // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
+        // Constant=0 through Halt(89). value <= Halt guarantees validity.
             Ok(unsafe { core::mem::transmute::<u8, Self>(value) })
         } else {
             Err(())
@@ -382,6 +387,10 @@ mod tests {
             OpCode::Rethrow,
             OpCode::FinallyEnd,
             OpCode::ClearCurrentExc,
+            OpCode::LoadCurrentExc,
+            OpCode::LoadExcType,
+            OpCode::LoadExcMsg,
+            OpCode::LoadExcTb,
             OpCode::Assert,
             OpCode::Import,
             OpCode::Channel,
@@ -430,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_all_opcodes_byte_roundtrip() {
-        // 0..=Halt(85) 每个字节都应能往返转换
+        // 0..=Halt(89) 每个字节都应能往返转换
         for b in 0u8..=OpCode::Halt as u8 {
             let op =
                 OpCode::from_byte(b).unwrap_or_else(|| panic!("from_byte({}) should succeed", b));

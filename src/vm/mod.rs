@@ -11,7 +11,7 @@ use crate::vm::object::{
     alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, alloc_upvalue,
     read_closure, read_dict, read_exception, read_exception_class, read_exception_mut,
     read_function, read_iterator, read_list, read_set, read_str, read_tuple, read_upvalue,
-    CmpOp, DictMap, Function, MsObjHeader, MsUpvalue, Object, TypeTag,
+    CmpOp, DictMap, Function, MsException, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -725,6 +725,26 @@ impl VM {
         }
     }
 
+    /// task 38：从当前帧 current_exc 派生字段；无异常（或非异常对象）返回 Nil。
+    /// 供 with `__exit__` 的 err_type/err_msg/tb 三参数，避免 GET_ATTR-on-nil 失败。
+    fn current_exc_field<F>(&self, extractor: F) -> Result<Object, String>
+    where
+        F: FnOnce(&MsException) -> Object,
+    {
+        let frame = self
+            .call_stack
+            .last()
+            .ok_or("no call frame".to_string())?;
+        Ok(match &frame.current_exc {
+            Some(Object::Ref(ptr))
+                if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
+            {
+                extractor(unsafe { read_exception(*ptr) })
+            }
+            _ => Object::Nil,
+        })
+    }
+
     /// 格式化未捕获异常为错误字符串（顶层 throw() 返回此 Err）。
     fn format_uncaught_error(&self, err: &Object) -> String {
         match err {
@@ -778,6 +798,18 @@ impl VM {
                 None => return Err(self.format_uncaught_error(&err)),
             };
             let defer_base = self.call_stack.last().unwrap().defer_stack_base;
+
+            // [task 38] 跨帧 cause 链：with 的 __exit__ 在子帧运行，其内部 throw 的新异常
+            // 经 throw() 时取不到本帧的 current_exc（子帧 current_exc 为 None）。当该新异常
+            // 传播回本帧（current_exc 仍持原异常），把原异常挂为新异常的 __cause__（§6/§7）。
+            // 同帧 finally 场景的 cause 已由 throw() 处理（current_exc 已 take），此处不重复触发。
+            let prev_exc = {
+                let frame = self.call_stack.last_mut().unwrap();
+                frame.current_exc.take()
+            };
+            if let Some(old) = prev_exc {
+                self.set_cause(&err, old);
+            }
 
             // (a) 刷新本帧 defer（逐条；closure callee 须泊车交主循环执行）。
             if self.defer_stack.len() > defer_base {
@@ -868,7 +900,7 @@ impl VM {
 
             // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
             // 0，此调用为 no-op；接入后在此按阈值触发 minor/major GC（STW）。
-            gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals, &mut self.defer_stack);
+            gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals, &mut self.defer_stack, &mut self.call_stack);
 
             let opcode_byte = self.read_byte()?;
             let opcode = OpCode::from_byte(opcode_byte)
@@ -1728,13 +1760,57 @@ impl VM {
                         .current_exc = None;
                 }
 
-                // GET_ATTR（task 37）：仅处理 EXCEPTION 对象的属性访问
-                // （message/type/traceback/__cause__）；其余类型留待 task 41/43。
+                // LOAD_CURRENT_EXC（task 38）：压当前帧 current_exc（无异常时压 nil），
+                // 供 with cleanup 块判定正常/异常路径与重抛。
+                OpCode::LoadCurrentExc => {
+                    let exc = self
+                        .call_stack
+                        .last()
+                        .ok_or("no call frame".to_string())?
+                        .current_exc
+                        .clone()
+                        .unwrap_or(Object::Nil);
+                    self.push(exc)?;
+                }
+
+                // LOAD_EXC_TYPE / MSG / TB（task 38）：从 current_exc 派生 with __exit__
+                // 的 err_type / err_msg / tb 参数；无异常时压 nil。专用 opcode 避免
+                // GET_ATTR-on-nil 失败（mslang 无 SWAP/ROT，无法用单条 LOAD_CURRENT_EXC
+                // + 多次 GET_ATTR 拆字段）。
+                OpCode::LoadExcType => {
+                    let val = self.current_exc_field(|e| alloc_string(&e.class_name))?;
+                    self.push(val)?;
+                }
+                OpCode::LoadExcMsg => {
+                    let val = self.current_exc_field(|e| e.message.clone())?;
+                    self.push(val)?;
+                }
+                OpCode::LoadExcTb => {
+                    let val = self.current_exc_field(|e| e.traceback.clone())?;
+                    self.push(val)?;
+                }
+
+                // GET_ATTR（task 37）：处理 EXCEPTION / DICT 对象的属性访问；
+                // Instance 等其余类型留待 task 41/43。
                 OpCode::GetAttr => {
                     let name_idx = self.read_u16()? as usize;
                     let attr = self.read_string_constant(name_idx)?;
                     let obj = self.pop()?;
                     match &obj {
+                        // [task 38 临时] Dict 属性访问：等价于 dict[attr]，键不存在返回 nil。
+                        // Phase 5 task 41/43 由 Instance 接管，本分支删除。
+                        // 注：Object 对 STRING Ref 按内容哈希/相等（object.rs Hash/Eq），
+                        // 故 alloc_string(&attr) 与源码字面量键按内容匹配。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 =>
+                        {
+                            let key = alloc_string(&attr);
+                            let val = unsafe { read_dict(*ptr) }
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or(Object::Nil);
+                            self.push(val)?;
+                        }
                         Object::Ref(ptr)
                             if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
                         {
@@ -1755,7 +1831,7 @@ impl VM {
                         }
                         _ => {
                             return Err(
-                                "GET_ATTR for non-exception types: not yet implemented (task 41/43)"
+                                "GET_ATTR for non-exception/non-dict types: not yet implemented (task 41/43)"
                                     .into(),
                             )
                         }
@@ -5433,5 +5509,478 @@ run()
 "#;
         let r = compile_and_run(src);
         assert!(r.is_ok(), "basic try/except failed: {:?}", r.err());
+    }
+
+    // ---- task 38：with 语句（上下文管理器）----
+    // 注：本阶段用 dict 模拟上下文管理器（GET_ATTR on Dict 临时分支）。
+    //     Phase 5 task 41/43 完成后改用正式 class + Instance。
+    //     mslang 无 ';' 语句分隔符（换行分隔），故 __enter__/__exit__ 用具名闭包
+    //     经标识符存入 dict，避免行内 fn 字面量的多语句问题。
+
+    /// 基本流程：__enter__ → body → __exit__；正常退出时 err 参数为 nil（标准 1/3）。
+    #[test]
+    fn test_with_basic() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        p("enter")
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("exit err=" + str(err))
+        return false
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    with ctx as c {
+        p("body")
+    }
+    assert(log == "enter|body|exit err=nil|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with basic failed: {:?}", r.err());
+    }
+
+    /// `as` 变量绑定 __enter__ 返回值，且 with 块外仍可见（外围函数作用域，标准 2）。
+    #[test]
+    fn test_with_as_binding_visible_after_block() {
+        let src = r#"
+fn run() {
+    fn do_enter(self) {
+        return 42
+    }
+    fn do_exit(self, err, msg, tb) {
+        return false
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    with ctx as c {
+        assert(c == 42, "inside")
+    }
+    assert(c == 42, "outside")
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with as-binding visibility failed: {:?}", r.err());
+    }
+
+    /// with body 抛异常：__exit__ 收到 err_type，异常继续传播被外层捕获（标准 4）。
+    #[test]
+    fn test_with_exception_propagates() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        p("enter")
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("exit: " + str(err))
+        return false
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    try {
+        with ctx as c {
+            p("before")
+            throw ValueError("oops")
+            p("unreachable")
+        }
+    } except ValueError as e {
+        p("caught: " + e.message)
+    }
+    assert(log == "enter|before|exit: ValueError|caught: oops|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with exception propagation failed: {:?}", r.err());
+    }
+
+    /// __exit__ 返回 true 抑制异常（标准 5）。
+    #[test]
+    fn test_with_suppress_when_truthy() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("suppress: " + str(err))
+        return true
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    with ctx as c {
+        throw ValueError("suppressed")
+    }
+    p("after")
+    assert(log == "suppress: ValueError|after|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with suppress failed: {:?}", r.err());
+    }
+
+    /// __exit__ 返回假值（nil）时异常继续传播（标准 6）。
+    #[test]
+    fn test_with_propagate_when_falsy() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("exit")
+        return nil
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    try {
+        with ctx as c {
+            throw ValueError("propagated")
+        }
+    } except ValueError as e {
+        p("caught: " + e.message)
+    }
+    assert(log == "exit|caught: propagated|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with falsy propagation failed: {:?}", r.err());
+    }
+
+    /// 嵌套 with 正常路径，LIFO 顺序（标准 7）。
+    #[test]
+    fn test_with_nested_lifo() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn e1(self) {
+        p("enter1")
+        return self
+    }
+    fn x1(self, err, msg, tb) {
+        p("exit1")
+        return false
+    }
+    fn e2(self) {
+        p("enter2")
+        return self
+    }
+    fn x2(self, err, msg, tb) {
+        p("exit2")
+        return false
+    }
+    ctx1 = {
+        "__enter__": e1,
+        "__exit__": x1
+    }
+    ctx2 = {
+        "__enter__": e2,
+        "__exit__": x2
+    }
+    with ctx1 as a {
+        with ctx2 as b {
+            p("body")
+        }
+    }
+    assert(log == "enter1|enter2|body|exit2|exit1|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with nested LIFO failed: {:?}", r.err());
+    }
+
+    /// 内层抛异常 + 内层 __exit__ 不抑制 → 外层 __exit__ 收到同一异常（标准 8）。
+    #[test]
+    fn test_with_cross_with_propagation() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn e1(self) {
+        p("enter1")
+        return self
+    }
+    fn x1(self, err, msg, tb) {
+        p("exit1: " + str(err))
+        return false
+    }
+    fn e2(self) {
+        p("enter2")
+        return self
+    }
+    fn x2(self, err, msg, tb) {
+        p("exit2: " + str(err))
+        return false
+    }
+    ctx1 = {
+        "__enter__": e1,
+        "__exit__": x1
+    }
+    ctx2 = {
+        "__enter__": e2,
+        "__exit__": x2
+    }
+    try {
+        with ctx1 as a {
+            with ctx2 as b {
+                throw ValueError("cross")
+            }
+        }
+    } except ValueError {
+        p("caught")
+    }
+    assert(log == "enter1|enter2|exit2: ValueError|exit1: ValueError|caught|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with cross-with propagation failed: {:?}", r.err());
+    }
+
+    /// 内层 __exit__ 抑制 → 外层 __exit__ 收到 nil（异常未传播到外层，标准 9）。
+    #[test]
+    fn test_with_inner_suppress_outer_sees_nil() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn e1(self) {
+        return self
+    }
+    fn x1(self, err, msg, tb) {
+        p("exit1: " + str(err))
+        return false
+    }
+    fn e2(self) {
+        return self
+    }
+    fn x2(self, err, msg, tb) {
+        p("exit2: " + str(err))
+        return true
+    }
+    ctx1 = {
+        "__enter__": e1,
+        "__exit__": x1
+    }
+    ctx2 = {
+        "__enter__": e2,
+        "__exit__": x2
+    }
+    with ctx1 as a {
+        with ctx2 as b {
+            throw ValueError("inner")
+        }
+    }
+    p("done")
+    assert(log == "exit2: ValueError|exit1: nil|done|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with inner suppress failed: {:?}", r.err());
+    }
+
+    /// __exit__ 自身抛异常：原异常挂为新异常的 __cause__（标准 10）。
+    #[test]
+    fn test_with_exit_throws_chains_cause() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        throw RuntimeError("from exit")
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    try {
+        with ctx as c {
+            throw ValueError("original")
+        }
+    } except RuntimeError as e {
+        p("caught: " + e.message)
+        p("cause: " + e.__cause__.type)
+    }
+    assert(log == "caught: from exit|cause: ValueError|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with exit-throws cause chain failed: {:?}", r.err());
+    }
+
+    /// with body 内 defer：异常路径下 defer 先于 __exit__（标准 11）。
+    #[test]
+    fn test_with_defer_runs_before_exit() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn cleanup() {
+        p("cleanup")
+    }
+    fn do_enter(self) {
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("exit: " + str(err))
+        return false
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    try {
+        with ctx as c {
+            defer cleanup()
+            throw ValueError("body")
+        }
+    } except ValueError {
+        p("propagated")
+    }
+    assert(log == "cleanup|exit: ValueError|propagated|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with defer interaction failed: {:?}", r.err());
+    }
+
+    /// __enter__ 抛异常：__exit__ 不被调用（TRY_ENTER 在 __enter__ 之后，标准 12）。
+    #[test]
+    fn test_with_enter_throws_exit_not_called() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        p("enter")
+        throw RuntimeError("enter fail")
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("EXIT")
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    try {
+        with ctx as c {
+            p("body")
+        }
+    } except RuntimeError as e {
+        p("caught: " + e.message)
+    }
+    assert(log == "enter|caught: enter fail|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with enter-throws failed: {:?}", r.err());
+    }
+
+    /// with body 内 early-exit（return）：插 TRY_EXIT 注销 handler，不泄漏（标准 13）。
+    /// mslang 的 early-exit 仅 TRY_EXIT（不调 __exit__）。后续 throw 须被外层正常捕获。
+    #[test]
+    fn test_with_early_exit_no_handler_leak() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    fn do_enter(self) {
+        p("enter")
+        return self
+    }
+    fn do_exit(self, err, msg, tb) {
+        p("EXIT")
+        return false
+    }
+    ctx = {
+        "__enter__": do_enter,
+        "__exit__": do_exit
+    }
+    fn earlyreturn() {
+        with ctx as c {
+            p("body")
+            return
+        }
+        p("unreachable")
+    }
+    earlyreturn()
+    try {
+        throw ValueError("after")
+    } except ValueError as e {
+        p("caught: " + e.message)
+    }
+    assert(log == "enter|body|caught: after|", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with early-exit no-leak failed: {:?}", r.err());
     }
 }
