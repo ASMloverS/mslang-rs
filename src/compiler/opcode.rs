@@ -9,7 +9,7 @@ use crate::compiler::Chunk;
 
 /// 字节码操作码。
 ///
-/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(81)，
+/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(85)，
 /// 因此可通过 `transmute` 与 `u8` 之间安全转换（见 [`OpCode::from_byte`]）。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +104,9 @@ pub enum OpCode {
     TryEnter,
     TryExit,
     Catch,
+    Rethrow,
+    FinallyEnd,
+    ClearCurrentExc,
     // 其他
     Assert,
     Import,
@@ -124,6 +127,10 @@ impl OpCode {
     /// - `3`：`INVOKE` 特殊（2 字节 `name_idx` + 1 字节 `argc`）
     pub fn operand_size(&self) -> usize {
         match self {
+            // 4 字节操作数：handler_offset(2) + finally_offset(2)
+            // task 37：TRY_ENTER 扩展双操作数（无 finally 时 finally_offset=0xFFFF）。
+            Self::TryEnter => 4,
+
             // 2 字节操作数：idx / offset / name_idx
             Self::Constant
             | Self::LoadGlobal
@@ -140,7 +147,6 @@ impl OpCode {
             | Self::Class
             | Self::Method
             | Self::GetSuper
-            | Self::TryEnter
             | Self::Catch
             | Self::Import => 2,
 
@@ -186,7 +192,7 @@ impl TryFrom<u8> for OpCode {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         if value <= Self::Halt as u8 {
             // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
-            // Constant=0 through Halt=79. value <= Halt guarantees validity.
+            // Constant=0 through Halt(85). value <= Halt guarantees validity.
             Ok(unsafe { core::mem::transmute::<u8, Self>(value) })
         } else {
             Err(())
@@ -259,6 +265,20 @@ fn format_instruction(chunk: &Chunk, offset: usize) -> (String, usize) {
                     offset + 4,
                 )
             }
+        }
+        4 => {
+            // TRY_ENTER: handler_offset(2) + finally_offset(2)
+            let handler_offset =
+                u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
+            let finally_offset =
+                u16::from_be_bytes([chunk.code[offset + 3], chunk.code[offset + 4]]);
+            (
+                format!(
+                    "{:04} {:?} handler={} finally={}",
+                    offset, opcode, handler_offset, finally_offset
+                ),
+                offset + 5,
+            )
         }
         _ => (format!("{:04} {:?}", offset, opcode), offset + 1),
     }
@@ -359,6 +379,9 @@ mod tests {
             OpCode::TryEnter,
             OpCode::TryExit,
             OpCode::Catch,
+            OpCode::Rethrow,
+            OpCode::FinallyEnd,
+            OpCode::ClearCurrentExc,
             OpCode::Assert,
             OpCode::Import,
             OpCode::Channel,
@@ -388,6 +411,8 @@ mod tests {
         assert_eq!(OpCode::ListAppend.operand_size(), 1);
         assert_eq!(OpCode::SetAdd.operand_size(), 1);
         assert_eq!(OpCode::DictInsert.operand_size(), 1);
+        assert_eq!(OpCode::TryEnter.operand_size(), 4);
+        assert_eq!(OpCode::Catch.operand_size(), 2);
         assert_eq!(OpCode::Halt.operand_size(), 0);
     }
 
@@ -405,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_all_opcodes_byte_roundtrip() {
-        // 0..=Halt(79) 每个字节都应能往返转换
+        // 0..=Halt(85) 每个字节都应能往返转换
         for b in 0u8..=OpCode::Halt as u8 {
             let op =
                 OpCode::from_byte(b).unwrap_or_else(|| panic!("from_byte({}) should succeed", b));

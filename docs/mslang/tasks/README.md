@@ -63,7 +63,7 @@
 | 34 | [Dict/Set 推导式](34-dict-set-comprehension.md) | ✅ |
 | 35 | [切片操作](35-slicing.md) | ✅ |
 | 36 | [defer 语句](36-defer.md) | ✅ |
-| 37 | [try/except/finally 异常处理](37-try-except-finally.md) | ⬜ |
+| 37 | [try/except/finally 异常处理](37-try-except-finally.md) | ✅ |
 | 38 | [with 语句（上下文管理器）](38-with-statement.md) | ⬜ |
 | 39 | [生成器与 yield](39-generator-yield.md) | ⬜ |
 

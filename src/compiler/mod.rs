@@ -89,6 +89,9 @@ pub struct Compiler {
     exports: Vec<String>,
     /// 循环上下文栈，支持 break/continue 与嵌套循环（最内层在栈顶）。
     current_loop: Vec<LoopContext>,
+    /// task 37：当前正编译其 try body 的嵌套 try 数量。return/break/continue 在
+    /// try body 内的 early-exit 出口须先 emit 等量 TRY_EXIT（注销已注册的 handler）。
+    try_depth: usize,
     /// 标记为 nonlocal 的变量名（当前函数作用域内有效）。
     nonlocal_names: std::collections::HashSet<String>,
     /// 标记为 global 的变量名（当前函数作用域内有效）。
@@ -123,6 +126,7 @@ impl Compiler {
             source_lines: Vec::new(),
             exports: Vec::new(),
             current_loop: Vec::new(),
+            try_depth: 0,
             nonlocal_names: std::collections::HashSet::new(),
             global_names: std::collections::HashSet::new(),
         }

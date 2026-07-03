@@ -166,9 +166,12 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | OpCode | 操作数 | 说明 |
 |---|---|---|
 | `THROW` | — | 抛出异常 |
-| `TRY_ENTER` | `handler_offset(2)` | 进入 try 块 |
+| `TRY_ENTER` | `handler_offset(2)` `finally_offset(2)` | 进入 try 块（4 字节操作数：handler 与 finally 相对偏移；finally_offset=0xFFFF 表示无 finally） |
 | `TRY_EXIT` | — | 离开 try 块 |
-| `CATCH` | `type_idx(2)` | 捕获异常 |
+| `CATCH` | `name_idx(2)` | peek 栈顶异常、压 bool（类型匹配则 true） |
+| `RETHROW` | — | 重抛当前帧 current_exc |
+| `FINALLY_END` | — | finally 体结束：current_exc 非空则续抛，否则 fall-through |
+| `CLEAR_CURRENT_EXC` | — | 清除当前帧 current_exc（异常已处理） |
 
 ### 其他
 

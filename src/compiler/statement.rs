@@ -5,7 +5,7 @@
 //!
 //! 参照 [19-compile-statements](../../../docs/mslang/tasks/19-compile-statements.md)。
 
-use crate::ast::node::{AssignOp, BinaryOp, Expr, Stmt, UnaryOp};
+use crate::ast::node::{AssignOp, BinaryOp, ExceptClause, Expr, Stmt, UnaryOp};
 use crate::vm::object::{alloc_function, alloc_string, Function};
 
 use super::{CompilationUnit, Compiler, Local, OpCode};
@@ -48,14 +48,16 @@ impl Compiler {
             } => self.compile_fn_decl(name, params, body, line),
             Stmt::ClassDecl { .. } => Err("class compilation not yet implemented (task 40)".into()),
             Stmt::Defer { expr } => self.compile_defer(expr, line),
-            Stmt::Try { .. } => {
-                Err("try/except/finally compilation not yet implemented (task 37)".into())
-            }
+            Stmt::Try {
+                try_block,
+                except_clauses,
+                finally_block,
+            } => self.compile_try(try_block, except_clauses, finally_block, line),
             Stmt::With { .. } => Err("with compilation not yet implemented (task 38)".into()),
             Stmt::Import { .. } | Stmt::FromImport { .. } => {
                 Err("import compilation not yet implemented (task 45)".into())
             }
-            Stmt::Throw { .. } => Err("throw compilation not yet implemented (task 37)".into()),
+            Stmt::Throw { expr } => self.compile_throw(expr, line),
         }
     }
 }
@@ -316,6 +318,8 @@ impl Compiler {
                 self.emit_byte(count, line);
             }
         }
+        // task 37：try body 内 return 须先注销所有外层 try 的 handler。
+        self.emit_early_exit_try_exits(line);
         self.emit_return(line);
         Ok(())
     }
@@ -338,6 +342,172 @@ impl Compiler {
         self.emit_byte(OpCode::BuildTuple as u8, line);
         self.emit_byte(count, line);
         self.emit_byte(OpCode::Defer as u8, line);
+        Ok(())
+    }
+
+    /// task 37：为当前点所有外层 try body 注销 handler（return/break/continue 出口）。
+    /// emit 等量 TRY_EXIT。try_body 编译期间 try_depth > 0；except/finally 编译时
+    /// try_depth 已恢复（其内 return/break/continue 不为本 try emit TRY_EXIT）。
+    fn emit_early_exit_try_exits(&mut self, line: usize) {
+        for _ in 0..self.try_depth {
+            self.emit_byte(OpCode::TryExit as u8, line);
+        }
+    }
+
+    /// task 37：编译 throw 语句。裸 throw → RETHROW；throw <expr> → 求值后 THROW。
+    fn compile_throw(&mut self, expr: &Option<Expr>, line: usize) -> Result<(), String> {
+        match expr {
+            None => self.emit_byte(OpCode::Rethrow as u8, line),
+            Some(e) => {
+                self.compile_expression(e, line)?;
+                self.emit_byte(OpCode::Throw as u8, line);
+            }
+        }
+        Ok(())
+    }
+
+    /// task 37：编译 try/except/finally。字节码布局：
+    ///
+    /// ```text
+    /// TRY_ENTER handler_off finally_off      ; 注册 handler（4 字节操作数）
+    /// <try body>                             ; try_depth++ 期间编译（early-exit 插 TRY_EXIT）
+    /// TRY_EXIT                               ; 正常完成，注销 handler
+    /// JUMP finally_start / end
+    /// dispatcher:                            ; catch_address：throw 跳到这里，栈顶 = 异常
+    ///   <每个 typed except: CATCH/JUMP_IF_FALSE/POP；命中则 STORE/POP + body + CLEAR + JUMP>
+    ///   <bare except: POP/STORE + body + CLEAR + JUMP>
+    ///   no_match: POP, [JUMP finally_start | RETHROW]
+    /// finally_start:                         ; （仅当有 finally）
+    ///   <finally body>
+    ///   FINALLY_END                          ; current_exc 非空则重抛
+    /// end:
+    /// ```
+    fn compile_try(
+        &mut self,
+        try_block: &[Stmt],
+        except_clauses: &[ExceptClause],
+        finally_block: &Option<Vec<Stmt>>,
+        line: usize,
+    ) -> Result<(), String> {
+        // TRY_ENTER：emit opcode + 4 字节占位（handler_off(2) + finally_off(2)）。
+        self.emit_byte(OpCode::TryEnter as u8, line);
+        let handler_patch = self.current_offset(); // handler_off 起始
+        self.emit_bytes(&[0xff, 0xff], line);
+        let finally_patch = self.current_offset(); // finally_off 起始
+        self.emit_bytes(&[0xff, 0xff], line);
+        let body_start = self.current_offset(); // TRY_ENTER 执行后 frame.ip 指向此处
+
+        // try body（try_depth++ 使内部 return/break/continue 注销 handler）。
+        self.try_depth += 1;
+        for stmt in try_block {
+            self.compile_statement(stmt, line)?;
+        }
+        self.try_depth -= 1;
+
+        // 正常完成：TRY_EXIT 注销 handler，跳过 dispatcher。
+        self.emit_byte(OpCode::TryExit as u8, line);
+        let normal_exit_jump = self.emit_jump(OpCode::Jump, line);
+
+        // dispatcher：异常入口（throw 压异常到栈顶、设 current_exc、ip 跳此）。
+        let dispatcher = self.current_offset();
+
+        // 所有「跳到 finally/语句末尾」的跳转占位（正常完成 + 各命中分支 + no_match）。
+        let mut to_target_jumps: Vec<usize> = Vec::new();
+
+        for clause in except_clauses {
+            // bare except（无类型）按 `except Error` 处理：所有内置异常皆派生自 Error，
+            // 而 GeneratorExit 被 exception_matches 特判排除（05-control-flow.md:238），
+            // 故 bare except 不会捕获 GeneratorExit。
+            let type_str = match &clause.type_name {
+                Some(path) => path.join("."),
+                None => "Error".to_string(),
+            };
+            let name_idx = self.add_constant(alloc_string(&type_str));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "too many constants for CATCH name".to_string())?;
+            // CATCH（peek 异常、压 bool）→ JUMP_IF_FALSE no_match_landing。
+            self.emit_byte(OpCode::Catch as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+            let jif = self.emit_jump(OpCode::JumpIfFalse, line);
+            // 命中路径：POP bool。
+            self.emit_byte(OpCode::Pop as u8, line);
+            self.bind_or_pop_exc(clause, line)?;
+            // 注意：CLEAR_CURRENT_EXC 置于 handler 体末尾（非开头）。handler 体内
+            // 可能有裸 `throw`（RETHROW），需要 current_exc 仍持有当前异常。
+            for stmt in &clause.body {
+                self.compile_statement(stmt, line)?;
+            }
+            self.emit_byte(OpCode::ClearCurrentExc as u8, line);
+            to_target_jumps.push(self.emit_jump(OpCode::Jump, line));
+            // no_match 落点：JUMP_IF_FALSE 跳此（栈顶仍剩 bool）→ POP bool，落入下一 clause。
+            self.patch_jump(jif)?;
+            self.emit_byte(OpCode::Pop as u8, line);
+        }
+
+        // no_match：所有 except 均不匹配。栈顶为异常本体（current_exc 仍持有）。
+        self.emit_byte(OpCode::Pop as u8, line); // 弹异常本体（current_exc 保留供重抛）
+        if finally_block.is_some() {
+            to_target_jumps.push(self.emit_jump(OpCode::Jump, line)); // → finally_start
+        } else {
+            self.emit_byte(OpCode::Rethrow as u8, line); // 无 finally → 重抛 current_exc
+        }
+
+        // finally_start：finally 体起始（无 finally 时与 end 重合）。
+        let finally_start = self.current_offset();
+
+        // 回填跳转：正常完成 + 各命中分支 + no_match(若有 finally) → finally_start。
+        // 此时 code 末尾恰为 finally_start，故 patch_jump 目标正确；finally 体在其后发射。
+        for jump in &to_target_jumps {
+            self.patch_jump(*jump)?;
+        }
+        self.patch_jump(normal_exit_jump)?;
+
+        // finally 体（若有）：执行后 FINALLY_END 决定续抛或 fall-through 到 end。
+        if let Some(fb) = finally_block {
+            for stmt in fb {
+                self.compile_statement(stmt, line)?;
+            }
+            self.emit_byte(OpCode::FinallyEnd as u8, line);
+        }
+
+        // 回填 TRY_ENTER 操作数：handler_off / finally_off 相对 body_start。
+        let handler_off = u16::try_from(dispatcher.wrapping_sub(body_start))
+            .map_err(|_| "try handler offset exceeds 65535".to_string())?;
+        self.unit.chunk.code[handler_patch..handler_patch + 2]
+            .copy_from_slice(&handler_off.to_be_bytes());
+        match finally_block {
+            Some(_) => {
+                let fin_off = u16::try_from(finally_start.wrapping_sub(body_start))
+                    .map_err(|_| "try finally offset exceeds 65535".to_string())?;
+                self.unit.chunk.code[finally_patch..finally_patch + 2]
+                    .copy_from_slice(&fin_off.to_be_bytes());
+            }
+            None => {
+                // 0xFFFF 哨兵 = 无 finally。
+                self.unit.chunk.code[finally_patch..finally_patch + 2].copy_from_slice(&[0xff, 0xff]);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// task 37：绑定或弹出栈顶异常（except 命中分支）。有 alias 则 STORE_LOCAL，否则 POP。
+    fn bind_or_pop_exc(&mut self, clause: &ExceptClause, line: usize) -> Result<(), String> {
+        if let Some(alias) = &clause.alias {
+            let slot = match self.resolve_local(alias) {
+                Some(s) => s,
+                None => {
+                    self.declare_local(alias, line)?;
+                    self.resolve_local(alias).ok_or_else(|| {
+                        format!("internal: local '{}' not found after declare", alias)
+                    })?
+                }
+            };
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(slot as u8, line);
+        } else {
+            self.emit_byte(OpCode::Pop as u8, line);
+        }
         Ok(())
     }
 
@@ -575,6 +745,8 @@ impl Compiler {
 
     /// 编译 break：前向跳转到循环出口（由循环编译末尾统一 patch）。
     fn compile_break(&mut self, line: usize) -> Result<(), String> {
+        // task 37：try body 内 break 须先注销所有外层 try 的 handler。
+        self.emit_early_exit_try_exits(line);
         let jump = self.emit_jump(OpCode::Break, line);
         let ctx = self
             .current_loop
@@ -586,6 +758,8 @@ impl Compiler {
 
     /// 编译 continue：后向跳转到循环头（立即 patch）。
     fn compile_continue(&mut self, line: usize) -> Result<(), String> {
+        // task 37：try body 内 continue 须先注销所有外层 try 的 handler。
+        self.emit_early_exit_try_exits(line);
         let loop_start = self
             .current_loop
             .last()
@@ -783,16 +957,15 @@ mod tests {
 
     #[test]
     fn test_deferred_statement_types_return_error() {
-        // fn/defer 声明已实现，不再报错；其余语句类型仍为 stub。
-        for source in ["throw e", "import os"] {
-            let program = parse(source);
-            let mut compiler = Compiler::new();
-            assert!(
-                compiler.compile(&program).is_err(),
-                "expected error for deferred statement: {:?}",
-                source
-            );
-        }
+        // fn/defer/throw 声明已实现，不再报错；其余语句类型仍为 stub。
+        let source = "import os";
+        let program = parse(source);
+        let mut compiler = Compiler::new();
+        assert!(
+            compiler.compile(&program).is_err(),
+            "expected error for deferred statement: {:?}",
+            source
+        );
     }
 
     // ---- task 31：默认参数 / 可变参数编译期校验 ----

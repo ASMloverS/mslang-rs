@@ -1,4 +1,4 @@
-use crate::vm::object::MsObjHeader;
+use crate::vm::object::{MsObjHeader, Object};
 
 /// 调用帧。每个帧对应一次函数调用（或顶层脚本）。
 /// closure 指向 MsClosure，经由 closure.function 取 MsFunction 的字节码与常量池。
@@ -12,6 +12,10 @@ pub struct CallFrame {
     /// 下次进入 EXEC_DEFER 时须先弹出刚完成的 defer 调用返回值。每帧独立，
     /// 避免 defer callee 自身的（空）EXEC_DEFER 误触发弹栈。
     pub defer_flushing: bool,
+    /// task 37：当前帧正在处理的异常（裸 throw 重抛 + finally-on-propagation 共用）。
+    /// throw() 跳入 except 分派器前设为 Some(err)；except 命中分支经
+    /// CLEAR_CURRENT_EXC 置 None（异常已处理），FINALLY_END 据此决定是否重抛。
+    pub current_exc: Option<Object>,
 }
 
 impl CallFrame {
@@ -26,6 +30,7 @@ impl CallFrame {
             stack_base,
             defer_stack_base,
             defer_flushing: false,
+            current_exc: None,
         }
     }
 

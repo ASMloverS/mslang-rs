@@ -38,6 +38,12 @@ pub enum TypeTag {
     JOIN_HANDLE = 16,
     /// 上值堆对象（task 28 新增）。
     UPVALUE = 17,
+    /// 异常实例（task 37 新增）。MsException：class_name + message + traceback + cause。
+    /// Phase 5 升级为正式 Instance（TypeTag::INSTANCE）后废弃。
+    EXCEPTION = 18,
+    /// 内置异常类对象（task 37 新增）。MsExceptionClass：仅 name。注册为全局变量，
+    /// CALL 时构造 EXCEPTION。Phase 5 升级为正式 Class 后废弃。
+    EXCEPTION_CLASS = 19,
     LARGE_OBJECT = 0xFF,
 }
 
@@ -657,6 +663,107 @@ pub unsafe fn read_upvalue<'a>(ptr: *mut MsObjHeader) -> &'a mut MsUpvalue {
 }
 
 // ---------------------------------------------------------------------------
+// 异常对象（task 37）
+// ---------------------------------------------------------------------------
+
+/// 内置异常类对象（TypeTag::EXCEPTION_CLASS）。仅承载类名，作为全局变量；
+/// 被 CALL 时构造 MsException（见 CALL handler 的 EXCEPTION_CLASS 分支）。
+/// Phase 5 升级为正式 Class。
+///
+/// 参照 [37-try-except-finally](../../docs/mslang/tasks/37-try-except-finally.md) §1。
+#[repr(C)]
+pub struct MsExceptionClass {
+    pub header: MsObjHeader,
+    pub name: String, // "ValueError" / "TypeError" / ... / "Error"
+}
+
+/// 异常实例（TypeTag::EXCEPTION）。自包含 4 字段，对应 05-control-flow.md:216-221 的属性。
+/// 不依赖 Phase 5 的 Instance/Class：父类关系由 VM 侧的静态 MRO 表查表。
+#[repr(C)]
+pub struct MsException {
+    pub header: MsObjHeader,
+    pub class_name: String, // → e.type
+    pub message: Object,    // → e.message（string）
+    pub traceback: Object,  // → e.traceback（string，捕获点见 task 37 §9）
+    pub cause: Object,      // → e.__cause__（Exception 或 Nil）
+}
+
+impl MsExceptionClass {
+    pub fn new(name: String) -> Self {
+        Self {
+            header: MsObjHeader {
+                gc_meta: 0,
+                type_tag: TypeTag::EXCEPTION_CLASS as u8,
+                size: std::mem::size_of::<MsExceptionClass>() as u16,
+                _padding: 0,
+                class_ptr: 0,
+            },
+            name,
+        }
+    }
+}
+
+impl MsException {
+    pub fn new(class_name: String, message: Object, traceback: Object, cause: Object) -> Self {
+        Self {
+            header: MsObjHeader {
+                gc_meta: 0,
+                type_tag: TypeTag::EXCEPTION as u8,
+                size: std::mem::size_of::<MsException>() as u16,
+                _padding: 0,
+                class_ptr: 0,
+            },
+            class_name,
+            message,
+            traceback,
+            cause,
+        }
+    }
+}
+
+/// 分配 MsExceptionClass 堆对象（TypeTag::EXCEPTION_CLASS），返回 Object::Ref。
+/// MVP：Box 分配；task 52-gc 替换为 TLAB bump 分配。
+pub fn alloc_exception_class(name: &str) -> Object {
+    let obj = Box::new(MsExceptionClass::new(name.to_string()));
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 分配 MsException 堆对象（TypeTag::EXCEPTION），返回 Object::Ref。
+pub fn alloc_exception(class_name: &str, message: Object, traceback: Object, cause: Object) -> Object {
+    let obj = Box::new(MsException::new(
+        class_name.to_string(),
+        message,
+        traceback,
+        cause,
+    ));
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsException（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_exception` 分配的、在 `'a` 期间有效的 `MsException`。
+pub unsafe fn read_exception<'a>(ptr: *mut MsObjHeader) -> &'a MsException {
+    &*(ptr as *const MsException)
+}
+
+/// 读取 MsException（可变，用于设置 __cause__）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_exception` 分配的、在 `'a` 期间有效的 `MsException`。
+pub unsafe fn read_exception_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsException {
+    &mut *(ptr as *mut MsException)
+}
+
+/// 读取 MsExceptionClass。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_exception_class` 分配的、在 `'a` 期间有效的 `MsExceptionClass`。
+pub unsafe fn read_exception_class<'a>(ptr: *mut MsObjHeader) -> &'a MsExceptionClass {
+    &*(ptr as *const MsExceptionClass)
+}
+
+// ---------------------------------------------------------------------------
 // Object 行为
 // ---------------------------------------------------------------------------
 
@@ -721,6 +828,10 @@ impl Object {
                     "class"
                 } else if tag == TypeTag::INSTANCE as u8 {
                     "instance"
+                } else if tag == TypeTag::EXCEPTION as u8 {
+                    "Error"
+                } else if tag == TypeTag::EXCEPTION_CLASS as u8 {
+                    "class"
                 } else {
                     "object"
                 }

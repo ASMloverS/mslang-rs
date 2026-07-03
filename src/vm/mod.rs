@@ -7,10 +7,11 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_dict, alloc_function, alloc_iterator, alloc_list, alloc_set, alloc_string,
-    alloc_tuple, alloc_upvalue, read_closure, read_dict, read_function, read_iterator, read_list,
-    read_set, read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function, MsObjHeader, MsUpvalue,
-    Object, TypeTag,
+    alloc_closure, alloc_dict, alloc_exception, alloc_exception_class, alloc_function,
+    alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, alloc_upvalue,
+    read_closure, read_dict, read_exception, read_exception_class, read_exception_mut,
+    read_function, read_iterator, read_list, read_set, read_str, read_tuple, read_upvalue,
+    CmpOp, DictMap, Function, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -26,6 +27,55 @@ pub struct DeferEntry {
     pub call_tuple: Object,
 }
 
+/// 异常处理器条目（task 37）。与 defer_stack 一样按帧分区，但用 frame_stack_base
+/// （值栈基址）判定所属帧。throw() 自顶向下扫描，匹配当前帧者跳到 catch_address。
+struct ExceptionHandler {
+    /// except 分派器入口（throw 跳转点）。
+    catch_address: usize,
+    /// finally 块入口地址（None 表示无 finally 块）。当前由编译端 dispatcher 经 JUMP
+    /// 路由到 finally，VM 不直接读取；保留以契合 spec（TRY_ENTER 双操作数）。
+    #[allow(dead_code)]
+    finally_address: Option<usize>,
+    /// 所属帧的值栈基址（跨帧判定）。
+    frame_stack_base: usize,
+    /// 进入 try 时值栈长度（unwind 时恢复栈平衡）。
+    scope_stack_base: usize,
+}
+
+/// 内置异常层级（父类链）。父类一律为 Error。Phase 5 升级为正式 Class 后此表废弃。
+/// 参照 [37-try-except-finally](../docs/mslang/tasks/37-try-except-finally.md) §5。
+const EXCEPTION_PARENTS: &[(&str, &str)] = &[
+    ("ValueError", "Error"),
+    ("TypeError", "Error"),
+    ("IndexError", "Error"),
+    ("KeyError", "Error"),
+    ("AttributeError", "Error"),
+    ("NameError", "Error"),
+    ("RuntimeError", "Error"),
+    ("IOError", "Error"),
+    ("ZeroDivisionError", "Error"),
+    ("OverflowError", "Error"),
+    ("StopIteration", "Error"),
+    ("GeneratorExit", "Error"),
+];
+
+/// 12 个内置异常类名（Error + 11 子类）。VM::new 时注册为 EXCEPTION_CLASS 全局变量。
+const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
+    "Error",
+    "ValueError",
+    "TypeError",
+    "IndexError",
+    "KeyError",
+    "AttributeError",
+    "NameError",
+    "RuntimeError",
+    "IOError",
+    "ZeroDivisionError",
+    "OverflowError",
+    "StopIteration",
+    "GeneratorExit",
+];
+
 pub struct VM {
     stack: Vec<Object>,
     call_stack: Vec<CallFrame>,
@@ -39,6 +89,13 @@ pub struct VM {
     /// defer 栈（task 36）。每个 CallFrame 经 `defer_stack_base` 分区隔离；
     /// EXEC_DEFER 按本帧区间 LIFO 刷新。
     defer_stack: Vec<DeferEntry>,
+    /// 异常处理器栈（task 37）。按帧分区（frame_stack_base 判定所属帧）。
+    /// TRY_ENTER 压入、TRY_EXIT 弹出；throw() 自顶向下扫描匹配当前帧者。
+    exception_handlers: Vec<ExceptionHandler>,
+    /// task 37：待传播的异常。throw() 置位后由 drive_unwind() 推进；drive_unwind 在
+    /// 需要运行 closure defer 时「泊车」（压 defer 帧后返回主循环），主循环顶部检测到
+    /// pending_unwind + 当前帧 defer_flushing 时重新调用 drive_unwind 续行。
+    pending_unwind: Option<Object>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
@@ -55,9 +112,12 @@ impl VM {
             native_arities: HashMap::new(),
             open_upvalues: Vec::new(),
             defer_stack: Vec::new(),
+            exception_handlers: Vec::new(),
+            pending_unwind: None,
             heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
+        vm.init_exception_classes();
         vm
     }
 
@@ -564,6 +624,26 @@ impl VM {
                 self.call_stack
                     .push(CallFrame::new(*ptr, callee_idx, self.defer_stack.len()));
             }
+            // task 37：异常类对象（EXCEPTION_CLASS）— `ValueError("msg")` 等构造调用。
+            // 参数约定：第 1 个实参为 message（无参则 message = nil）。多余实参暂忽略
+            // （Phase 5 经 __init__ 处理）。构造 MsException 并替换 callee+args。
+            Object::Ref(ptr)
+                if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION_CLASS as u8 =>
+            {
+                let cls_name = unsafe { read_exception_class(*ptr) }.name.clone();
+                let message = if argc >= 1 {
+                    self.stack[callee_idx + 1].clone()
+                } else {
+                    Object::Nil
+                };
+                self.stack.truncate(callee_idx); // 弹出 callee + args
+                self.push(alloc_exception(
+                    &cls_name,
+                    message,
+                    alloc_string(""),
+                    Object::Nil,
+                ))?;
+            }
             _ => {
                 return Err(format!(
                     "TypeError: '{}' object is not callable",
@@ -575,9 +655,217 @@ impl VM {
     }
 }
 
+// ---------------------------------------------------------------------------
+// task 37：异常处理（异常类注册、throw、CATCH 匹配、finally-on-propagation）
+// ---------------------------------------------------------------------------
+
+impl VM {
+    /// 注册 12 个内置异常类为 EXCEPTION_CLASS 全局变量（Error + 11 子类）。
+    fn init_exception_classes(&mut self) {
+        for &name in BUILTIN_EXCEPTION_NAMES {
+            let cls = alloc_exception_class(name);
+            self.globals.insert(name.to_string(), cls);
+        }
+    }
+
+    /// 读取当前帧常量池中索引为 `idx` 的**字符串常量**，返回克隆的 String。
+    /// 供 CATCH（异常类名匹配）与 GET_ATTR（属性名）使用。
+    fn read_string_constant(&self, idx: usize) -> Result<String, String> {
+        let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
+        let constants = unsafe {
+            let closure = read_closure(frame.closure);
+            read_function(closure.function).function.constants.as_slice()
+        };
+        let val = constants
+            .get(idx)
+            .ok_or_else(|| "constant index out of range".to_string())?;
+        match val {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+                Ok(unsafe { read_str(*ptr) }.to_string())
+            }
+            _ => Err("internal: expected string constant".into()),
+        }
+    }
+
+    /// 异常在 MRO 上是否为 `target_name` 或其子孙。查静态 EXCEPTION_PARENTS 表。
+    /// GeneratorExit 不可被用户 except 捕获（仅 CLOSE_GENERATOR 内部流程可处理）。
+    fn exception_matches(exception: &Object, target_name: &str) -> bool {
+        let class_name = match exception {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
+                unsafe { read_exception(*ptr) }.class_name.clone()
+            }
+            _ => return false, // 非 EXCEPTION 不能被 except 捕获
+        };
+        // GeneratorExit 不可被用户 except 捕获（05-control-flow.md:238）。
+        if class_name == "GeneratorExit" {
+            return false;
+        }
+        let mut cur = class_name.as_str();
+        loop {
+            if cur == target_name {
+                return true;
+            }
+            match EXCEPTION_PARENTS
+                .iter()
+                .find(|(c, _)| *c == cur)
+                .map(|(_, p)| *p)
+            {
+                Some(parent) => cur = parent,
+                None => return false,
+            }
+        }
+    }
+
+    /// 将 `cause` 挂为异常 `exc` 的 `__cause__`（规则 1/4）。
+    fn set_cause(&mut self, exc: &Object, cause: Object) {
+        if let Object::Ref(ptr) = exc {
+            if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 {
+                unsafe { read_exception_mut(*ptr) }.cause = cause;
+            }
+        }
+    }
+
+    /// 格式化未捕获异常为错误字符串（顶层 throw() 返回此 Err）。
+    fn format_uncaught_error(&self, err: &Object) -> String {
+        match err {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
+                let e = unsafe { read_exception(*ptr) };
+                let msg = match &e.message {
+                    Object::Ref(s) if unsafe { (**s).type_tag } == TypeTag::STRING as u8 => {
+                        unsafe { read_str(*s) }.to_string()
+                    }
+                    _ => e.message.type_name().to_string(),
+                };
+                format!("{}: {}", e.class_name, msg)
+            }
+            _ => "Error: <non-exception thrown>".to_string(),
+        }
+    }
+
+    /// 异常传播入口（THROW/RETHROW/FINALLY_END 调用）。
+    ///
+    /// 把 `err` 挂为 `pending_unwind` 并驱动 `drive_unwind`。若当前已处于 unwind 态
+    /// （一个 defer 抛了新异常）或当前帧正处理某异常（finally 内抛新异常），则旧异常
+    /// 挂为新异常的 `__cause__`（规则 1/4 / finally 覆盖）。
+    fn throw(&mut self, err: Object) -> Result<(), String> {
+        // 取出「当前正在传播/处理的异常」作为 __cause__ 链源：
+        //  - pending_unwind：unwind 途中某 defer 抛了新异常（规则 1/4）。
+        //  - current_exc：finally 块内抛新异常，覆盖进入 finally 时的原异常（规则 §6）。
+        let cause = self
+            .pending_unwind
+            .take()
+            .or_else(|| self.call_stack.last_mut().and_then(|f| f.current_exc.take()));
+        if let Some(c) = cause {
+            self.set_cause(&err, c);
+        }
+        self.pending_unwind = Some(err);
+        self.drive_unwind()
+    }
+
+    /// 推进异常传播（由 throw() 与主循环顶部共同驱动）。
+    ///
+    /// 对当前帧：(a) 若有未刷新 defer，逐条经主循环执行（closure defer 须泊车）；
+    /// (b) defers 完成后扫描 exception_handlers，命中则跳 catch_address；不命中则 (c)
+    /// pop frame 续传；顶层无 handler 返回 Err。
+    fn drive_unwind(&mut self) -> Result<(), String> {
+        let err = self
+            .pending_unwind
+            .take()
+            .expect("drive_unwind called with no pending exception");
+        loop {
+            let frame_stack_base = match self.call_stack.last() {
+                Some(f) => f.stack_base,
+                None => return Err(self.format_uncaught_error(&err)),
+            };
+            let defer_base = self.call_stack.last().unwrap().defer_stack_base;
+
+            // (a) 刷新本帧 defer（逐条；closure callee 须泊车交主循环执行）。
+            if self.defer_stack.len() > defer_base {
+                self.call_stack.last_mut().unwrap().defer_flushing = true;
+                let entry = self.defer_stack.pop().unwrap();
+                // 拆开 call_tuple = (callee, arg1, ..., argN)。
+                let items = match &entry.call_tuple {
+                    Object::Ref(ptr)
+                        if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 =>
+                    {
+                        unsafe { read_tuple(*ptr) }.clone()
+                    }
+                    _ => return Err("internal: defer call_tuple is not a tuple".into()),
+                };
+                let argc = items.len() - 1;
+                for a in &items {
+                    self.push(a.clone())?;
+                }
+                let frames_before = self.call_stack.len();
+                self.call_value(argc)?;
+                if self.call_stack.len() == frames_before {
+                    // native defer 同步完成：丢弃返回值，继续刷下一条 defer（不泊车）。
+                    self.pop()?;
+                    continue;
+                }
+                // closure defer：新帧已压入 → 泊车，交主循环执行该帧。
+                // defer 抛异常时该帧的 throw() 会自驱动（含跨帧续传）。
+                self.pending_unwind = Some(err);
+                return Ok(());
+            }
+
+            // defers 全部完成。
+            self.call_stack.last_mut().unwrap().defer_flushing = false;
+
+            // (b) 扫描 exception_handlers，找到属于当前帧的 handler。
+            //   frame_stack_base 是值栈基址：内层帧更高、外层帧更低。
+            //   handler > 当前帧 → 残留的内层 handler（其帧已 pop）→ 丢弃；
+            //   handler == 当前帧 → 命中本帧；
+            //   handler < 当前帧 → 属于外层帧 → 保留，pop 本帧后续传。
+            let handler = loop {
+                match self.exception_handlers.last() {
+                    None => break None,
+                    Some(h) if h.frame_stack_base > frame_stack_base => {
+                        self.exception_handlers.pop();
+                    }
+                    Some(h) if h.frame_stack_base == frame_stack_base => {
+                        break self.exception_handlers.pop();
+                    }
+                    Some(_) => break None,
+                }
+            };
+
+            if let Some(h) = handler {
+                self.stack.truncate(h.scope_stack_base);
+                let frame = self.call_stack.last_mut().unwrap();
+                frame.current_exc = Some(err.clone());
+                frame.ip = h.catch_address;
+                self.push(err)?;
+                return Ok(()); // 主循环将派发 catch_address（except 分派器）
+            }
+
+            // (c) 本帧无 handler：关闭 upvalue，pop frame，续传外层帧。
+            self.close_upvalues_from(frame_stack_base);
+            if self.call_stack.len() > 1 {
+                self.stack.truncate(frame_stack_base);
+                self.call_stack.pop();
+                continue;
+            }
+            return Err(self.format_uncaught_error(&err));
+        }
+    }
+}
+
 impl VM {
     fn run(&mut self) -> Result<Object, String> {
         loop {
+            // task 37：unwind 续行——若待传播异常存在且当前帧正处于 defer 刷新
+            // （说明一个 closure defer 帧刚弹出回到 unwind 帧），则推进 drive_unwind。
+            // 首次 throw 在 handler 内已调用 drive_unwind；这里仅处理泊车后续行。
+            if self.pending_unwind.is_some()
+                && self
+                    .call_stack
+                    .last()
+                    .is_some_and(|f| f.defer_flushing)
+            {
+                self.drive_unwind()?;
+            }
+
             // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
             // 0，此调用为 no-op；接入后在此按阈值触发 minor/major GC（STW）。
             gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals, &mut self.defer_stack);
@@ -1323,6 +1611,154 @@ impl VM {
                     } else {
                         // 本帧 defer 已全部执行，退出刷新态（不回退 ip → 下一条为 RETURN/HALT）。
                         self.call_stack.last_mut().unwrap().defer_flushing = false;
+                    }
+                }
+
+                // ---- task 37：异常处理 ----
+
+                // THROW：弹出栈顶异常对象并抛出。string 自动包装为 RuntimeError。
+                OpCode::Throw => {
+                    let val = self.pop()?;
+                    let err = match &val {
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
+                        {
+                            val
+                        }
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 =>
+                        {
+                            // throw "string" → RuntimeError(message)
+                            let msg = unsafe { read_str(*ptr) }.to_string();
+                            alloc_exception(
+                                "RuntimeError",
+                                alloc_string(&msg),
+                                alloc_string(""),
+                                Object::Nil,
+                            )
+                        }
+                        _ => {
+                            return Err(
+                                "TypeError: exceptions must derive from Error or be a string".into()
+                            )
+                        }
+                    };
+                    self.throw(err)?;
+                }
+
+                // TRY_ENTER：注册异常处理器。操作数 handler_offset(2) finally_offset(2)。
+                OpCode::TryEnter => {
+                    let handler_offset = self.read_u16()? as usize;
+                    let finally_raw = self.read_u16()?;
+                    let frame = self
+                        .call_stack
+                        .last()
+                        .ok_or("no call frame".to_string())?;
+                    let catch_address = frame.ip + handler_offset;
+                    let finally_address = if finally_raw == 0xFFFF {
+                        None
+                    } else {
+                        Some(frame.ip + finally_raw as usize)
+                    };
+                    self.exception_handlers.push(ExceptionHandler {
+                        catch_address,
+                        finally_address,
+                        frame_stack_base: frame.stack_base,
+                        scope_stack_base: self.stack.len(),
+                    });
+                }
+
+                // TRY_EXIT：try body 正常完成（或 early-exit 出口）注销本 try 的 handler。
+                OpCode::TryExit => {
+                    self.exception_handlers.pop();
+                }
+
+                // CATCH：栈顶异常的类名是否匹配常量池[name_idx]（含父类链）；压 bool。
+                // 不弹出异常本体（供后续绑定 / 不匹配时重抛）。
+                OpCode::Catch => {
+                    let name_idx = self.read_u16()? as usize;
+                    let target_name = self.read_string_constant(name_idx)?;
+                    let exception = self.peek(0)?.clone();
+                    let matches = Self::exception_matches(&exception, &target_name);
+                    self.push(Object::Bool(matches))?;
+                }
+
+                // RETHROW：重抛当前帧 current_exc（裸 throw）；为空抛 nothing to rethrow。
+                OpCode::Rethrow => {
+                    let err = {
+                        let frame = self
+                            .call_stack
+                            .last()
+                            .ok_or("no call frame".to_string())?;
+                        frame.current_exc.clone()
+                    };
+                    match err {
+                        Some(e) => self.throw(e)?,
+                        None => {
+                            let e = alloc_exception(
+                                "RuntimeError",
+                                alloc_string("nothing to rethrow"),
+                                alloc_string(""),
+                                Object::Nil,
+                            );
+                            self.throw(e)?;
+                        }
+                    }
+                }
+
+                // FINALLY_END：finally 块末尾。current_exc 非空则重抛（finally-on-propagation）。
+                OpCode::FinallyEnd => {
+                    let pending = self
+                        .call_stack
+                        .last_mut()
+                        .ok_or("no call frame".to_string())?
+                        .current_exc
+                        .take();
+                    if let Some(e) = pending {
+                        self.throw(e)?;
+                    }
+                }
+
+                // CLEAR_CURRENT_EXC：except 命中分支末尾，清除 current_exc（异常已处理，
+                // 使后续 FINALLY_END 不误重抛）。
+                OpCode::ClearCurrentExc => {
+                    self.call_stack
+                        .last_mut()
+                        .ok_or("no call frame".to_string())?
+                        .current_exc = None;
+                }
+
+                // GET_ATTR（task 37）：仅处理 EXCEPTION 对象的属性访问
+                // （message/type/traceback/__cause__）；其余类型留待 task 41/43。
+                OpCode::GetAttr => {
+                    let name_idx = self.read_u16()? as usize;
+                    let attr = self.read_string_constant(name_idx)?;
+                    let obj = self.pop()?;
+                    match &obj {
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
+                        {
+                            let exc = unsafe { read_exception(*ptr) };
+                            let val = match attr.as_str() {
+                                "message" => exc.message.clone(),
+                                "type" => alloc_string(&exc.class_name),
+                                "traceback" => exc.traceback.clone(),
+                                "__cause__" => exc.cause.clone(),
+                                _ => {
+                                    return Err(format!(
+                                        "AttributeError: 'Error' has no attribute '{}'",
+                                        attr
+                                    ))
+                                }
+                            };
+                            self.push(val)?;
+                        }
+                        _ => {
+                            return Err(
+                                "GET_ATTR for non-exception types: not yet implemented (task 41/43)"
+                                    .into(),
+                            )
+                        }
                     }
                 }
 
@@ -4768,5 +5204,234 @@ defer print("top defer 2")
         let program = parse(src);
         let mut compiler = Compiler::new();
         assert!(compiler.compile(&program).is_err());
+    }
+
+    // ---- task 37：try/except/finally 异常处理 ----
+
+    /// 完整 spec 测试序列（tasks/37 §测试用例）：基本捕获 / finally / 捕获所有 /
+    /// 多 except / finally 正常路径 / 跨帧传播 / 组合 / finally-on-propagation /
+    /// throw string 包装 / 裸 throw 重抛 / __cause__ 链。
+    #[test]
+    fn test_try_except_finally_full() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s + "|"
+    }
+    try {
+        throw ValueError("test error")
+    } except ValueError as e {
+        p("caught: " + e.message)
+    }
+    try {
+        throw ZeroDivisionError("divide by zero")
+    } except ZeroDivisionError as e {
+        p("division error")
+    } finally {
+        p("cleanup")
+    }
+    try {
+        throw TypeError("type!")
+    } except {
+        p("caught all")
+    }
+    try {
+        throw KeyError("missing")
+    } except ValueError as e {
+        p("value error")
+    } except KeyError as e {
+        p("key error: " + e.message)
+    }
+    try {
+        x = 42
+    } finally {
+        p("always runs")
+    }
+    fn inner() {
+        throw RuntimeError("from inner")
+    }
+    fn outer() {
+        inner()
+    }
+    try {
+        outer()
+    } except RuntimeError as e {
+        p("propagated: " + e.message)
+    }
+    try {
+        throw ValueError("combo")
+    } except ValueError as e {
+        p("handled: " + e.message)
+    } finally {
+        p("final cleanup")
+    }
+    fn boom() {
+        try {
+            throw ValueError("boom")
+        } finally {
+            p("inner finally")
+        }
+    }
+    try {
+        boom()
+    } except ValueError as e {
+        p("outer caught: " + e.message)
+    }
+    try {
+        throw "oops"
+    } except RuntimeError as e {
+        p("wrapped: " + e.message)
+    }
+    try {
+        try {
+            throw ValueError("first")
+        } except ValueError as e {
+            throw
+        }
+    } except ValueError as e {
+        p("rethrown: " + e.message)
+    }
+    fn defer_throw() {
+        throw KeyError("defer err")
+    }
+    fn with_defer() {
+        defer defer_throw()
+        throw ValueError("orig")
+    }
+    try {
+        with_defer()
+    } except KeyError as e {
+        p("cause type: " + e.__cause__.type)
+        p("caught: " + e.message)
+    }
+    expected = "caught: test error|division error|cleanup|caught all|key error: missing|always runs|propagated: from inner|handled: combo|final cleanup|inner finally|outer caught: boom|wrapped: oops|rethrown: first|cause type: ValueError|caught: defer err|"
+    assert(log == expected, log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "try/except/finally full sequence failed: {:?}", r.err());
+    }
+
+    /// 子类匹配（验证标准 6）：ValueError 被 except Error 捕获。
+    #[test]
+    fn test_try_except_subclass_match() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s
+    }
+    try {
+        throw ValueError("sub")
+    } except Error as e {
+        p("caught by Error: " + e.message)
+    }
+    assert(log == "caught by Error: sub", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "subclass match failed: {:?}", r.err());
+    }
+
+    /// 未捕获异常终止程序并返回错误字符串（验证标准 9）。
+    #[test]
+    fn test_uncaught_exception() {
+        let src = "throw ValueError(\"uncaught\")";
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("ValueError"), "got: {}", err);
+        assert!(err.contains("uncaught"), "got: {}", err);
+    }
+
+    /// 裸 throw 在 except 块外抛 RuntimeError("nothing to rethrow")（验证标准 8）。
+    #[test]
+    fn test_bare_throw_outside_except() {
+        let src = "throw";
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("RuntimeError"), "got: {}", err);
+        assert!(err.contains("nothing to rethrow"), "got: {}", err);
+    }
+
+    /// GeneratorExit 不可被用户 except 捕获（验证标准 13）。
+    #[test]
+    fn test_generator_exit_not_caught() {
+        let src = r#"
+try {
+    throw GeneratorExit("ge")
+} except {
+    print("should not catch")
+} except Error as e {
+    print("should not catch either")
+}
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("GeneratorExit"), "got: {}", err);
+        assert!(err.contains("ge"), "got: {}", err);
+    }
+
+    /// throw 非 string/Exception → TypeError。
+    #[test]
+    fn test_throw_non_exception_type_error() {
+        let src = "throw 42";
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+    }
+
+    /// 编译器：try/except/finally 生成 TRY_ENTER / TRY_EXIT / CATCH / FINALLY_END 等指令。
+    #[test]
+    fn test_compile_try_emits_opcodes() {
+        let src = r#"
+try {
+    throw ValueError("x")
+} except ValueError as e {
+    print(e)
+} finally {
+    cleanup()
+}
+"#;
+        let chunk = {
+            let program = parse(src);
+            let mut compiler = Compiler::new();
+            compiler.compile(&program).unwrap()
+        };
+        assert!(chunk.code.contains(&(OpCode::TryEnter as u8)), "missing TRY_ENTER");
+        assert!(chunk.code.contains(&(OpCode::TryExit as u8)), "missing TRY_EXIT");
+        assert!(chunk.code.contains(&(OpCode::Catch as u8)), "missing CATCH");
+        assert!(chunk.code.contains(&(OpCode::Throw as u8)), "missing THROW");
+        assert!(
+            chunk.code.contains(&(OpCode::FinallyEnd as u8)),
+            "missing FINALLY_END"
+        );
+        assert!(
+            chunk.code.contains(&(OpCode::ClearCurrentExc as u8)),
+            "missing CLEAR_CURRENT_EXC"
+        );
+    }
+
+    /// 基本捕获 + `as` 绑定 + GET_ATTR(e.message)。
+    #[test]
+    fn test_try_except_basic() {
+        let src = r#"
+fn run() {
+    log = ""
+    fn p(s) {
+        nonlocal log
+        log = log + s
+    }
+    try {
+        throw ValueError("test error")
+    } except ValueError as e {
+        p("caught: " + e.message)
+    }
+    assert(log == "caught: test error", log)
+}
+run()
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "basic try/except failed: {:?}", r.err());
     }
 }
