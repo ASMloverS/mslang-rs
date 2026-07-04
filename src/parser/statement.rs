@@ -418,9 +418,7 @@ impl Parser {
         self.advance(); // consume 'throw'
 
         // 支持 bare throw（重新抛出当前异常）
-        if self.check(&TokenKind::Newline)
-            || self.check(&TokenKind::RightBrace)
-            || self.is_at_end()
+        if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) || self.is_at_end()
         {
             self.consume_newline();
             return Ok(Stmt::Throw { expr: None });
