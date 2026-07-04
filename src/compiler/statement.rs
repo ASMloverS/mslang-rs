@@ -218,6 +218,7 @@ impl Compiler {
             }],
             upvalues: Vec::new(),
             scope_depth: 0,
+            is_generator: false,
             parent: std::ptr::null(),
         };
         // task 31：参数顺序校验（普通 → 默认 → 可变）+ 默认/可变参数分类。
@@ -278,6 +279,8 @@ impl Compiler {
             default_values,
             has_variadic,
             required_arity,
+            is_generator: func_unit.is_generator,
+            locals_count: func_unit.locals.len(),
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)
@@ -488,7 +491,8 @@ impl Compiler {
             }
             None => {
                 // 0xFFFF 哨兵 = 无 finally。
-                self.unit.chunk.code[finally_patch..finally_patch + 2].copy_from_slice(&[0xff, 0xff]);
+                self.unit.chunk.code[finally_patch..finally_patch + 2]
+                    .copy_from_slice(&[0xff, 0xff]);
             }
         }
 
@@ -548,7 +552,10 @@ impl Compiler {
         self.with_temp_counter += 1;
         self.declare_local(&tmp_name, line)?;
         let tmp_slot = u8::try_from(self.resolve_local(&tmp_name).ok_or_else(|| {
-            format!("internal: with temp local '{}' not found after declare", tmp_name)
+            format!(
+                "internal: with temp local '{}' not found after declare",
+                tmp_name
+            )
         })?)
         .map_err(|_| "too many locals for with temp".to_string())?;
         self.emit_byte(OpCode::StoreLocal as u8, line);
@@ -559,8 +566,8 @@ impl Compiler {
         self.emit_byte(tmp_slot, line);
         self.emit_byte(OpCode::GetAttr as u8, line);
         let enter_idx = self.add_constant(alloc_string("__enter__"));
-        let enter_idx = u16::try_from(enter_idx)
-            .map_err(|_| "too many constants for __enter__".to_string())?;
+        let enter_idx =
+            u16::try_from(enter_idx).map_err(|_| "too many constants for __enter__".to_string())?;
         self.emit_bytes(&enter_idx.to_be_bytes(), line);
         self.emit_byte(OpCode::LoadLocal as u8, line); // self 实参
         self.emit_byte(tmp_slot, line);
@@ -608,7 +615,7 @@ impl Compiler {
         // —— cleanup_exc：异常入口（栈顶=异常，current_exc 已设）——
         let cleanup_exc_addr = self.current_offset();
         self.emit_byte(OpCode::Pop as u8, line); // 弹栈顶异常（current_exc 仍持有）
-        // cleanup 合并点：normal_jump 跳到此处（跳过上面的 POP）。
+                                                 // cleanup 合并点：normal_jump 跳到此处（跳过上面的 POP）。
         self.patch_jump(normal_jump)?;
 
         // —— __exit__(ctx, err_type, err_msg, tb)：callee-below-args → CALL 4 ——
@@ -616,8 +623,8 @@ impl Compiler {
         self.emit_byte(tmp_slot, line);
         self.emit_byte(OpCode::GetAttr as u8, line);
         let exit_idx = self.add_constant(alloc_string("__exit__"));
-        let exit_idx = u16::try_from(exit_idx)
-            .map_err(|_| "too many constants for __exit__".to_string())?;
+        let exit_idx =
+            u16::try_from(exit_idx).map_err(|_| "too many constants for __exit__".to_string())?;
         self.emit_bytes(&exit_idx.to_be_bytes(), line);
         self.emit_byte(OpCode::LoadLocal as u8, line); // self 实参
         self.emit_byte(tmp_slot, line);
@@ -1213,9 +1220,7 @@ mod tests {
             .constants
             .iter()
             .find_map(|c| match c {
-                Object::Ref(ptr)
-                    if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 =>
-                {
+                Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 => {
                     Some(unsafe { read_function(*ptr) }.function.code.clone())
                 }
                 _ => None,

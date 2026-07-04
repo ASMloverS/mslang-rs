@@ -65,7 +65,7 @@
 | 36 | [defer 语句](36-defer.md) | ✅ |
 | 37 | [try/except/finally 异常处理](37-try-except-finally.md) | ✅ |
 | 38 | [with 语句（上下文管理器）](38-with-statement.md) | ✅ |
-| 39 | [生成器与 yield](39-generator-yield.md) | ⬜ |
+| 39 | [生成器与 yield](39-generator-yield.md) | ✅ |
 
 ## Phase 5 — Class + 面向对象
 

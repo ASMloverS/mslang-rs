@@ -16,14 +16,13 @@ pub struct CallFrame {
     /// throw() 跳入 except 分派器前设为 Some(err)；except 命中分支经
     /// CLEAR_CURRENT_EXC 置 None（异常已处理），FINALLY_END 据此决定是否重抛。
     pub current_exc: Option<Object>,
+    /// task 39：生成器帧标记。普通帧为 None；生成器帧为 Some(gen_ptr)，指向
+    /// 所属 MsGenerator。YIELD / RETURN 据此识别生成器帧并走快照保存路径。
+    pub gen_owner: Option<*mut MsObjHeader>,
 }
 
 impl CallFrame {
-    pub fn new(
-        closure: *mut MsObjHeader,
-        stack_base: usize,
-        defer_stack_base: usize,
-    ) -> Self {
+    pub fn new(closure: *mut MsObjHeader, stack_base: usize, defer_stack_base: usize) -> Self {
         Self {
             closure,
             ip: 0,
@@ -31,6 +30,7 @@ impl CallFrame {
             defer_stack_base,
             defer_flushing: false,
             current_exc: None,
+            gen_owner: None,
         }
     }
 

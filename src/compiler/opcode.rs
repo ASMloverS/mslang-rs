@@ -9,7 +9,7 @@ use crate::compiler::Chunk;
 
 /// 字节码操作码。
 ///
-/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(89)，
+/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(90)，
 /// 因此可通过 `transmute` 与 `u8` 之间安全转换（见 [`OpCode::from_byte`]）。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,8 @@ pub enum OpCode {
     ForIter,
     Yield,
     YieldFrom,
+    // task 39：YIELD_FROM 的配套恢复指令（无操作数），handler 调用 yield_from_step。
+    YieldFromResume,
     CloseGenerator,
     // 构造器
     BuildList,
@@ -196,8 +198,8 @@ impl TryFrom<u8> for OpCode {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         if value <= Self::Halt as u8 {
-        // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
-        // Constant=0 through Halt(89). value <= Halt guarantees validity.
+            // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
+            // Constant=0 through Halt(90). value <= Halt guarantees validity.
             Ok(unsafe { core::mem::transmute::<u8, Self>(value) })
         } else {
             Err(())
@@ -364,6 +366,7 @@ mod tests {
             OpCode::ForIter,
             OpCode::Yield,
             OpCode::YieldFrom,
+            OpCode::YieldFromResume,
             OpCode::CloseGenerator,
             OpCode::BuildList,
             OpCode::BuildDict,

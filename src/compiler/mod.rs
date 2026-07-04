@@ -52,6 +52,9 @@ pub struct CompilationUnit {
     pub upvalues: Vec<Upvalue>,
     /// 当前作用域深度
     pub scope_depth: usize,
+    /// task 39：函数体编译期间是否出现 yield / yield from。函数编译完成时据此
+    /// 设置 Function.is_generator。父单元的该字段不被读取（仅当前子单元有效）。
+    pub is_generator: bool,
     /// 父编译单元（用于闭包上值解析）。
     ///
     /// 采用裸指针（clox 风格）规避 `self.unit` 经 `mem::replace` 换出/换入时
@@ -95,6 +98,7 @@ pub struct Compiler {
     /// task 38：with 语句临时局部（保存上下文管理器）的唯一名计数器。每条 with 分配
     /// `_with_ctx_N`，使同函数作用域内嵌套 with 不冲突（with 不创建新作用域）。
     with_temp_counter: usize,
+    gen_expr_counter: usize,
     /// 标记为 nonlocal 的变量名（当前函数作用域内有效）。
     nonlocal_names: std::collections::HashSet<String>,
     /// 标记为 global 的变量名（当前函数作用域内有效）。
@@ -121,6 +125,7 @@ impl Compiler {
             }],
             upvalues: Vec::new(),
             scope_depth: 0,
+            is_generator: false,
             parent: std::ptr::null(),
         };
         Compiler {
@@ -131,6 +136,7 @@ impl Compiler {
             current_loop: Vec::new(),
             try_depth: 0,
             with_temp_counter: 0,
+            gen_expr_counter: 0,
             nonlocal_names: std::collections::HashSet::new(),
             global_names: std::collections::HashSet::new(),
         }

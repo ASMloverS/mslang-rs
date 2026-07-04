@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::vm::frame::CallFrame;
+
 /// 堆对象类型标签。来自 14-gc.md。
 ///
 /// 本定义为全局唯一权威 TypeTag，其他任务（52-gc 等）应引用此处，不得重复定义。
@@ -507,6 +509,11 @@ pub struct Function {
     pub has_variadic: bool,
     /// 必需参数数量（普通参数，不含默认和可变）。
     pub required_arity: usize,
+    /// task 39：是否为生成器函数（函数体含 yield / yield from）。
+    pub is_generator: bool,
+    /// task 39：局部变量槽位数（含 slot 0 占位）。生成器创建时据此校验
+    /// MAX_GENERATOR_LOCALS 上限（V6/R6），亦作为快照栈区间的合理上界参考。
+    pub locals_count: usize,
 }
 
 impl Function {
@@ -521,6 +528,8 @@ impl Function {
             default_values: Vec::new(),
             has_variadic: false,
             required_arity: arity,
+            is_generator: false,
+            locals_count: 1,
         }
     }
 }
@@ -663,6 +672,81 @@ pub unsafe fn read_upvalue<'a>(ptr: *mut MsObjHeader) -> &'a mut MsUpvalue {
 }
 
 // ---------------------------------------------------------------------------
+// Generator 堆对象（task 39）
+// ---------------------------------------------------------------------------
+
+/// 生成器状态。close 后的生成器统一为 `Exhausted`（不单独设 `Closed`，A1 修复）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeneratorState {
+    Suspended,
+    Running,
+    Exhausted,
+}
+
+/// 生成器堆对象（TypeTag::GENERATOR = 12）。参照 [39-generator-yield] §0。
+///
+/// 沿用 task 23/27 的"值栈按帧分段"不变量：`stack_snapshot` 保存 VM 主值栈
+/// `[stack_base..stack_top)` 区间的拷贝（locals 即其前缀），**不是**独立栈。
+/// `frame` 为值类型拷贝（ip / stack_base / defer_stack_base / closure 等）。
+#[repr(C)]
+pub struct MsGenerator {
+    pub header: MsObjHeader,
+    /// 帧拷贝（值类型）。closure 字段指向生成器函数的 MsClosure。
+    pub frame: CallFrame,
+    /// `[stack_base..stack_top)` 区间快照（恢复时拷回主栈）。
+    pub stack_snapshot: Vec<Object>,
+    pub state: GeneratorState,
+    /// yield from 子迭代器（MsIterator 或 MsGenerator）。None 表示无委托。
+    pub receiver: Option<*mut MsObjHeader>,
+    /// close_generator 注入 GeneratorExit 标志（resume 时首个安全点检查）。
+    pub gen_exit_pending: bool,
+}
+
+impl MsGenerator {
+    pub fn new(frame: CallFrame, stack_snapshot: Vec<Object>) -> Self {
+        Self {
+            header: MsObjHeader {
+                gc_meta: 0,
+                type_tag: TypeTag::GENERATOR as u8,
+                size: std::mem::size_of::<MsGenerator>() as u16,
+                _padding: 0,
+                class_ptr: 0,
+            },
+            frame,
+            stack_snapshot,
+            state: GeneratorState::Suspended,
+            receiver: None,
+            gen_exit_pending: false,
+        }
+    }
+}
+
+/// 分配 MsGenerator（TypeTag::GENERATOR），返回 Object::Ref。
+/// 设 HAS_FINALIZER（gc_meta），使 GC 回收前进入 finalizer 队列（task 39 §9）。
+/// MVP：Box 分配（与既有 alloc_* 一致，VM 日常分配暂未接入 GC 堆）。
+pub fn alloc_generator(gen: MsGenerator) -> Object {
+    let mut boxed = Box::new(gen);
+    boxed.header.set_has_finalizer(true);
+    Object::Ref(Box::into_raw(boxed) as *mut MsObjHeader)
+}
+
+/// 读取 MsGenerator（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_generator` 分配的、在 `'a` 期间有效的 `MsGenerator`。
+pub unsafe fn read_generator<'a>(ptr: *mut MsObjHeader) -> &'a MsGenerator {
+    &*(ptr as *const MsGenerator)
+}
+
+/// 读取 MsGenerator（可变）。
+///
+/// # Safety
+/// 同 read_generator；调用方须保证无其它 `&MsGenerator` / `&mut MsGenerator` 同时存活。
+pub unsafe fn read_generator_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsGenerator {
+    &mut *(ptr as *mut MsGenerator)
+}
+
+// ---------------------------------------------------------------------------
 // 异常对象（task 37）
 // ---------------------------------------------------------------------------
 
@@ -729,7 +813,12 @@ pub fn alloc_exception_class(name: &str) -> Object {
 }
 
 /// 分配 MsException 堆对象（TypeTag::EXCEPTION），返回 Object::Ref。
-pub fn alloc_exception(class_name: &str, message: Object, traceback: Object, cause: Object) -> Object {
+pub fn alloc_exception(
+    class_name: &str,
+    message: Object,
+    traceback: Object,
+    cause: Object,
+) -> Object {
     let obj = Box::new(MsException::new(
         class_name.to_string(),
         message,

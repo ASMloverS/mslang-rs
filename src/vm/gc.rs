@@ -470,7 +470,9 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         // trace/copy/free 实际不被调用；防悬垂。
         // CLOSURE/UPVALUE 真实 trace 待 GC 接管闭包堆分配后补全（future task）。
         // TODO task 40/41: CLASS/INSTANCE/BOUND_METHOD。
-        // TODO task 45: MODULE。TODO task 52/26: ITERATOR。TODO task 39: GENERATOR。
+        // TODO task 45: MODULE。TODO task 52/26: ITERATOR。
+        // task 39: GENERATOR — Box 分配（alloc_generator），当前不经 gc_alloc，
+        // trace/finalize 不被调用；GC 接管后需 trace stack_snapshot + receiver。
         // TODO task 53: FUTURE/CHANNEL/JOIN_HANDLE。
         // [task 38 回填] current_exc 作根集已在 minor_gc/major_gc 扫描（见上方 frames 参数）；
         //   exception_handlers 仅持元数据（无 Object 引用），不需扫描。
@@ -1167,7 +1169,13 @@ mod tests {
         let mut stack = vec![live];
         let mut globals = HashMap::new();
         let mut defer_stack: Vec<DeferEntry> = Vec::new();
-        maybe_gc(&mut heap, &mut stack, &mut globals, &mut defer_stack, &mut []);
+        maybe_gc(
+            &mut heap,
+            &mut stack,
+            &mut globals,
+            &mut defer_stack,
+            &mut [],
+        );
         // live 经 minor 晋升 Old，major 标记可达 → 存活。
         assert_eq!(heap.old_objects.len(), 1);
         unsafe {

@@ -82,14 +82,29 @@ impl Compiler {
                 for_clauses,
                 condition,
             } => self.compile_set_comprehension(expr, for_clauses, condition, line),
-            Expr::GeneratorExpression { .. } => {
-                Err("comprehension compilation not yet implemented (task 35/38)".to_string())
-            }
+            Expr::GeneratorExpression {
+                expr,
+                for_clauses,
+                condition,
+            } => self.compile_generator_expression(expr, for_clauses, condition, line),
             Expr::SuperAccess { .. } => {
                 Err("super compilation not yet implemented (task 42)".to_string())
             }
-            Expr::Yield { .. } | Expr::YieldFrom { .. } => {
-                Err("yield compilation not yet implemented (task 39)".to_string())
+            Expr::Yield { value } => {
+                self.unit.is_generator = true;
+                match value {
+                    None => self.emit_byte(OpCode::Nil as u8, line),
+                    Some(e) => self.compile_expression(e, line)?,
+                }
+                self.emit_byte(OpCode::Yield as u8, line);
+                Ok(())
+            }
+            Expr::YieldFrom { iterable } => {
+                self.unit.is_generator = true;
+                self.compile_expression(iterable, line)?;
+                self.emit_byte(OpCode::YieldFrom as u8, line);
+                self.emit_byte(OpCode::YieldFromResume as u8, line);
+                Ok(())
             }
             Expr::Await { .. } => {
                 Err("await compilation not yet implemented (task 53)".to_string())
@@ -537,6 +552,7 @@ impl Compiler {
             }],
             upvalues: Vec::new(),
             scope_depth: 0,
+            is_generator: false,
             parent: std::ptr::null(),
         };
         // task 31：参数顺序校验 + 默认/可变分类（镜像 compile_fn_decl）。
@@ -595,6 +611,8 @@ impl Compiler {
             default_values,
             has_variadic,
             required_arity,
+            is_generator: func_unit.is_generator,
+            locals_count: func_unit.locals.len(),
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)
@@ -854,6 +872,204 @@ impl Compiler {
             }
         }
         self.emit_byte(slot as u8, line);
+        Ok(())
+    }
+}
+
+struct GenClause {
+    iter: usize,
+    targets: Vec<usize>,
+}
+
+impl Compiler {
+    /// 编译生成器表达式 `(expr for x in iter (if cond)?)`（task 39）。
+    ///
+    /// 变换为匿名生成器闭包并立即调用：
+    ///   fn __gen_expr_N(iter) {
+    ///       for x in iter {           // 首子句用参数 iter
+    ///           for y in iter2 { ... } // 后续子句编译各自 iterable
+    ///           if cond { yield expr }
+    ///       }
+    ///   }
+    /// 外层变量经 upvalue 捕获（R7）。函数名用单调计数器保证唯一（R8）。
+    fn compile_generator_expression(
+        &mut self,
+        expr: &Expr,
+        for_clauses: &[ForClause],
+        condition: &Option<Box<Expr>>,
+        line: usize,
+    ) -> Result<(), String> {
+        let name = format!("__gen_expr_{}", self.gen_expr_counter);
+        self.gen_expr_counter += 1;
+
+        // 新建编译单元 fn __gen_expr_N(iter)。
+        let func_unit = super::CompilationUnit {
+            chunk: super::Chunk::new(),
+            locals: vec![
+                super::Local {
+                    name: "<self>".to_string(),
+                    depth: 0,
+                    is_captured: false,
+                },
+                super::Local {
+                    name: "iter".to_string(),
+                    depth: 0,
+                    is_captured: false,
+                },
+            ],
+            upvalues: Vec::new(),
+            scope_depth: 0,
+            is_generator: true,
+            parent: std::ptr::null(),
+        };
+        let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        self.unit.parent = std::ptr::addr_of!(saved_unit);
+
+        // 预留所有子句的 iter/target slot（Nil 占位 + declare_local）。
+        let mut clauses: Vec<GenClause> = Vec::with_capacity(for_clauses.len());
+        for (i, clause) in for_clauses.iter().enumerate() {
+            let iter_name = format!("__gen_iter_{}", i);
+            self.emit_byte(OpCode::Nil as u8, line);
+            self.declare_local(&iter_name, line)?;
+            let iter = self
+                .resolve_local(&iter_name)
+                .ok_or("internal: gen-expr iter slot")?;
+            let mut targets = Vec::with_capacity(clause.targets.len());
+            for target in &clause.targets {
+                self.emit_byte(OpCode::Nil as u8, line);
+                self.declare_local(target, line)?;
+                targets.push(
+                    self.resolve_local(target)
+                        .ok_or("internal: gen-expr target slot")?,
+                );
+            }
+            clauses.push(GenClause { iter, targets });
+        }
+
+        // 递归编译嵌套循环（首子句用参数 iter，后续子句编译各自 iterable）。
+        self.compile_gen_expr_loop(expr, condition, 0, &clauses, for_clauses, line)?;
+
+        // 隐式 return nil + emit_return（含 EXEC_DEFER）。
+        self.emit_byte(OpCode::Nil as u8, line);
+        self.emit_return(line);
+
+        // 换回父单元 + 上值回填。
+        let func_unit = std::mem::replace(&mut self.unit, saved_unit);
+        let captured: Vec<usize> = func_unit
+            .upvalues
+            .iter()
+            .filter(|uv| uv.is_local)
+            .map(|uv| uv.index)
+            .collect();
+        for idx in captured {
+            if idx < self.unit.locals.len() {
+                self.unit.locals[idx].is_captured = true;
+            }
+        }
+
+        // 存 Function + 发 CLOSURE + 上值操作数。
+        // 注意：CLOSURE 先发（压闭包于栈），再编译首子句 iterable（压实参于栈），
+        // 使 CALL 1 的栈布局为 [closure, arg]（callee 在底，实参在顶）。
+        let function = crate::vm::object::Function {
+            name: name.clone(),
+            arity: 1,
+            code: func_unit.chunk.code,
+            constants: func_unit.chunk.constants,
+            upvalue_count: func_unit.upvalues.len(),
+            source_file: self.source_file.clone(),
+            default_values: Vec::new(),
+            has_variadic: false,
+            required_arity: 1,
+            is_generator: true,
+            locals_count: func_unit.locals.len(),
+        };
+        let func_idx = self.add_constant(crate::vm::object::alloc_function(function));
+        let func_idx = u16::try_from(func_idx).map_err(|_| "constant pool overflow".to_string())?;
+        self.emit_byte(OpCode::Closure as u8, line);
+        self.emit_bytes(&func_idx.to_be_bytes(), line);
+        for uv in &func_unit.upvalues {
+            self.emit_byte(if uv.is_local { 1 } else { 0 }, line);
+            let idx =
+                u8::try_from(uv.index).map_err(|_| "upvalue index exceeds 255".to_string())?;
+            self.emit_byte(idx, line);
+        }
+
+        // 外层：编译首子句 iterable（压栈，作为 CALL 1 的实参）。
+        self.compile_expression(&for_clauses[0].iterable, line)?;
+
+        // CALL 1：用首子句 iterable 调用闭包 → 返回 Generator 对象。
+        self.emit_byte(OpCode::Call as u8, line);
+        self.emit_byte(1, line);
+        Ok(())
+    }
+
+    /// 生成器表达式嵌套循环递归编译（task 39）。
+    fn compile_gen_expr_loop(
+        &mut self,
+        expr: &Expr,
+        condition: &Option<Box<Expr>>,
+        i: usize,
+        clauses: &[GenClause],
+        for_clauses: &[ForClause],
+        line: usize,
+    ) -> Result<(), String> {
+        let clause = &clauses[i];
+
+        // 设置迭代器：首子句用参数 iter（slot 1），后续子句编译各自 iterable。
+        if i == 0 {
+            self.emit_byte(OpCode::LoadLocal as u8, line);
+            self.emit_byte(1, line); // slot 1 = iter parameter
+        } else {
+            self.compile_expression(&for_clauses[i].iterable, line)?;
+        }
+        self.emit_byte(OpCode::Iterator as u8, line);
+        self.emit_byte(OpCode::StoreLocal as u8, line);
+        self.emit_byte(clause.iter as u8, line);
+
+        // 循环头。
+        let loop_start = self.current_offset();
+        let exit = self.emit_for_iter(clause.iter as u8, line);
+
+        // 存储循环目标。
+        let targets = &clause.targets;
+        if targets.len() == 1 {
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(targets[0] as u8, line);
+        } else {
+            let n =
+                u8::try_from(targets.len()).map_err(|_| "too many unpack targets".to_string())?;
+            self.emit_byte(OpCode::Unpack as u8, line);
+            self.emit_byte(n, line);
+            for &slot in targets {
+                self.emit_byte(OpCode::StoreLocal as u8, line);
+                self.emit_byte(slot as u8, line);
+            }
+        }
+
+        if i + 1 < clauses.len() {
+            self.compile_gen_expr_loop(expr, condition, i + 1, clauses, for_clauses, line)?;
+        } else if let Some(cond) = condition {
+            // 条件过滤 + yield。
+            self.compile_expression(cond, line)?;
+            let skip = self.emit_jump(OpCode::JumpIfFalse, line);
+            self.emit_byte(OpCode::Pop as u8, line);
+            self.compile_expression(expr, line)?;
+            self.emit_byte(OpCode::Yield as u8, line);
+            let end_jump = self.emit_jump(OpCode::Jump, line);
+            self.patch_jump(skip)?;
+            self.emit_byte(OpCode::Pop as u8, line);
+            self.patch_jump(end_jump)?;
+        } else {
+            // 无条件 yield。
+            self.compile_expression(expr, line)?;
+            self.emit_byte(OpCode::Yield as u8, line);
+        }
+
+        // 回边。
+        let back = self.emit_jump(OpCode::JumpBack, line);
+        self.patch_jump_back(back, loop_start)?;
+        // 出口。
+        self.patch_jump(exit)?;
         Ok(())
     }
 }

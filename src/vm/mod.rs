@@ -8,10 +8,11 @@ use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
     alloc_closure, alloc_dict, alloc_exception, alloc_exception_class, alloc_function,
-    alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, alloc_upvalue,
-    read_closure, read_dict, read_exception, read_exception_class, read_exception_mut,
-    read_function, read_iterator, read_list, read_set, read_str, read_tuple, read_upvalue,
-    CmpOp, DictMap, Function, MsException, MsObjHeader, MsUpvalue, Object, TypeTag,
+    alloc_generator, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple,
+    alloc_upvalue, read_closure, read_dict, read_exception, read_exception_class,
+    read_exception_mut, read_function, read_generator, read_generator_mut, read_iterator,
+    read_list, read_set, read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function,
+    GeneratorState, MsException, MsGenerator, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -25,6 +26,12 @@ pub const MAX_CALL_DEPTH: usize = 1000;
 #[derive(Clone)]
 pub struct DeferEntry {
     pub call_tuple: Object,
+}
+
+/// task 39：生成器恢复执行的结果。YIELD 产出值或自然结束/close 耗尽。
+enum GenOutcome {
+    Yielded(Object),
+    Exhausted,
 }
 
 /// 异常处理器条目（task 37）。与 defer_stack 一样按帧分区，但用 frame_stack_base
@@ -96,6 +103,12 @@ pub struct VM {
     /// 需要运行 closure defer 时「泊车」（压 defer 帧后返回主循环），主循环顶部检测到
     /// pending_unwind + 当前帧 defer_flushing 时重新调用 drive_unwind 续行。
     pending_unwind: Option<Object>,
+    /// task 39：生成器恢复结果的传输槽。YIELD / generator_return 写入，
+    /// run_until_generator_yield 读取。每次 resume 前清空。
+    gen_outcome: Option<GenOutcome>,
+    /// task 39：GET_ATTR 对 GENERATOR 解析 __next__/close/__iter__ 时写入待调用方法 id，
+    /// CALL（call_value）对 GENERATOR 被调用者读取并清空。1=__next__，2=close，3=__iter__。
+    gen_call_method: Option<u8>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
@@ -114,6 +127,8 @@ impl VM {
             defer_stack: Vec::new(),
             exception_handlers: Vec::new(),
             pending_unwind: None,
+            gen_outcome: None,
+            gen_call_method: None,
             heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
@@ -132,11 +147,14 @@ impl VM {
             default_values: Vec::new(),
             has_variadic: false,
             required_arity: 0,
+            is_generator: false,
+            locals_count: 1,
         };
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
         };
-        self.call_stack.push(CallFrame::new(closure_ptr, 0, self.defer_stack.len()));
+        self.call_stack
+            .push(CallFrame::new(closure_ptr, 0, self.defer_stack.len()));
         self.run()
     }
 }
@@ -530,9 +548,38 @@ impl VM {
         let callee_idx = self.stack.len() - argc - 1;
         let callee = self.stack[callee_idx].clone();
         match &callee {
-            Object::Ref(ptr)
-                if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 =>
-            {
+            // task 39: GENERATOR 方法调用（gen.__next__() / gen.close() / gen.__iter__()）。
+            // GET_ATTR 已设置 gen_call_method 并把 gen 压回栈顶作为 callee。
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8 => {
+                let method_id = self
+                    .gen_call_method
+                    .take()
+                    .ok_or("TypeError: 'generator' object is not directly callable")?;
+                self.stack.truncate(callee_idx);
+                match method_id {
+                    1 => match self.resume_generator(*ptr)? {
+                        Some(v) => self.push(v)?,
+                        None => {
+                            let exc = alloc_exception(
+                                "StopIteration",
+                                alloc_string("generator exhausted"),
+                                alloc_string(""),
+                                Object::Nil,
+                            );
+                            return self.throw(exc);
+                        }
+                    },
+                    2 => {
+                        self.close_generator(*ptr)?;
+                        self.push(Object::Nil)?;
+                    }
+                    3 => {
+                        self.push(callee)?;
+                    }
+                    _ => unreachable!("invalid gen_call_method id"),
+                }
+            }
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::FUNCTION as u8 => {
                 // 读出函数指针与参数个数信息（借用堆对象，不借用 self）。
                 let (func, arity, name) = {
                     debug_assert!(!ptr.is_null(), "null Object::Ref");
@@ -559,9 +606,7 @@ impl VM {
                 self.push(result)?;
             }
             // 用户函数（task 27/31）：CLOSURE 分支。支持默认参数与可变参数。
-            Object::Ref(ptr)
-                if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
-            {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 => {
                 // 读出 arity / required_arity / has_variadic / func_ptr（不借用 self）。
                 let (arity, required_arity, has_variadic, func_ptr) = {
                     debug_assert!(!ptr.is_null(), "null Object::Ref");
@@ -618,6 +663,14 @@ impl VM {
                     }
                 }
 
+                // task 39: is_generator 预检 — 默认值/可变参数已填充完毕，
+                // 此时栈上 callee + argc 个值即为生成器帧的初始快照。
+                let is_generator = unsafe { read_function(func_ptr) }.function.is_generator;
+                if is_generator {
+                    let final_argc = self.stack.len() - callee_idx - 1;
+                    return self.call_generator(*ptr, final_argc);
+                }
+
                 // stack_base = callee_idx：slot 0 = callee（closure 自身），
                 // 参数在 slot 1..（与 compile_fn_decl 的 slot-0 预留约定自洽）。
                 // defer_stack_base = 当前 defer 栈长度，按帧分区隔离嵌套调用的 defer。
@@ -627,9 +680,7 @@ impl VM {
             // task 37：异常类对象（EXCEPTION_CLASS）— `ValueError("msg")` 等构造调用。
             // 参数约定：第 1 个实参为 message（无参则 message = nil）。多余实参暂忽略
             // （Phase 5 经 __init__ 处理）。构造 MsException 并替换 callee+args。
-            Object::Ref(ptr)
-                if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION_CLASS as u8 =>
-            {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION_CLASS as u8 => {
                 let cls_name = unsafe { read_exception_class(*ptr) }.name.clone();
                 let message = if argc >= 1 {
                     self.stack[callee_idx + 1].clone()
@@ -656,6 +707,179 @@ impl VM {
 }
 
 // ---------------------------------------------------------------------------
+// task 39：生成器（创建 / 恢复 / yield / yield from / close）
+// ---------------------------------------------------------------------------
+
+impl VM {
+    /// CALL 检测到 is_generator 函数：不执行函数体，创建 MsGenerator 并压栈。
+    /// `argc` 为栈上 callee 之上的实参数（默认值已由 call_value 填充）。
+    fn call_generator(&mut self, closure_ptr: *mut MsObjHeader, argc: usize) -> Result<(), String> {
+        // V1：显式栈下溢校验。
+        if argc + 1 > self.stack.len() {
+            return Err("stack underflow in call_generator".into());
+        }
+        let callee_idx = self.stack.len() - argc - 1;
+        let initial_stack: Vec<Object> = self.stack[callee_idx..callee_idx + argc + 1].to_vec();
+
+        let func_ptr = unsafe { read_closure(closure_ptr) }.function;
+        // V6/R6：locals_count 上限校验。
+        const MAX_GENERATOR_LOCALS: usize = 65536;
+        let locals_count = unsafe { read_function(func_ptr) }.function.locals_count;
+        if locals_count > MAX_GENERATOR_LOCALS {
+            return Err(format!(
+                "generator locals_count {} exceeds MAX_GENERATOR_LOCALS {}",
+                locals_count, MAX_GENERATOR_LOCALS
+            ));
+        }
+
+        let frame = CallFrame {
+            closure: closure_ptr,
+            ip: 0,
+            stack_base: callee_idx,
+            defer_stack_base: self.defer_stack.len(),
+            defer_flushing: false,
+            current_exc: None,
+            gen_owner: None,
+        };
+        let generator = MsGenerator::new(frame, initial_stack);
+
+        // 弹出 callee + args，压入 Generator。
+        for _ in 0..=argc {
+            self.stack.pop();
+        }
+        self.push(alloc_generator(generator))?;
+        Ok(())
+    }
+
+    /// 恢复生成器：把 stack_snapshot 拷回主栈、push 生成器 CallFrame、置 Running。
+    fn push_generator_frame(&mut self, gen_ptr: *mut MsObjHeader) {
+        {
+            let gen = unsafe { read_generator_mut(gen_ptr) };
+            gen.state = GeneratorState::Running;
+        }
+        let (frame, snapshot) = {
+            let gen = unsafe { read_generator_mut(gen_ptr) };
+            (gen.frame.clone(), std::mem::take(&mut gen.stack_snapshot))
+        };
+        let new_base = self.stack.len();
+        for v in snapshot {
+            self.stack.push(v);
+        }
+        let mut new_frame = frame;
+        new_frame.stack_base = new_base;
+        new_frame.gen_owner = Some(gen_ptr);
+        self.call_stack.push(new_frame);
+    }
+
+    /// yield / 结束时：把当前帧的 [stack_base..stack_top) 拷回生成器快照、pop 帧。
+    fn pop_generator_frame(&mut self, gen_ptr: *mut MsObjHeader) {
+        let frame = self.call_stack.pop().expect("no generator frame to pop");
+        let stack_base = frame.stack_base;
+        let snapshot: Vec<Object> = self.stack[stack_base..].to_vec();
+        self.stack.truncate(stack_base);
+        let gen = unsafe { read_generator_mut(gen_ptr) };
+        gen.frame.ip = frame.ip;
+        gen.frame.defer_stack_base = frame.defer_stack_base;
+        gen.frame.current_exc = frame.current_exc;
+        gen.frame.defer_flushing = frame.defer_flushing;
+        gen.stack_snapshot = snapshot;
+    }
+
+    /// 恢复生成器执行直至 YIELD（返回 Some(value)）或结束（返回 None）。
+    fn resume_generator(&mut self, gen_ptr: *mut MsObjHeader) -> Result<Option<Object>, String> {
+        let state = unsafe { read_generator(gen_ptr) }.state;
+        match state {
+            GeneratorState::Exhausted => return Ok(None),
+            GeneratorState::Running => {
+                return Err("RuntimeError: generator already executing".into())
+            }
+            GeneratorState::Suspended => {}
+        }
+        self.push_generator_frame(gen_ptr);
+        let caller_depth = self.call_stack.len() - 1;
+        self.gen_outcome = None;
+        self.run_loop(Some(caller_depth))?;
+        Ok(match self.gen_outcome.take() {
+            Some(GenOutcome::Yielded(v)) => Some(v),
+            _ => None,
+        })
+    }
+
+    /// 从 gen.receiver 取下一个值；有值则按 YIELD 流程产出、耗尽则清 receiver 继续。
+    fn yield_from_step(&mut self, gen_ptr: *mut MsObjHeader) -> Result<(), String> {
+        let sub_iter_ptr = unsafe { read_generator(gen_ptr) }
+            .receiver
+            .ok_or("internal: yield_from_step with no receiver")?;
+        let tag = unsafe { (*sub_iter_ptr).type_tag };
+        let next: Option<Object> = if tag == TypeTag::ITERATOR as u8 {
+            unsafe { read_iterator(sub_iter_ptr) }.state.next()
+        } else if tag == TypeTag::GENERATOR as u8 {
+            self.resume_generator(sub_iter_ptr)?
+        } else {
+            return Err("yield from receiver corrupted".into());
+        };
+        match next {
+            Some(value) => {
+                self.pop_generator_frame(gen_ptr);
+                unsafe { read_generator_mut(gen_ptr) }.state = GeneratorState::Suspended;
+                self.gen_outcome = Some(GenOutcome::Yielded(value));
+            }
+            None => {
+                unsafe { read_generator_mut(gen_ptr) }.receiver = None;
+                self.push(Object::Nil)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 显式 gen.close() / GC finalizer：注入 GeneratorExit 并恢复，触发 defer/finally。
+    fn close_generator(&mut self, gen_ptr: *mut MsObjHeader) -> Result<(), String> {
+        let state = unsafe { read_generator(gen_ptr) }.state;
+        match state {
+            GeneratorState::Exhausted => return Ok(()),
+            GeneratorState::Running => {
+                return Err("RuntimeError: generator already executing".into())
+            }
+            GeneratorState::Suspended => {}
+        }
+        unsafe { read_generator_mut(gen_ptr) }.gen_exit_pending = true;
+        let res =
+            self.resume_generator_with_exception(gen_ptr, "GeneratorExit", "generator closed");
+        // 无论内部控制流如何，close 后一律置 Exhausted（A1）。
+        let gen = unsafe { read_generator_mut(gen_ptr) };
+        gen.state = GeneratorState::Exhausted;
+        gen.gen_exit_pending = false;
+        res
+    }
+
+    /// 注入异常并恢复生成器执行。复用 throw()/drive_unwind：GeneratorExit 不可被用户
+    /// except 捕获，跑完 defer/finally 后在生成器帧边界被 drive_unwind 拦截（置 Exhausted）。
+    fn resume_generator_with_exception(
+        &mut self,
+        gen_ptr: *mut MsObjHeader,
+        class_name: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        let exc = alloc_exception(
+            class_name,
+            alloc_string(message),
+            alloc_string(""),
+            Object::Nil,
+        );
+        self.push_generator_frame(gen_ptr);
+        let caller_depth = self.call_stack.len() - 1;
+        self.gen_outcome = None;
+        // throw 在生成器帧内找 handler（GeneratorExit 不可捕获），驱动 defer/finally。
+        self.throw(exc)?;
+        // throw 可能泊车（闭包 defer）或已弹出生成器帧；仍存在则继续驱动至帧弹出。
+        if self.call_stack.len() > caller_depth {
+            self.run_loop(Some(caller_depth))?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // task 37：异常处理（异常类注册、throw、CATCH 匹配、finally-on-propagation）
 // ---------------------------------------------------------------------------
 
@@ -674,7 +898,10 @@ impl VM {
         let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
         let constants = unsafe {
             let closure = read_closure(frame.closure);
-            read_function(closure.function).function.constants.as_slice()
+            read_function(closure.function)
+                .function
+                .constants
+                .as_slice()
         };
         let val = constants
             .get(idx)
@@ -731,14 +958,9 @@ impl VM {
     where
         F: FnOnce(&MsException) -> Object,
     {
-        let frame = self
-            .call_stack
-            .last()
-            .ok_or("no call frame".to_string())?;
+        let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
         Ok(match &frame.current_exc {
-            Some(Object::Ref(ptr))
-                if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
-            {
+            Some(Object::Ref(ptr)) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
                 extractor(unsafe { read_exception(*ptr) })
             }
             _ => Object::Nil,
@@ -771,10 +993,11 @@ impl VM {
         // 取出「当前正在传播/处理的异常」作为 __cause__ 链源：
         //  - pending_unwind：unwind 途中某 defer 抛了新异常（规则 1/4）。
         //  - current_exc：finally 块内抛新异常，覆盖进入 finally 时的原异常（规则 §6）。
-        let cause = self
-            .pending_unwind
-            .take()
-            .or_else(|| self.call_stack.last_mut().and_then(|f| f.current_exc.take()));
+        let cause = self.pending_unwind.take().or_else(|| {
+            self.call_stack
+                .last_mut()
+                .and_then(|f| f.current_exc.take())
+        });
         if let Some(c) = cause {
             self.set_cause(&err, c);
         }
@@ -817,9 +1040,7 @@ impl VM {
                 let entry = self.defer_stack.pop().unwrap();
                 // 拆开 call_tuple = (callee, arg1, ..., argN)。
                 let items = match &entry.call_tuple {
-                    Object::Ref(ptr)
-                        if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 =>
-                    {
+                    Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
                         unsafe { read_tuple(*ptr) }.clone()
                     }
                     _ => return Err("internal: defer call_tuple is not a tuple".into()),
@@ -873,6 +1094,26 @@ impl VM {
 
             // (c) 本帧无 handler：关闭 upvalue，pop frame，续传外层帧。
             self.close_upvalues_from(frame_stack_base);
+            // task 39: 生成器帧边界 — 保存快照、置 Exhausted。
+            // GeneratorExit 在此停止传播（不可越界到调用者帧）；其他异常也停止
+            // 传播（生成器内未捕获异常导致生成器终止，异常以 Err 返回）。
+            let gen_owner = self.call_stack.last().unwrap().gen_owner;
+            if let Some(gen_ptr) = gen_owner {
+                self.pop_generator_frame(gen_ptr);
+                unsafe { read_generator_mut(gen_ptr) }.state = GeneratorState::Exhausted;
+                let is_gen_exit = match &err {
+                    Object::Ref(e_ptr)
+                        if unsafe { (**e_ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
+                    {
+                        unsafe { read_exception(*e_ptr) }.class_name == "GeneratorExit"
+                    }
+                    _ => false,
+                };
+                if is_gen_exit {
+                    return Ok(());
+                }
+                return Err(self.format_uncaught_error(&err));
+            }
             if self.call_stack.len() > 1 {
                 self.stack.truncate(frame_stack_base);
                 self.call_stack.pop();
@@ -885,22 +1126,39 @@ impl VM {
 
 impl VM {
     fn run(&mut self) -> Result<Object, String> {
+        self.run_loop(None)
+    }
+
+    /// 主解释循环。`stop_depth = None` 为顶层模式（执行至 HALT / 顶层 RETURN）；
+    /// `Some(d)` 为生成器驱动模式（task 39）：当调用栈缩回 `d`（生成器帧被 YIELD 或
+    /// 结束弹出）时立即返回。生成器恢复结果经 `gen_outcome` 字段回传。
+    fn run_loop(&mut self, stop_depth: Option<usize>) -> Result<Object, String> {
         loop {
+            // task 39：生成器驱动模式 — 生成器帧弹出即返回（结果在 gen_outcome）。
+            if let Some(d) = stop_depth {
+                if self.call_stack.len() <= d {
+                    return Ok(Object::Nil);
+                }
+            }
+
             // task 37：unwind 续行——若待传播异常存在且当前帧正处于 defer 刷新
             // （说明一个 closure defer 帧刚弹出回到 unwind 帧），则推进 drive_unwind。
             // 首次 throw 在 handler 内已调用 drive_unwind；这里仅处理泊车后续行。
             if self.pending_unwind.is_some()
-                && self
-                    .call_stack
-                    .last()
-                    .is_some_and(|f| f.defer_flushing)
+                && self.call_stack.last().is_some_and(|f| f.defer_flushing)
             {
                 self.drive_unwind()?;
             }
 
             // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
             // 0，此调用为 no-op；接入后在此按阈值触发 minor/major GC（STW）。
-            gc::maybe_gc(&mut self.heap, &mut self.stack, &mut self.globals, &mut self.defer_stack, &mut self.call_stack);
+            gc::maybe_gc(
+                &mut self.heap,
+                &mut self.stack,
+                &mut self.globals,
+                &mut self.defer_stack,
+                &mut self.call_stack,
+            );
 
             let opcode_byte = self.read_byte()?;
             let opcode = OpCode::from_byte(opcode_byte)
@@ -940,9 +1198,6 @@ impl VM {
                         .stack_base
                         .checked_add(slot)
                         .ok_or_else(|| "local slot overflow".to_string())?;
-                    // task 28：新局部变量声明时（VarDecl/compile_var_decl），slot 尚不存在
-                    // 于栈上（StoreLocal 先 pop 再写）。以 Nil 填充至 idx 保证写入成功。
-                    // 已有 slot（赋值/复合赋值）不受影响：while 条件为 false，直接覆写。
                     while self.stack.len() <= idx {
                         self.stack.push(Object::Nil);
                     }
@@ -1224,9 +1479,15 @@ impl VM {
                 // 编译器在 for..in 头部发射（statement.rs:329）。
                 OpCode::Iterator => {
                     let iterable = self.pop()?;
-                    let iter_state =
-                        to_iterator(&iterable).map_err(|e| format!("RuntimeError: {}", e))?;
-                    self.push(alloc_iterator(iter_state))?;
+                    let is_gen = matches!(&iterable,
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8);
+                    if is_gen {
+                        self.push(iterable)?;
+                    } else {
+                        let iter_state =
+                            to_iterator(&iterable).map_err(|e| format!("RuntimeError: {}", e))?;
+                        self.push(alloc_iterator(iter_state))?;
+                    }
                 }
 
                 // FOR_ITER（task 32 修订）：迭代器存储在局部 slot（非栈顶）。
@@ -1245,24 +1506,118 @@ impl VM {
                     if location >= self.stack.len() {
                         return Err("RuntimeError: FOR_ITER slot out of range".to_string());
                     }
-                    let next_val: Option<Object> = {
-                        match &mut self.stack[location] {
-                            Object::Ref(ptr)
-                                if unsafe { (**ptr).type_tag } == TypeTag::ITERATOR as u8 =>
-                            {
-                                unsafe { read_iterator(*ptr) }.state.next()
+                    let gen_ptr = match &self.stack[location] {
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8 =>
+                        {
+                            Some(*ptr)
+                        }
+                        _ => None,
+                    };
+                    if let Some(gp) = gen_ptr {
+                        match self.resume_generator(gp)? {
+                            Some(value) => self.push(value)?,
+                            None => {
+                                self.call_stack.last_mut().unwrap().ip += offset;
                             }
-                            _ => return Err("RuntimeError: not an iterator".to_string()),
+                        }
+                    } else {
+                        let next_val: Option<Object> = {
+                            match &mut self.stack[location] {
+                                Object::Ref(ptr)
+                                    if unsafe { (**ptr).type_tag } == TypeTag::ITERATOR as u8 =>
+                                {
+                                    unsafe { read_iterator(*ptr) }.state.next()
+                                }
+                                _ => return Err("RuntimeError: not an iterator".to_string()),
+                            }
+                        };
+                        match next_val {
+                            Some(v) => self.push(v)?,
+                            None => {
+                                self.call_stack.last_mut().unwrap().ip += offset;
+                            }
+                        }
+                    }
+                }
+
+                // YIELD（task 39）：弹出产出值，保存生成器帧快照，置 Suspended，
+                // 把值压入调用者栈。gen_outcome 通知 resume_generator 的 run_loop 返回。
+                OpCode::Yield => {
+                    let value = self.pop()?;
+                    let gen_ptr = self
+                        .call_stack
+                        .last()
+                        .ok_or("no frame")?
+                        .gen_owner
+                        .ok_or("YIELD outside generator frame")?;
+                    self.push(Object::Nil)?;
+                    self.pop_generator_frame(gen_ptr);
+                    unsafe { read_generator_mut(gen_ptr) }.state = GeneratorState::Suspended;
+                    self.gen_outcome = Some(GenOutcome::Yielded(value));
+                }
+
+                // YIELD_FROM（task 39）：弹出可迭代对象，转为子迭代器存入 gen.receiver，
+                // 立即经 yield_from_step 产出首个值（或子迭代器为空时 fall-through）。
+                OpCode::YieldFrom => {
+                    let iterable = self.pop()?;
+                    let gen_ptr = self
+                        .call_stack
+                        .last()
+                        .ok_or("no frame")?
+                        .gen_owner
+                        .ok_or("YIELD_FROM outside generator frame")?;
+                    let sub_iter = match &iterable {
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8 =>
+                        {
+                            iterable
+                        }
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::ITERATOR as u8 =>
+                        {
+                            iterable
+                        }
+                        _ => {
+                            let is = to_iterator(&iterable)
+                                .map_err(|e| format!("RuntimeError: {}", e))?;
+                            alloc_iterator(is)
                         }
                     };
-                    match next_val {
-                        Some(v) => self.push(v)?,
-                        None => {
-                            let frame = self
-                                .call_stack
-                                .last_mut()
-                                .ok_or("no call frame".to_string())?;
-                            frame.ip += offset;
+                    let sub_ptr = match sub_iter {
+                        Object::Ref(r) => r,
+                        _ => return Err("yield from requires an iterable".into()),
+                    };
+                    unsafe { read_generator_mut(gen_ptr) }.receiver = Some(sub_ptr);
+                    self.yield_from_step(gen_ptr)?;
+                }
+
+                // YIELD_FROM_RESUME（task 39）：yield-from 的配套恢复指令。
+                // 生成器被恢复时从此处继续：若 receiver 仍有值则再次 yield，否则 fall-through。
+                //
+                // IP 管理：read_byte 已将 IP 推进到本指令之后。若有 receiver，先将 IP 回退
+                // 1 字节（指回 YIELD_FROM_RESUME），再调 yield_from_step。这样：
+                // — Some(value)：pop_generator_frame 保存的 IP = YIELD_FROM_RESUME，
+                //   下次恢复时重新执行本指令，形成迭代循环。
+                // — None：yield_from_step 推 Nil 后正常返回，IP += 1 跳过本指令继续执行。
+                //
+                // 关键：Some 情况下 yield_from_step 内部 pop_generator_frame 弹出生成器帧，
+                // 此时 self.call_stack.last() 已变为调用者帧。若无条件执行 ip += 1 会
+                // 破坏调用者 IP。故仅在帧未弹出（None 情况）时才前进 IP。
+                OpCode::YieldFromResume => {
+                    let gen_ptr = self
+                        .call_stack
+                        .last()
+                        .ok_or("no frame")?
+                        .gen_owner
+                        .ok_or("YIELD_FROM_RESUME outside generator frame")?;
+                    let has_receiver = unsafe { read_generator(gen_ptr) }.receiver.is_some();
+                    if has_receiver {
+                        let depth_before = self.call_stack.len();
+                        self.call_stack.last_mut().unwrap().ip -= 1;
+                        self.yield_from_step(gen_ptr)?;
+                        if self.call_stack.len() == depth_before {
+                            self.call_stack.last_mut().unwrap().ip += 1;
                         }
                     }
                 }
@@ -1567,10 +1922,25 @@ impl VM {
                     self.call_value(argc)?;
                 }
 
-                // RETURN（task 27/28/36）：弹出返回值，关闭本帧开放上值，恢复调用者帧，截断值栈。
+                // RETURN（task 27/28/36/39）：弹出返回值，关闭本帧开放上值，恢复调用者帧，截断值栈。
                 // defer 已由编译端在 RETURN 前 emit 的 EXEC_DEFER 执行完毕，本帧 defer 区间为空。
+                // task 39：生成器帧的 RETURN 走 generator_return 路径（丢弃返回值、置 Exhausted）。
                 OpCode::Return => {
+                    let gen_owner = self
+                        .call_stack
+                        .last()
+                        .ok_or("return outside function".to_string())?
+                        .gen_owner;
                     let return_value = self.stack.pop().unwrap_or(Object::Nil);
+                    if let Some(gen_ptr) = gen_owner {
+                        let old_base = self.call_stack.last().unwrap().stack_base;
+                        self.close_upvalues_from(old_base);
+                        self.pop_generator_frame(gen_ptr);
+                        unsafe { read_generator_mut(gen_ptr) }.state = GeneratorState::Exhausted;
+                        self.gen_outcome = Some(GenOutcome::Exhausted);
+                        let _ = return_value;
+                        return Ok(Object::Nil);
+                    }
                     let old_base = self
                         .call_stack
                         .last()
@@ -1605,10 +1975,7 @@ impl VM {
                 // 独立，避免 defer callee 自身的（空）EXEC_DEFER 误触发弹栈。
                 OpCode::ExecDefer => {
                     let (base, was_flushing) = {
-                        let frame = self
-                            .call_stack
-                            .last()
-                            .ok_or("no call frame".to_string())?;
+                        let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
                         (frame.defer_stack_base, frame.defer_flushing)
                     };
                     // 上一个 defer 调用刚完成（native 同步或闭包帧弹回），丢弃其返回值。
@@ -1671,7 +2038,8 @@ impl VM {
                         }
                         _ => {
                             return Err(
-                                "TypeError: exceptions must derive from Error or be a string".into()
+                                "TypeError: exceptions must derive from Error or be a string"
+                                    .into(),
                             )
                         }
                     };
@@ -1682,10 +2050,7 @@ impl VM {
                 OpCode::TryEnter => {
                     let handler_offset = self.read_u16()? as usize;
                     let finally_raw = self.read_u16()?;
-                    let frame = self
-                        .call_stack
-                        .last()
-                        .ok_or("no call frame".to_string())?;
+                    let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
                     let catch_address = frame.ip + handler_offset;
                     let finally_address = if finally_raw == 0xFFFF {
                         None
@@ -1718,10 +2083,7 @@ impl VM {
                 // RETHROW：重抛当前帧 current_exc（裸 throw）；为空抛 nothing to rethrow。
                 OpCode::Rethrow => {
                     let err = {
-                        let frame = self
-                            .call_stack
-                            .last()
-                            .ok_or("no call frame".to_string())?;
+                        let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
                         frame.current_exc.clone()
                     };
                     match err {
@@ -1790,12 +2152,38 @@ impl VM {
                     self.push(val)?;
                 }
 
-                // GET_ATTR（task 37）：处理 EXCEPTION / DICT 对象的属性访问；
+                // GET_ATTR（task 37/39）：处理 GENERATOR / EXCEPTION / DICT 对象的属性访问；
                 // Instance 等其余类型留待 task 41/43。
                 OpCode::GetAttr => {
                     let name_idx = self.read_u16()? as usize;
                     let attr = self.read_string_constant(name_idx)?;
                     let obj = self.pop()?;
+                    // task 39: GENERATOR 方法分派 — 设置 gen_call_method，push gen 自身。
+                    let handled_gen = if let Object::Ref(ptr) = &obj {
+                        if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8 {
+                            let method_id: u8 = match attr.as_str() {
+                                "__next__" => 1,
+                                "close" => 2,
+                                "__iter__" => 3,
+                                _ => {
+                                    return Err(format!(
+                                        "AttributeError: 'generator' has no attribute '{}'",
+                                        attr
+                                    ))
+                                }
+                            };
+                            self.gen_call_method = Some(method_id);
+                            self.push(obj.clone())?;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if handled_gen {
+                        continue;
+                    }
                     match &obj {
                         // [task 38 临时] Dict 属性访问：等价于 dict[attr]，键不存在返回 nil。
                         // Phase 5 task 41/43 由 Instance 接管，本分支删除。
@@ -1903,8 +2291,8 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::vm::object::{
-        alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, DictMap,
-        IteratorState, Object,
+        alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, read_list,
+        DictMap, IteratorState, Object,
     };
     use std::collections::HashSet;
 
@@ -1919,6 +2307,17 @@ mod tests {
         let chunk = compiler.compile(&program).unwrap();
         let mut vm = VM::new();
         vm.interpret(chunk)
+    }
+
+    fn i(n: i64) -> Object {
+        Object::Int(n)
+    }
+
+    fn to_list(obj: &Object) -> Vec<Object> {
+        match obj {
+            Object::Ref(ptr) => unsafe { read_list(*ptr) }.clone(),
+            _ => panic!("expected list, got {:?}", obj),
+        }
     }
 
     // 合成字节码测试：直接构造 Chunk 验证单个 opcode 语义，绕开编译器
@@ -3912,6 +4311,8 @@ mod tests {
             default_values: Vec::new(),
             has_variadic: false,
             required_arity: 2,
+            is_generator: false,
+            locals_count: 1,
         };
         let func_obj = alloc_function(func);
         let Object::Ref(func_ptr) = func_obj else {
@@ -5388,7 +5789,11 @@ fn run() {
 run()
 "#;
         let r = compile_and_run(src);
-        assert!(r.is_ok(), "try/except/finally full sequence failed: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "try/except/finally full sequence failed: {:?}",
+            r.err()
+        );
     }
 
     /// 子类匹配（验证标准 6）：ValueError 被 except Error 捕获。
@@ -5474,8 +5879,14 @@ try {
             let mut compiler = Compiler::new();
             compiler.compile(&program).unwrap()
         };
-        assert!(chunk.code.contains(&(OpCode::TryEnter as u8)), "missing TRY_ENTER");
-        assert!(chunk.code.contains(&(OpCode::TryExit as u8)), "missing TRY_EXIT");
+        assert!(
+            chunk.code.contains(&(OpCode::TryEnter as u8)),
+            "missing TRY_ENTER"
+        );
+        assert!(
+            chunk.code.contains(&(OpCode::TryExit as u8)),
+            "missing TRY_EXIT"
+        );
         assert!(chunk.code.contains(&(OpCode::Catch as u8)), "missing CATCH");
         assert!(chunk.code.contains(&(OpCode::Throw as u8)), "missing THROW");
         assert!(
@@ -5573,7 +5984,11 @@ fn run() {
 run()
 "#;
         let r = compile_and_run(src);
-        assert!(r.is_ok(), "with as-binding visibility failed: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "with as-binding visibility failed: {:?}",
+            r.err()
+        );
     }
 
     /// with body 抛异常：__exit__ 收到 err_type，异常继续传播被外层捕获（标准 4）。
@@ -5612,7 +6027,11 @@ fn run() {
 run()
 "#;
         let r = compile_and_run(src);
-        assert!(r.is_ok(), "with exception propagation failed: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "with exception propagation failed: {:?}",
+            r.err()
+        );
     }
 
     /// __exit__ 返回 true 抑制异常（标准 5）。
@@ -5779,7 +6198,11 @@ fn run() {
 run()
 "#;
         let r = compile_and_run(src);
-        assert!(r.is_ok(), "with cross-with propagation failed: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "with cross-with propagation failed: {:?}",
+            r.err()
+        );
     }
 
     /// 内层 __exit__ 抑制 → 外层 __exit__ 收到 nil（异常未传播到外层，标准 9）。
@@ -5861,7 +6284,11 @@ fn run() {
 run()
 "#;
         let r = compile_and_run(src);
-        assert!(r.is_ok(), "with exit-throws cause chain failed: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "with exit-throws cause chain failed: {:?}",
+            r.err()
+        );
     }
 
     /// with body 内 defer：异常路径下 defer 先于 __exit__（标准 11）。
@@ -5982,5 +6409,253 @@ run()
 "#;
         let r = compile_and_run(src);
         assert!(r.is_ok(), "with early-exit no-leak failed: {:?}", r.err());
+    }
+
+    // ---- task 39: 生成器与 yield ----
+
+    #[test]
+    fn test_generator_basic_for_in() {
+        let src = r#"
+fn countdown(n) {
+    while n > 0 {
+        yield n
+        n = n - 1
+    }
+}
+r = [x for x in countdown(5)]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(5), i(4), i(3), i(2), i(1)]);
+    }
+
+    #[test]
+    fn test_generator_next_method() {
+        let src = r#"
+fn gen3() {
+    yield 10
+    yield 20
+    yield 30
+}
+g = gen3()
+r = [g.__next__(), g.__next__(), g.__next__()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(10), i(20), i(30)]);
+    }
+
+    #[test]
+    fn test_generator_stop_iteration() {
+        let src = r#"
+fn gen1() {
+    yield 1
+}
+g = gen1()
+g.__next__()
+caught = false
+try {
+    g.__next__()
+} except StopIteration {
+    caught = true
+}
+caught
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(r, Object::Bool(true));
+    }
+
+    #[test]
+    fn test_generator_fibonacci() {
+        let src = r#"
+fn fibonacci() {
+    a, b = 0, 1
+    while true {
+        yield a
+        a, b = b, a + b
+    }
+}
+fib = fibonacci()
+r = [fib.__next__(), fib.__next__(), fib.__next__(), fib.__next__(), fib.__next__(), fib.__next__()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(0), i(1), i(1), i(2), i(3), i(5)]);
+    }
+
+    #[test]
+    fn test_generator_yield_from_list() {
+        let src = r#"
+fn gen() {
+    yield 1
+    yield from [2, 3, 4]
+    yield 5
+}
+r = [x for x in gen()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(1), i(2), i(3), i(4), i(5)]);
+    }
+
+    #[test]
+    fn test_generator_yield_from_range() {
+        let src = r#"
+fn gen() {
+    yield from range(3)
+}
+r = [x for x in gen()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(0), i(1), i(2)]);
+    }
+
+    #[test]
+    fn test_generator_yield_from_generator() {
+        let src = r#"
+fn inner() {
+    yield 10
+    yield 20
+}
+fn outer() {
+    yield 1
+    yield from inner()
+    yield 2
+}
+r = [x for x in outer()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(1), i(10), i(20), i(2)]);
+    }
+
+    #[test]
+    fn test_generator_close() {
+        let src = r#"
+fn gen() {
+    yield 1
+    yield 2
+}
+g = gen()
+g.__next__()
+g.close()
+caught = false
+try {
+    g.__next__()
+} except StopIteration {
+    caught = true
+}
+caught
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(r, Object::Bool(true));
+    }
+
+    #[test]
+    fn test_generator_bare_yield() {
+        let src = r#"
+fn gen() {
+    yield
+    yield
+}
+g = gen()
+r = [g.__next__(), g.__next__()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![Object::Nil, Object::Nil]);
+    }
+
+    #[test]
+    fn test_generator_return_discards_value() {
+        let src = r#"
+fn gen() {
+    yield 1
+    return 999
+}
+g = gen()
+g.__next__()
+caught = false
+try {
+    g.__next__()
+} except StopIteration {
+    caught = true
+}
+caught
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(r, Object::Bool(true));
+    }
+
+    #[test]
+    fn test_generator_expression_basic() {
+        let src = r#"
+squares = (x * x for x in range(5))
+r = [x for x in squares]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(0), i(1), i(4), i(9), i(16)]);
+    }
+
+    #[test]
+    fn test_generator_expression_filtered() {
+        let src = r#"
+nums = [1, -2, 3, -4, 5]
+positives = (x for x in nums if x > 0)
+r = [x for x in positives]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(1), i(3), i(5)]);
+    }
+
+    #[test]
+    fn test_generator_expression_upvalue_capture() {
+        let src = r#"
+mult = 10
+gen = (x * mult for x in range(3))
+r = [x for x in gen]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(0), i(10), i(20)]);
+    }
+
+    #[test]
+    fn test_generator_multiple_unique_names() {
+        let src1 = r#"
+g1 = (x for x in range(3))
+r1 = [v for v in g1]
+r1
+"#;
+        let src2 = r#"
+g2 = (x * x for x in range(3))
+r2 = [v for v in g2]
+r2
+"#;
+        let r1 = compile_and_run(src1).unwrap();
+        assert_eq!(to_list(&r1), vec![i(0), i(1), i(2)]);
+        let r2 = compile_and_run(src2).unwrap();
+        assert_eq!(to_list(&r2), vec![i(0), i(1), i(4)]);
+    }
+
+    #[test]
+    fn test_generator_make_counter() {
+        let src = r#"
+fn make_counter(start) {
+    n = start
+    while true {
+        yield n
+        n += 1
+    }
+}
+c = make_counter(100)
+r = [c.__next__(), c.__next__(), c.__next__()]
+r
+"#;
+        let r = compile_and_run(src).unwrap();
+        assert_eq!(to_list(&r), vec![i(100), i(101), i(102)]);
     }
 }
