@@ -7,13 +7,13 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_class, alloc_closure, alloc_dict, alloc_exception, alloc_exception_class, alloc_function,
-    alloc_generator, alloc_instance, alloc_iterator, alloc_list, alloc_set, alloc_string,
-    alloc_tuple, alloc_upvalue, read_class, read_closure, read_dict, read_exception,
-    read_exception_class, read_exception_mut, read_function, read_generator, read_generator_mut,
-    read_instance, read_iterator, read_list, read_set, read_str, read_tuple, read_upvalue, CmpOp,
-    DictMap, Function, GeneratorState, MsException, MsGenerator, MsObjHeader, MsUpvalue, Object,
-    TypeTag,
+    alloc_bound_method, alloc_class, alloc_closure, alloc_dict, alloc_exception,
+    alloc_exception_class, alloc_function, alloc_generator, alloc_instance, alloc_iterator,
+    alloc_list, alloc_set, alloc_string, alloc_tuple, alloc_upvalue, read_bound_method, read_class,
+    read_closure, read_dict, read_exception, read_exception_class, read_exception_mut,
+    read_function, read_generator, read_generator_mut, read_instance, read_iterator, read_list,
+    read_set, read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function, GeneratorState,
+    MsException, MsGenerator, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -110,10 +110,6 @@ pub struct VM {
     /// task 39：GET_ATTR 对 GENERATOR 解析 __next__/close/__iter__ 时写入待调用方法 id，
     /// CALL（call_value）对 GENERATOR 被调用者读取并清空。1=__next__，2=close，3=__iter__。
     gen_call_method: Option<u8>,
-    /// task 40：GET_ATTR 在实例上找到方法且紧随 CALL（`obj.method(args)`）时，记下 receiver。
-    /// call_value 起始处取出并注入为 self（slot 1）。**非** BoundMethod 堆对象（task 41 的职责）：
-    /// 此为调用点暂存槽，仅在 GET_ATTR→CALL 紧邻时生效，避免泄漏到无关调用。
-    pending_method_self: Option<Object>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
@@ -134,7 +130,6 @@ impl VM {
             pending_unwind: None,
             gen_outcome: None,
             gen_call_method: None,
-            pending_method_self: None,
             heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
@@ -546,18 +541,12 @@ impl VM {
     /// CALL 子流程（task 25/27/36）：栈顶为 [callee, arg1, ..., arg(argc)]。
     /// native（FUNCTION）同步执行并压结果；用户函数（CLOSURE）压入新帧（异步）。
     /// 抽出以供 EXEC_DEFER 的 defer 调用复用（task 36）。
-    fn call_value(&mut self, mut argc: usize) -> Result<(), String> {
+    fn call_value(&mut self, argc: usize) -> Result<(), String> {
         // 边界检查（D1）：防止 argc 过大导致下溢/越界。
         if argc + 1 > self.stack.len() {
             return Err("stack underflow for CALL arguments".to_string());
         }
         let callee_idx = self.stack.len() - argc - 1;
-        // task 40：`obj.method(args)` 时 GET_ATTR 已记下 receiver，此处注入为 self（slot 1）。
-        // task 41 切换为 BoundMethod 堆对象后此暂存机制移除。
-        if let Some(receiver) = self.pending_method_self.take() {
-            self.stack.insert(callee_idx + 1, receiver);
-            argc += 1;
-        }
         let callee = self.stack[callee_idx].clone();
         match &callee {
             // task 39: GENERATOR 方法调用（gen.__next__() / gen.close() / gen.__iter__()）。
@@ -689,6 +678,32 @@ impl VM {
                 self.call_stack
                     .push(CallFrame::new(*ptr, callee_idx, self.defer_stack.len()));
             }
+            // task 41：BoundMethod（`obj.method(args)` / __init__ 经 call_class 绑定）。
+            // receiver（self）覆盖 callee 所在 slot（= 新帧 slot 0），新帧 closure 指向
+            // bound.method（MsClosure）。方法编译期 self 注册于 slot 0（见 compile_function_closure）。
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::BOUND_METHOD as u8 => {
+                let (closure_ptr, receiver) = {
+                    let bound = unsafe { read_bound_method(*ptr) };
+                    debug_assert!(
+                        !bound.method.is_null(),
+                        "bound method closure pointer is null"
+                    );
+                    debug_assert_eq!(
+                        unsafe { (*bound.method).type_tag },
+                        TypeTag::CLOSURE as u8,
+                        "bound method not pointing to closure"
+                    );
+                    (bound.method, bound.receiver.clone())
+                };
+                if self.call_stack.len() >= MAX_CALL_DEPTH {
+                    return Err("RecursionError: stack overflow".to_string());
+                }
+                // frame_base = callee(BoundMethod) 所在 slot；覆写为 receiver（self）。
+                let frame_base = self.stack.len() - argc - 1;
+                self.stack[frame_base] = receiver;
+                self.call_stack
+                    .push(CallFrame::new(closure_ptr, frame_base, self.defer_stack.len()));
+            }
             // task 37：异常类对象（EXCEPTION_CLASS）— `ValueError("msg")` 等构造调用。
             // 参数约定：第 1 个实参为 message（无参则 message = nil）。多余实参暂忽略
             // （Phase 5 经 __init__ 处理）。构造 MsException 并替换 callee+args。
@@ -753,14 +768,15 @@ impl VM {
             .copied();
         match init_ptr_opt {
             Some(init_ptr) => {
-                // 栈布局：[closure, inst(self), args...]，call(argc+1)。
-                self.push(Object::Ref(init_ptr))?;
-                self.push(inst_obj.clone())?; // slot 0 = self
+                // task 41 §2 call_class 切换：以 BoundMethod 为 callee，self 由 CALL
+                // handler 写入 slot 0。栈布局：[bound, args...]，call(argc)。
+                let bound = alloc_bound_method(inst_obj.clone(), init_ptr);
+                self.push(bound)?;
                 for arg in &args {
                     self.push(arg.clone())?;
                 }
                 let caller_depth = self.call_stack.len();
-                self.call_value(argc + 1)?;
+                self.call_value(argc)?;
                 // __init__ 为闭包 → 已压帧；驱动至其返回（复用生成器的 run_loop 模式）。
                 if self.call_stack.len() > caller_depth {
                     self.run_loop(Some(caller_depth))?;
@@ -782,18 +798,18 @@ impl VM {
         }
     }
 
-    /// task 40 §10：在当前帧之上调用一个闭包并运行至返回，取其返回值。
+    /// task 40 §10 / task 41：在当前帧之上调用一个方法闭包并运行至返回，取其返回值。
     /// 供 print/str 经由 __repr__/__str__ 显示 Instance 使用。
-    /// `receiver` 占 slot 0（self），`extra_args` 紧随其后。
+    /// task 41：经 BoundMethod 绑定 receiver 为 self（slot 0），extra_args 紧随其后。
     fn invoke_method(
         &mut self,
         closure_ptr: *mut MsObjHeader,
         receiver: Object,
         extra_args: &[Object],
     ) -> Result<Object, String> {
-        self.push(Object::Ref(closure_ptr))?;
-        self.push(receiver)?;
-        let mut argc = 1usize;
+        let bound = alloc_bound_method(receiver, closure_ptr);
+        self.push(bound)?;
+        let mut argc = 0usize;
         for a in extra_args {
             self.push(a.clone())?;
             argc += 1;
@@ -1343,9 +1359,6 @@ impl VM {
 
                 OpCode::Pop => {
                     self.pop()?;
-                    // task 40：清除暂存的 method self（GET_ATTR 设置，call_value 消费）。
-                    // Pop 仅在语句/表达式边界执行，不会出现在 GET_ATTR→…→CALL 之间。
-                    self.pending_method_self = None;
                 }
 
                 OpCode::Dup => {
@@ -2324,6 +2337,8 @@ impl VM {
                         {
                             // V5 修复：先 copy 出裸指针（*mut is Copy），再分阶段查找，
                             // 避免嵌套 read_instance/read_class 的可变借用同时存活。
+                            // task 41 §3：find_method/find_class_attr 沿继承链递归
+                            // （parent 在 task 42 前恒 None）。
                             let inst_ptr = *ptr;
                             let class_ptr = unsafe { read_instance(inst_ptr) }.class;
                             // 1. 实例字段
@@ -2334,22 +2349,16 @@ impl VM {
                             {
                                 self.push(v)?;
                             } else if let Some(m) =
-                                unsafe { read_class(class_ptr) }.methods.get(&attr).copied()
+                                unsafe { read_class(class_ptr).find_method(&attr) }
                             {
-                                // task 41 前：返回 closure。为使 `obj.method(args)` 可用，
-                                // 记下 receiver 供下一次 call_value 注入为 self。
-                                // 在 Pop 中清除（避免 `m = obj.method; f()` 误注入）。
-                                // task 41 后：alloc_bound_method(obj, m) 返回 BoundMethod。
-                                self.push(Object::Ref(m))?;
-                                self.pending_method_self = Some(obj.clone());
-                            } else if let Some(v) = unsafe { read_class(class_ptr) }
-                                .class_attrs
-                                .get(&attr)
-                                .cloned()
+                                // task 41 §2：返回 BoundMethod，后续 CALL 自动绑定 self。
+                                self.push(alloc_bound_method(obj.clone(), m))?;
+                            } else if let Some(v) =
+                                unsafe { read_class(class_ptr).find_class_attr(&attr) }
                             {
                                 self.push(v)?;
                             } else if attr == "__name__" {
-                                // §12：__name__ 内置属性（合成，不入 class_attrs）。
+                                // §12 / §3 第 4 步：__name__ 内置属性（合成，不入 class_attrs）。
                                 let n = unsafe { read_class(class_ptr) }.name.clone();
                                 self.push(alloc_string(&n))?;
                             } else {
@@ -2517,8 +2526,9 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::vm::object::{
-        alloc_class, alloc_dict, alloc_instance, alloc_iterator, alloc_list, alloc_set,
-        alloc_string, alloc_tuple, read_class, read_list, DictMap, IteratorState, Object,
+        alloc_bound_method, alloc_class, alloc_dict, alloc_instance, alloc_iterator, alloc_list,
+        alloc_set, alloc_string, alloc_tuple, read_bound_method, read_class, read_list, DictMap,
+        IteratorState, Object,
     };
     use std::collections::HashSet;
 
@@ -7234,5 +7244,270 @@ c = C()
 assert(c.n == 42)
 "#;
         assert!(compile_and_run(src).is_ok());
+    }
+
+    // ---- task 41：self 绑定与实例属性（BoundMethod） ----
+
+    #[test]
+    fn test_self_binding_basic() {
+        // 验证标准 1/2：self 引用当前实例；obj.method(args) 自动绑定 self（BoundMethod）。
+        let src = r#"
+class Box {
+    fn __init__(self, v) {
+        self.v = v
+    }
+    fn get(self) {
+        return self.v
+    }
+}
+b = Box(42)
+assert(b.get() == 42)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_bound_method_stored_and_called_later() {
+        // BoundMethod 是一等值：可存储后调用，self 仍正确绑定。
+        let src = r#"
+class Counter {
+    fn __init__(self, n) {
+        self.n = n
+    }
+    fn inc(self) {
+        self.n = self.n + 1
+        return self.n
+    }
+}
+c = Counter(0)
+f = c.inc
+assert(f() == 1)
+assert(f() == 2)
+assert(c.inc() == 3)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_method_with_args_and_field_lookup_chain() {
+        // 验证标准 3/5：实例字段读写；查找链 实例字段 → 类方法 → 类属性。
+        let src = r#"
+class Point {
+    fn __init__(self, x, y) {
+        self.x = x
+        self.y = y
+    }
+    fn distance_to(self, other) {
+        dx = self.x - other.x
+        dy = self.y - other.y
+        return (dx * dx + dy * dy) ** 0.5
+    }
+}
+p1 = Point(3, 4)
+p2 = Point(0, 0)
+assert(p1.distance_to(p2) == 5.0)
+"#;
+        let result = compile_and_run(src);
+        assert!(result.is_ok(), "got: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_dynamic_attribute_addition() {
+        // 验证标准 4：运行时动态添加实例属性。
+        let src = r#"
+class P {
+    fn __init__(self) {
+        self.x = 1
+    }
+}
+p = P()
+p.y = 99
+p.z = p.x + p.y
+assert(p.z == 100)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_field_overrides_class_attr_lookup() {
+        // 验证标准 5：实例字段优先于类属性。
+        let src = r#"
+class Config {
+    value = "class"
+    fn __init__(self) {
+        self.value = "instance"
+    }
+}
+c = Config()
+assert(c.value == "instance")
+d = Config()
+d.value = "other"
+assert(c.value == "instance")
+assert(d.value == "other")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_instances_isolated_fields() {
+        // 验证标准 6：不同实例的字段互不干扰。
+        let src = r#"
+class Tag {
+    fn __init__(self, label) {
+        self.label = label
+    }
+}
+a = Tag("A")
+b = Tag("B")
+a.extra = 1
+assert(a.label == "A")
+assert(b.label == "B")
+assert(a.extra == 1)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_method_first_param_must_be_self() {
+        // 验证标准 7：方法首参数非 self 时编译期报错。
+        let src = r#"
+class C {
+    fn bad(x) {
+        return x
+    }
+}
+"#;
+        let tokens = Lexer::new(src).tokenize_all().unwrap();
+        let prog = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let err = compiler.compile(&prog).unwrap_err();
+        assert!(
+            err.contains("must have 'self' as first parameter"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_method_no_params_error() {
+        // 方法无参数（缺少 self）时编译期报错。
+        let src = r#"
+class C {
+    fn empty() {
+    }
+}
+"#;
+        let tokens = Lexer::new(src).tokenize_all().unwrap();
+        let prog = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let err = compiler.compile(&prog).unwrap_err();
+        assert!(err.contains("self"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_name_attribute_no_regression() {
+        // 验证标准 9：inst.__name__ 与 Cls.__name__ 仍返回类名。
+        let src = r#"
+class Widget {
+    fn __init__(self) {
+    }
+}
+w = Widget()
+assert(w.__name__ == "Widget")
+assert(Widget.__name__ == "Widget")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_repr_via_print_with_self() {
+        // __repr__ 经 BoundMethod 调用，self 正确绑定（含 str(int) 拼接）。
+        let src = r#"
+class Point {
+    fn __init__(self, x, y) {
+        self.x = x
+        self.y = y
+    }
+    fn __repr__(self) {
+        return "Point(" + str(self.x) + ", " + str(self.y) + ")"
+    }
+}
+assert(str(Point(3, 4)) == "Point(3, 4)")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_method_chaining() {
+        // 方法链：方法返回 self，支持 builder 模式（不依赖 list 内置方法 task 50/51）。
+        let src = r#"
+class Builder {
+    fn __init__(self) {
+        self.count = 0
+    }
+    fn add(self, n) {
+        self.count = self.count + n
+        return self
+    }
+    fn get(self) {
+        return self.count
+    }
+}
+b = Builder()
+assert(b.add(1).add(2).add(3).get() == 6)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_closure_capturing_self() {
+        // 验证标准（§4 upvalue 捕获）：方法内闭包通过 upvalue 捕获 self。
+        let src = r#"
+class Acc {
+    fn __init__(self) {
+        self.total = 0
+    }
+    fn adder(self) {
+        return fn(n) {
+            self.total = self.total + n
+            return self.total
+        }
+    }
+}
+a = Acc()
+f = a.adder()
+assert(f(10) == 10)
+assert(f(5) == 15)
+assert(a.total == 15)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_alloc_and_read_bound_method() {
+        // 直接验证 alloc_bound_method / read_bound_method 堆对象。
+        let class_obj = alloc_class("Foo".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let Object::Ref(inst_ptr) = inst_obj else {
+            unreachable!()
+        };
+        let method_ptr = cls_ptr;
+        let bound = alloc_bound_method(inst_obj.clone(), method_ptr);
+        let Object::Ref(bptr) = bound else {
+            unreachable!()
+        };
+        unsafe {
+            assert_eq!((*bptr).type_tag, super::TypeTag::BOUND_METHOD as u8);
+            let b = read_bound_method(bptr);
+            assert_eq!(b.method, method_ptr);
+            // receiver 应为 inst_obj（Ref 指针等于 inst_ptr）。
+            match &b.receiver {
+                Object::Ref(r) => assert_eq!(*r, inst_ptr),
+                _ => unreachable!(),
+            }
+        }
     }
 }

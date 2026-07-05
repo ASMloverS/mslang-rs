@@ -200,28 +200,45 @@ impl Compiler {
     }
 
     /// 编译函数/方法体为 CLOSURE 指令（含逐上值操作数），闭包留在栈顶，**不**绑定名。
-    /// 创建独立编译单元（parent 链接父单元以启用上值解析），预留 slot 0 给被调用者
-    /// （closure 自身），参数从 slot 1 起。编译函数体后追加隐式 `NIL + RETURN`。
-    /// task 28 改造：存 **Function**（非 Closure）入常量池，发 `CLOSURE` 指令 +
-    /// 逐上值操作数（运行期包装），并写真值 `upvalue_count`。
+    /// 创建独立编译单元（parent 链接父单元以启用上值解析）。编译函数体后追加隐式
+    /// `NIL + RETURN`。task 28 改造：存 **Function**（非 Closure）入常量池，发 `CLOSURE`
+    /// 指令 + 逐上值操作数（运行期包装），并写真值 `upvalue_count`。
     /// 顶层函数（compile_fn_decl）后接 STORE_GLOBAL；类方法（compile_class_decl）后接 METHOD。
+    ///
+    /// slot 0 约定：
+    ///   - 普通函数（is_method=false）：slot 0 = `<self>`（closure 占位），参数从 slot 1 起，
+    ///     与 CALL 的 stack_base=callee_idx 自洽。
+    ///   - 方法（is_method=true）：slot 0 = 首参数 `self`（由 BoundMethod CALL handler 写入），
+    ///     其余参数从 slot 1 起。首参数必须为 `self`，否则编译期报错（task 41 §4）。
     fn compile_function_closure(
         &mut self,
         name: &str,
         params: &[crate::ast::node::Param],
         body: &[Stmt],
         line: usize,
+        is_method: bool,
     ) -> Result<(), String> {
+        // task 41 §4：方法首参数必须为 self（self 在词法层为关键字，仅此位置可作标识符）。
+        if is_method && (params.is_empty() || params[0].name != "self") {
+            return Err(format!(
+                "method '{}' must have 'self' as first parameter",
+                name
+            ));
+        }
         let mut func_unit = CompilationUnit {
             chunk: super::Chunk::new(),
-            // 订正 A3/V1：预留 slot 0 给被调用者（closure 自身），与 CALL 的
-            // stack_base = callee_idx 自洽（slot 0 = stack[stack_base] = callee）。
-            // 参数从 slot 1 起注册（slot 1..arity）。
-            locals: vec![Local {
-                name: "<self>".to_string(),
-                depth: 0,
-                is_captured: false,
-            }],
+            // 普通函数：slot 0 预留给被调用者（closure 自身），参数从 slot 1 起。
+            // 方法（task 41）：slot 0 = self（首参数），其余参数从 slot 1 起；
+            //   由 CALL 的 BoundMethod handler 将 receiver 写入 slot 0。
+            locals: if is_method {
+                vec![]
+            } else {
+                vec![Local {
+                    name: "<self>".to_string(),
+                    depth: 0,
+                    is_captured: false,
+                }]
+            },
             upvalues: Vec::new(),
             scope_depth: 0,
             is_generator: false,
@@ -317,7 +334,7 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
     ) -> Result<(), String> {
-        self.compile_function_closure(name, params, body, line)?;
+        self.compile_function_closure(name, params, body, line, false)?;
         // 绑定函数名到全局（与 task 27 一致）
         let name_idx = self.add_constant(alloc_string(name));
         let name_idx = u16::try_from(name_idx)
@@ -391,7 +408,7 @@ impl Compiler {
                 };
             self.emit_byte(OpCode::LoadGlobal as u8, line);
             self.emit_bytes(&name_idx.to_be_bytes(), line);
-            self.compile_function_closure(m_name, m_params, m_body, line)?;
+            self.compile_function_closure(m_name, m_params, m_body, line, true)?;
             let m_idx = self.add_constant(alloc_string(m_name));
             let m_idx = u16::try_from(m_idx)
                 .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;

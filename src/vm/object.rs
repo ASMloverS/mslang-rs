@@ -949,6 +949,84 @@ pub unsafe fn read_instance<'a>(ptr: *mut MsObjHeader) -> &'a mut MsInstance {
     &mut *(ptr as *mut MsInstance)
 }
 
+/// BoundMethod 堆对象（TypeTag::BOUND_METHOD = 15，task 41）。
+/// 将实例（receiver/self）与类方法（method → MsClosure）绑定，
+/// 使 `obj.method(args)` 调用时 VM 自动注入 self。
+#[repr(C)]
+pub struct MsBoundMethod {
+    pub header: MsObjHeader,
+    pub receiver: Object,
+    pub method: *mut MsObjHeader,
+}
+
+/// 分配 MsBoundMethod 堆对象，返回 Object::Ref。
+/// MVP：Box 分配（与既有 alloc_* 一致，VM 日常分配暂未接入 GC 堆）。
+pub fn alloc_bound_method(receiver: Object, method: *mut MsObjHeader) -> Object {
+    let obj = Box::new(MsBoundMethod {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::BOUND_METHOD as u8,
+            size: std::mem::size_of::<MsBoundMethod>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        receiver,
+        method,
+    });
+    debug_assert!(
+        std::mem::size_of::<MsBoundMethod>() <= crate::vm::gc::LARGE_OBJ_THRESHOLD,
+        "MsBoundMethod too large, use LOS"
+    );
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsBoundMethod（可变）。
+///
+/// 返回值生命周期由调用方约束（`'a`），**不可**用 `'static`——
+/// 数据来自堆分配，task 52 GC 上线后会被回收（参照 task 20 read_str 约定）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_bound_method` 分配的、在 `'a` 期间有效的 `MsBoundMethod`。
+pub unsafe fn read_bound_method<'a>(ptr: *mut MsObjHeader) -> &'a mut MsBoundMethod {
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::BOUND_METHOD as u8,
+        "read_bound_method on non-BOUND_METHOD"
+    );
+    &mut *(ptr as *mut MsBoundMethod)
+}
+
+impl MsClass {
+    /// 沿继承链查找方法（task 41 §3）。单继承下链路线性，深度有限。
+    /// 找到返回指向 MsClosure 的裸指针；parent 链递归至 None（task 42 前恒 None）。
+    ///
+    /// # Safety
+    /// `self.parent` 若为 Some，须指向由 `alloc_class` 分配的有效 `MsClass`。
+    pub unsafe fn find_method(&self, name: &str) -> Option<*mut MsObjHeader> {
+        if let Some(&ptr) = self.methods.get(name) {
+            return Some(ptr);
+        }
+        if let Some(parent_ptr) = self.parent {
+            return read_class(parent_ptr).find_method(name);
+        }
+        None
+    }
+
+    /// 沿继承链查找类属性（task 41 §3）。
+    ///
+    /// # Safety
+    /// `self.parent` 若为 Some，须指向有效 `MsClass`。
+    pub unsafe fn find_class_attr(&self, name: &str) -> Option<Object> {
+        if let Some(val) = self.class_attrs.get(name) {
+            return Some(val.clone());
+        }
+        if let Some(parent_ptr) = self.parent {
+            return read_class(parent_ptr).find_class_attr(name);
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Object 行为
 // ---------------------------------------------------------------------------

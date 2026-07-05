@@ -26,7 +26,8 @@
 
 use crate::vm::frame::CallFrame;
 use crate::vm::object::{
-    read_class, read_instance, DictMap, MsClass, MsInstance, MsObjHeader, Object, TypeTag,
+    read_bound_method, read_class, read_instance, DictMap, MsBoundMethod, MsClass, MsInstance,
+    MsObjHeader, Object, TypeTag,
 };
 use crate::vm::DeferEntry;
 use std::collections::{HashMap, HashSet};
@@ -487,6 +488,49 @@ fn free_instance(obj: *mut MsObjHeader) {
     }
 }
 
+// ---- task 41：BOUND_METHOD 的 trace / forward / copy / free ----
+// MsBoundMethod 持有 receiver（可能为 Object::Ref）与 method（*mut MsClosure），
+// 二者均为堆引用，须经 trace/forward/copy 处理，否则 Minor GC 复制后悬垂。
+
+/// 遍历 MsBoundMethod 内所有 Ref 槽：receiver（若为 Ref）+ method 指针。
+/// 用于 Major GC 三色标记。
+fn trace_bound_method(obj: *mut MsObjHeader, cb: &mut dyn FnMut(*mut MsObjHeader)) {
+    let b = unsafe { read_bound_method(obj) };
+    if let Object::Ref(r) = &b.receiver {
+        cb(*r);
+    }
+    cb(b.method);
+}
+
+/// Cheney 复制时修正 MsBoundMethod 内的 Ref 槽（Minor GC）。
+/// receiver 经 forwarder 修正；method 裸指针包成 Object::Ref 修正后写回。
+fn forward_fields_bound_method(obj: *mut MsObjHeader, forwarder: &mut dyn FnMut(&mut Object)) {
+    let b = unsafe { read_bound_method(obj) };
+    forwarder(&mut b.receiver);
+    let mut method_tmp = Object::Ref(b.method);
+    forwarder(&mut method_tmp);
+    if let Object::Ref(new) = method_tmp {
+        b.method = new;
+    }
+}
+
+/// Minor GC 复制：MsBoundMethod 无 HashMap 载荷，直接字段克隆至新 Box。
+fn copy_for_gc_bound_method(src: *mut MsObjHeader) -> *mut MsObjHeader {
+    let s = unsafe { read_bound_method(src) };
+    let new = Box::new(MsBoundMethod {
+        header: header_for(TypeTag::BOUND_METHOD, s.header.size),
+        receiver: s.receiver.clone(),
+        method: s.method,
+    });
+    Box::into_raw(new) as *mut MsObjHeader
+}
+
+fn free_bound_method(obj: *mut MsObjHeader) {
+    unsafe {
+        drop(Box::from_raw(obj as *mut MsBoundMethod));
+    }
+}
+
 // ---- 静态描述表 ----
 
 static STRING_DESC: TypeDescriptor = TypeDescriptor {
@@ -568,6 +612,18 @@ static INSTANCE_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<MsInstance>(),
 };
 
+// task 41：BOUND_METHOD 由 GC 托管的 trace/forward/copy/free。
+static BOUND_METHOD_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::BOUND_METHOD,
+    name: "bound_method",
+    trace: trace_bound_method,
+    copy_for_gc: copy_for_gc_bound_method,
+    forward_fields: forward_fields_bound_method,
+    free: free_bound_method,
+    finalize: None,
+    size_base: std::mem::size_of::<MsBoundMethod>(),
+};
+
 // FUNCTION/CLOSURE/CLASS/INSTANCE/MODULE/ITERATOR/GENERATOR/FUTURE/CHANNEL/
 // BOUND_METHOD/JOIN_HANDLE 在当前 Phase 2.5 尚未由 GC 托管，注册占位 noop trace +
 // placeholder copy/free，随对应 task 落地补真实实现。
@@ -596,11 +652,12 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         // task 40：CLASS/INSTANCE 已接入真实 trace/forward/copy/free。
         t if t == TypeTag::CLASS as u8 => &CLASS_DESC,
         t if t == TypeTag::INSTANCE as u8 => &INSTANCE_DESC,
+        // task 41：BOUND_METHOD 已接入真实 trace/forward/copy/free。
+        t if t == TypeTag::BOUND_METHOD as u8 => &BOUND_METHOD_DESC,
         // 合法但当前未托管 TypeTag（6..=19 与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。
         // CLOSURE/UPVALUE 真实 trace 待 GC 接管闭包堆分配后补全（future task）。
-        // TODO task 41: BOUND_METHOD。
         // TODO task 45: MODULE。TODO task 52/26: ITERATOR。
         // task 39: GENERATOR — Box 分配（alloc_generator），当前不经 gc_alloc，
         // trace/finalize 不被调用；GC 接管后需 trace stack_snapshot + receiver。
@@ -1316,7 +1373,7 @@ mod tests {
     }
 
     // ---- task 40：CLASS / INSTANCE GC 集成 ----
-    use crate::vm::object::{alloc_class, alloc_instance};
+    use crate::vm::object::{alloc_bound_method, alloc_class, alloc_instance};
 
     #[test]
     fn test_trace_class_methods_and_attrs() {
@@ -1427,5 +1484,91 @@ mod tests {
         };
         let desc2 = type_descriptor(unsafe { (*inst_ptr).type_tag });
         assert_eq!(desc2.name, "instance");
+    }
+
+    // ---- task 41：BOUND_METHOD GC 集成 ----
+
+    #[test]
+    fn test_trace_bound_method_receiver_and_method() {
+        // 验证标准 8：trace 遍历 receiver（Ref）与 method 裸指针。
+        let class_obj = alloc_class("K".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let bound = alloc_bound_method(inst_obj.clone(), cls_ptr);
+        let Object::Ref(bptr) = bound else {
+            unreachable!()
+        };
+        let mut traced: Vec<*mut MsObjHeader> = Vec::new();
+        trace_bound_method(bptr, &mut |p| traced.push(p));
+        // receiver(inst) + method(cls_ptr)。
+        assert_eq!(traced.len(), 2);
+        assert!(traced.contains(&cls_ptr));
+        let inst_ref = match &inst_obj {
+            Object::Ref(r) => *r,
+            _ => unreachable!(),
+        };
+        assert!(traced.contains(&inst_ref));
+    }
+
+    #[test]
+    fn test_copy_for_gc_bound_method_deep_copy() {
+        // 验证标准 8：copy 深拷贝 receiver 与 method，互不影响。
+        let class_obj = alloc_class("C".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let bound = alloc_bound_method(inst_obj.clone(), cls_ptr);
+        let Object::Ref(bptr) = bound else {
+            unreachable!()
+        };
+        let copy_ptr = copy_for_gc_bound_method(bptr);
+        // 改原对象的 method 指针，副本应不变（method 为 Copy 指针值，深拷贝后独立）。
+        unsafe { read_bound_method(bptr).method = std::ptr::null_mut() };
+        assert_eq!(unsafe { read_bound_method(copy_ptr).method }, cls_ptr);
+        free_bound_method(copy_ptr);
+    }
+
+    #[test]
+    fn test_type_descriptor_routes_bound_method() {
+        let class_obj = alloc_class("T".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let bound = alloc_bound_method(inst_obj, cls_ptr);
+        let Object::Ref(bptr) = bound else {
+            unreachable!()
+        };
+        let desc = type_descriptor(unsafe { (*bptr).type_tag });
+        assert_eq!(desc.name, "bound_method");
+    }
+
+    #[test]
+    fn test_forward_fields_bound_method_updates_slots() {
+        // 验证标准 8：forward 修正 receiver 与 method 槽（模拟 minor GC 转发）。
+        let class_obj = alloc_class("F".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let bound = alloc_bound_method(inst_obj.clone(), cls_ptr);
+        let Object::Ref(bptr) = bound else {
+            unreachable!()
+        };
+        // forwarder 将所有 Ref 重写为 cls_ptr（模拟转发到新地址）。
+        forward_fields_bound_method(bptr, &mut |slot| {
+            if let Object::Ref(_) = slot {
+                *slot = Object::Ref(cls_ptr);
+            }
+        });
+        let b = unsafe { read_bound_method(bptr) };
+        assert_eq!(b.method, cls_ptr);
+        match &b.receiver {
+            Object::Ref(r) => assert_eq!(*r, cls_ptr),
+            _ => unreachable!(),
+        }
     }
 }
