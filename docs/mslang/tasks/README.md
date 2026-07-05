@@ -73,7 +73,7 @@
 |---|---|---|
 | 40 | [Class 定义与实例化](40-class-definition.md) | ✅ |
 | 41 | [self 绑定与实例属性](41-self-instance-attributes.md) | ✅ |
-| 42 | [继承与 super](42-inheritance-super.md) | ⬜ |
+| 42 | [继承与 super](42-inheritance-super.md) | ✅ |
 | 43 | [魔术方法](43-magic-methods.md) | ⬜ |
 | 44 | [装饰器](44-decorators.md) | ⬜ |
 

@@ -87,8 +87,21 @@ impl Compiler {
                 for_clauses,
                 condition,
             } => self.compile_generator_expression(expr, for_clauses, condition, line),
-            Expr::SuperAccess { .. } => {
-                Err("super compilation not yet implemented (task 42)".to_string())
+            Expr::SuperAccess { name } => {
+                let class_name = self
+                    .current_class
+                    .as_ref()
+                    .ok_or_else(|| "'super' used outside of class method".to_string())?;
+                let class_idx = self.add_constant(alloc_string(class_name));
+                let class_idx = u16::try_from(class_idx)
+                    .map_err(|_| "constant pool overflow".to_string())?;
+                let name_idx = self.add_constant(alloc_string(name));
+                let name_idx = u16::try_from(name_idx)
+                    .map_err(|_| "constant pool overflow".to_string())?;
+                self.emit_byte(OpCode::GetSuper as u8, line);
+                self.emit_bytes(&class_idx.to_be_bytes(), line);
+                self.emit_bytes(&name_idx.to_be_bytes(), line);
+                Ok(())
             }
             Expr::Yield { value } => {
                 self.unit.is_generator = true;

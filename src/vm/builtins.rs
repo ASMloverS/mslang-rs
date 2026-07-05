@@ -12,9 +12,9 @@
 #![allow(clippy::get_first)]
 
 use super::object::{
-    alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, read_class,
-    read_dict, read_instance, read_iterator, read_list, read_set, read_str, read_tuple, CmpOp,
-    DictMap, IteratorState, MsObjHeader, Object, TypeTag,
+    alloc_class, alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple,
+    read_class, read_dict, read_instance, read_iterator, read_list, read_set, read_str, read_tuple,
+    CmpOp, DictMap, IteratorState, MsObjHeader, Object, TypeTag,
 };
 use super::VM;
 use std::collections::HashSet;
@@ -146,6 +146,74 @@ impl VM {
             self.native_arities.insert(name.to_string(), arity);
         }
     }
+
+    /// task 42：初始化隐式 Object 基类。注入原生 __repr__/__eq__/__ne__ 方法，
+    /// 标记 Immortal 代，存入 self.object_class。无显式父类的类自动继承之。
+    pub fn init_object_class(&mut self) {
+        let object_obj = alloc_class("Object".to_string());
+        let Object::Ref(object_ptr) = object_obj else {
+            unreachable!()
+        };
+        let Object::Ref(repr_ptr) = alloc_native_function(NativeFunction {
+            name: "__repr__".to_string(),
+            func: object_repr,
+        }) else {
+            unreachable!()
+        };
+        let Object::Ref(eq_ptr) = alloc_native_function(NativeFunction {
+            name: "__eq__".to_string(),
+            func: object_eq,
+        }) else {
+            unreachable!()
+        };
+        let Object::Ref(ne_ptr) = alloc_native_function(NativeFunction {
+            name: "__ne__".to_string(),
+            func: object_ne,
+        }) else {
+            unreachable!()
+        };
+        unsafe {
+            (*object_ptr).set_generation(crate::vm::gc::Generation::Immortal);
+            read_class(object_ptr).methods.insert("__repr__".to_string(), repr_ptr);
+            read_class(object_ptr).methods.insert("__eq__".to_string(), eq_ptr);
+            read_class(object_ptr).methods.insert("__ne__".to_string(), ne_ptr);
+        }
+        self.object_class = object_ptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Object 基类原生方法（task 42）
+// ---------------------------------------------------------------------------
+
+/// Object.__repr__(self) → "{ClassName} instance"。
+fn object_repr(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let self_obj = args.get(0).ok_or("__repr__ requires self")?;
+    if let Object::Ref(ptr) = self_obj {
+        if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+            let class_ptr = unsafe { read_instance(*ptr) }.class;
+            let name = unsafe { read_class(class_ptr) }.name.clone();
+            return Ok(alloc_string(&format!("{} instance", name)));
+        }
+    }
+    Ok(alloc_string("Object instance"))
+}
+
+/// Object.__eq__(self, other) → self is other。
+fn object_eq(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let self_obj = args.get(0).ok_or("__eq__ requires self")?;
+    let other = args.get(1).ok_or("__eq__ requires 2 arguments")?;
+    self_obj.is_identity(other)
+}
+
+/// Object.__ne__(self, other) → not (self is other)。
+fn object_ne(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let self_obj = args.get(0).ok_or("__ne__ requires self")?;
+    let other = args.get(1).ok_or("__ne__ requires 2 arguments")?;
+    match self_obj.is_identity(other)? {
+        Object::Bool(b) => Ok(Object::Bool(!b)),
+        _ => Ok(Object::Bool(true)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +276,14 @@ pub(crate) fn object_to_string(vm: &mut VM, obj: &Object) -> Result<String, Stri
 
 fn builtin_type(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("type() requires 1 argument")?;
+    // task 42：INSTANCE 返回动态类名（非 "instance"），供 Object.__repr__ 等使用。
+    if let Object::Ref(ptr) = arg {
+        if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+            let class_ptr = unsafe { read_instance(*ptr) }.class;
+            let name = unsafe { read_class(class_ptr) }.name.clone();
+            return Ok(alloc_string(&name));
+        }
+    }
     Ok(alloc_string(arg.type_name()))
 }
 

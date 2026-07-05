@@ -344,13 +344,14 @@ impl Compiler {
         Ok(())
     }
 
-    /// 编译 class 定义（task 40）。
+    /// 编译 class 定义（task 40，task 42 扩展继承）。
     /// 字节码布局：
     ///   CLASS name            → 类对象压栈
+    ///   [有父类] LOAD_GLOBAL parent; INHERIT  → 仍留 [class]
+    ///   STORE_GLOBAL name     → 存为全局变量（先于属性/方法，使其可自引用）
     ///   [每个类属性] DUP class; <expr>; SET_ATTR name   → 仍留 [class]
     ///   [每个方法]   <CLOSURE>;  METHOD name            → 仍留 [class]
-    ///   STORE_GLOBAL name     → 存为全局变量
-    /// 仅支持顶层 class 定义；继承语法（parent 非空）编译期报错（task 42）。
+    /// 仅支持顶层 class 定义。
     fn compile_class_decl(
         &mut self,
         name: &str,
@@ -359,10 +360,6 @@ impl Compiler {
         class_vars: &[(String, Expr)],
         line: usize,
     ) -> Result<(), String> {
-        // R2/B4：继承语法由 task 42 实现，本任务编译期拒绝（parser 已接受 `< Parent`）。
-        if parent.is_some() {
-            return Err("inheritance not yet supported (task 42)".into());
-        }
         // 函数内定义 class 暂不支持（task 17 局部变量规则未覆盖 class）。
         if !self.unit.parent.is_null() {
             return Err("class definition inside function not supported".into());
@@ -374,6 +371,17 @@ impl Compiler {
             .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
         self.emit_byte(OpCode::Class as u8, line);
         self.emit_bytes(&name_idx.to_be_bytes(), line);
+
+        // task 42：有显式父类时，LOAD_GLOBAL parent; INHERIT（class 仍在栈顶）。
+        // INHERIT 在 VM 端覆写 parent（CLASS 已默认链接 Object，见 VM CLASS handler）。
+        if let Some(parent_name) = parent {
+            let parent_idx = self.add_constant(alloc_string(parent_name));
+            let parent_idx = u16::try_from(parent_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::LoadGlobal as u8, line);
+            self.emit_bytes(&parent_idx.to_be_bytes(), line);
+            self.emit_byte(OpCode::Inherit as u8, line);
+        }
 
         // STORE_GLOBAL name → []（提前存储，使 class_vars / methods 可经 LOAD_GLOBAL 引用类自身）
         self.emit_byte(OpCode::StoreGlobal as u8, line);
@@ -393,6 +401,10 @@ impl Compiler {
             self.emit_bytes(&attr_idx.to_be_bytes(), line);
             self.emit_byte(OpCode::Pop as u8, line);
         }
+
+        // task 42：记录当前类名，供方法体内 Expr::SuperAccess 发射 GET_SUPER。
+        let prev_class = self.current_class.take();
+        self.current_class = Some(name.to_string());
 
         // 方法：LOAD_GLOBAL name; CLOSURE; METHOD name → [class]; POP
         for method in methods {
@@ -416,6 +428,8 @@ impl Compiler {
             self.emit_bytes(&m_idx.to_be_bytes(), line);
             self.emit_byte(OpCode::Pop as u8, line);
         }
+
+        self.current_class = prev_class;
 
         // 类已在上文 STORE_GLOBAL，无需重复存储。
         Ok(())

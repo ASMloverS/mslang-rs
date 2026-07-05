@@ -138,6 +138,9 @@ impl OpCode {
             // task 37：TRY_ENTER 扩展双操作数（无 finally 时 finally_offset=0xFFFF）。
             Self::TryEnter => 4,
 
+            // task 42：GET_SUPER 双操作数 class_idx(2) + name_idx(2)。
+            Self::GetSuper => 4,
+
             // 2 字节操作数：idx / offset / name_idx
             Self::Constant
             | Self::LoadGlobal
@@ -153,7 +156,6 @@ impl OpCode {
             | Self::Closure
             | Self::Class
             | Self::Method
-            | Self::GetSuper
             | Self::Catch
             | Self::Import => 2,
 
@@ -274,18 +276,30 @@ fn format_instruction(chunk: &Chunk, offset: usize) -> (String, usize) {
             }
         }
         4 => {
-            // TRY_ENTER: handler_offset(2) + finally_offset(2)
-            let handler_offset =
-                u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
-            let finally_offset =
-                u16::from_be_bytes([chunk.code[offset + 3], chunk.code[offset + 4]]);
-            (
-                format!(
-                    "{:04} {:?} handler={} finally={}",
-                    offset, opcode, handler_offset, finally_offset
-                ),
-                offset + 5,
-            )
+            if opcode == OpCode::GetSuper {
+                // GET_SUPER: class_idx(2) + name_idx(2)（task 42）
+                let class_idx =
+                    u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
+                let name_idx =
+                    u16::from_be_bytes([chunk.code[offset + 3], chunk.code[offset + 4]]);
+                (
+                    format!("{:04} {:?} class={} name={}", offset, opcode, class_idx, name_idx),
+                    offset + 5,
+                )
+            } else {
+                // TRY_ENTER: handler_offset(2) + finally_offset(2)
+                let handler_offset =
+                    u16::from_be_bytes([chunk.code[offset + 1], chunk.code[offset + 2]]);
+                let finally_offset =
+                    u16::from_be_bytes([chunk.code[offset + 3], chunk.code[offset + 4]]);
+                (
+                    format!(
+                        "{:04} {:?} handler={} finally={}",
+                        offset, opcode, handler_offset, finally_offset
+                    ),
+                    offset + 5,
+                )
+            }
         }
         _ => (format!("{:04} {:?}", offset, opcode), offset + 1),
     }
@@ -425,6 +439,7 @@ mod tests {
         assert_eq!(OpCode::DictInsert.operand_size(), 1);
         assert_eq!(OpCode::TryEnter.operand_size(), 4);
         assert_eq!(OpCode::Catch.operand_size(), 2);
+        assert_eq!(OpCode::GetSuper.operand_size(), 4);
         assert_eq!(OpCode::Halt.operand_size(), 0);
     }
 

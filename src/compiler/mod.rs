@@ -103,6 +103,9 @@ pub struct Compiler {
     nonlocal_names: std::collections::HashSet<String>,
     /// 标记为 global 的变量名（当前函数作用域内有效）。
     global_names: std::collections::HashSet<String>,
+    /// task 42：当前正编译其方法体的类名（None = 不在类方法内）。
+    /// compile_class_decl 进入方法编译前设置，Expr::SuperAccess 据此发射 GET_SUPER。
+    current_class: Option<String>,
 }
 
 /// 循环上下文。break 跳到循环出口（前向），continue 跳到循环头（后向）。
@@ -139,6 +142,7 @@ impl Compiler {
             gen_expr_counter: 0,
             nonlocal_names: std::collections::HashSet::new(),
             global_names: std::collections::HashSet::new(),
+            current_class: None,
         }
     }
 

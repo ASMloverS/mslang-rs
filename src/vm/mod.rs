@@ -113,6 +113,9 @@ pub struct VM {
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
+    /// task 42：隐式 Object 基类（Immortal 代）。无显式父类的类在 CLASS handler
+    /// 中自动链接至此；提供默认 __repr__/__eq__/__ne__。
+    object_class: *mut MsObjHeader,
 }
 
 impl VM {
@@ -131,8 +134,10 @@ impl VM {
             gen_outcome: None,
             gen_call_method: None,
             heap: gc::MsHeap::new(),
+            object_class: std::ptr::null_mut(),
         };
         vm.register_builtins();
+        vm.init_object_class();
         vm.init_exception_classes();
         vm
     }
@@ -678,31 +683,43 @@ impl VM {
                 self.call_stack
                     .push(CallFrame::new(*ptr, callee_idx, self.defer_stack.len()));
             }
-            // task 41：BoundMethod（`obj.method(args)` / __init__ 经 call_class 绑定）。
-            // receiver（self）覆盖 callee 所在 slot（= 新帧 slot 0），新帧 closure 指向
-            // bound.method（MsClosure）。方法编译期 self 注册于 slot 0（见 compile_function_closure）。
+            // task 41/42：BoundMethod（`obj.method(args)` / __init__ / super.method）。
+            // receiver（self）覆盖 callee 所在 slot（= 新帧 slot 0）。
+            // task 42：method 可为 CLOSURE（用户方法）或 FUNCTION（Object 原生方法）。
             Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::BOUND_METHOD as u8 => {
-                let (closure_ptr, receiver) = {
+                let (method_ptr, receiver) = {
                     let bound = unsafe { read_bound_method(*ptr) };
                     debug_assert!(
                         !bound.method.is_null(),
-                        "bound method closure pointer is null"
-                    );
-                    debug_assert_eq!(
-                        unsafe { (*bound.method).type_tag },
-                        TypeTag::CLOSURE as u8,
-                        "bound method not pointing to closure"
+                        "bound method pointer is null"
                     );
                     (bound.method, bound.receiver.clone())
                 };
-                if self.call_stack.len() >= MAX_CALL_DEPTH {
-                    return Err("RecursionError: stack overflow".to_string());
+                let method_tag = unsafe { (*method_ptr).type_tag };
+                if method_tag == TypeTag::FUNCTION as u8 {
+                    // task 42：原生方法（Object.__repr__/__eq__/__ne__ 等）。
+                    // args = [receiver, ...call_args]，内联调用后压单一结果。
+                    let func = unsafe { read_native_function(method_ptr) }.func;
+                    let mut args = self.stack[self.stack.len() - argc..].to_vec();
+                    args.insert(0, receiver);
+                    self.stack.truncate(self.stack.len() - argc - 1);
+                    let result = func(self, &args)?;
+                    self.push(result)?;
+                } else {
+                    debug_assert_eq!(
+                        method_tag,
+                        TypeTag::CLOSURE as u8,
+                        "bound method not pointing to closure/function"
+                    );
+                    if self.call_stack.len() >= MAX_CALL_DEPTH {
+                        return Err("RecursionError: stack overflow".to_string());
+                    }
+                    // frame_base = callee(BoundMethod) 所在 slot；覆写为 receiver（self）。
+                    let frame_base = self.stack.len() - argc - 1;
+                    self.stack[frame_base] = receiver;
+                    self.call_stack
+                        .push(CallFrame::new(method_ptr, frame_base, self.defer_stack.len()));
                 }
-                // frame_base = callee(BoundMethod) 所在 slot；覆写为 receiver（self）。
-                let frame_base = self.stack.len() - argc - 1;
-                self.stack[frame_base] = receiver;
-                self.call_stack
-                    .push(CallFrame::new(closure_ptr, frame_base, self.defer_stack.len()));
             }
             // task 37：异常类对象（EXCEPTION_CLASS）— `ValueError("msg")` 等构造调用。
             // 参数约定：第 1 个实参为 message（无参则 message = nil）。多余实参暂忽略
@@ -2434,7 +2451,16 @@ impl VM {
                 OpCode::Class => {
                     let name_idx = self.read_u16()? as usize;
                     let name = self.read_string_constant(name_idx)?;
-                    self.push(alloc_class(name))?;
+                    let class_obj = alloc_class(name);
+                    let Object::Ref(cls_ptr) = class_obj else {
+                        unreachable!()
+                    };
+                    // task 42：默认链接隐式 Object 基类。若字节码后续有 INHERIT
+                    //（显式父类），将覆写 parent。
+                    unsafe {
+                        read_class(cls_ptr).parent = Some(self.object_class);
+                    }
+                    self.push(Object::Ref(cls_ptr))?;
                 }
 
                 // METHOD（task 40 §7）：name_idx(2) → 弹栈顶 closure，peek 栈顶 class，
@@ -2459,6 +2485,59 @@ impl VM {
                         }
                         _ => return Err("METHOD target is not a Class".into()),
                     }
+                }
+
+                // INHERIT（task 42）：弹栈顶父类，peek 栈顶子类，设置 parent。
+                // V5 模式：拷出裸指针后分阶段写，避免两个 &mut 同时存活。
+                // 不复制 class_attrs：继承链查找由 find_class_attr 递归处理。
+                OpCode::Inherit => {
+                    let parent_obj = self.pop()?;
+                    let child_obj = self.peek(0)?;
+                    let (parent_ptr, child_ptr) = match (&parent_obj, child_obj) {
+                        (Object::Ref(p), Object::Ref(c))
+                            if unsafe { (**p).type_tag } == TypeTag::CLASS as u8
+                                && unsafe { (**c).type_tag } == TypeTag::CLASS as u8 =>
+                        {
+                            (*p, *c)
+                        }
+                        _ => return Err("parent must be a class".into()),
+                    };
+                    unsafe {
+                        read_class(child_ptr).parent = Some(parent_ptr);
+                    }
+                }
+
+                // GET_SUPER（task 42）：双操作数 class_idx(2), name_idx(2)。
+                // 取当前类 → parent → find_method，receiver = 当前帧 slot 0（self）。
+                OpCode::GetSuper => {
+                    let class_idx = self.read_u16()? as usize;
+                    let name_idx = self.read_u16()? as usize;
+                    let class_name = self.read_string_constant(class_idx)?;
+                    let name = self.read_string_constant(name_idx)?;
+                    let current_cls_obj = self
+                        .globals
+                        .get(&class_name)
+                        .ok_or_else(|| format!("class '{}' not found", class_name))?;
+                    let current_cls_ptr = match current_cls_obj {
+                        Object::Ref(p)
+                            if unsafe { (**p).type_tag } == TypeTag::CLASS as u8 =>
+                        {
+                            *p
+                        }
+                        _ => return Err(format!("'{}' is not a class", class_name)),
+                    };
+                    let parent_ptr = unsafe { read_class(current_cls_ptr).parent }
+                        .ok_or_else(|| format!("class '{}' has no parent", class_name))?;
+                    let method_ptr = unsafe { read_class(parent_ptr).find_method(&name) }
+                        .ok_or_else(|| format!("parent class has no method '{}'", name))?;
+                    let receiver = {
+                        let frame = self
+                            .call_stack
+                            .last()
+                            .ok_or("GET_SUPER outside method call")?;
+                        self.stack[frame.stack_base].clone()
+                    };
+                    self.push(alloc_bound_method(receiver, method_ptr))?;
                 }
 
                 // GET_INDEX（task 35）：[obj, key] → [result]。obj[key] 读取。
@@ -7099,15 +7178,15 @@ assert(x.__name__ == "Bare")
     }
 
     #[test]
-    fn test_inheritance_compile_error() {
-        // 验证标准 14（R2/B4）：继承语法编译期报错。
-        let src = "class Dog < Animal {\n}";
+    fn test_super_outside_class_error() {
+        // task 42 验证标准 9：super 在非方法上下文（顶层）编译期报错。
+        let src = "x = super.foo()";
         let tokens = Lexer::new(src).tokenize_all().unwrap();
         let prog = Parser::new(tokens).parse().unwrap();
         let mut compiler = Compiler::new();
         let err = compiler.compile(&prog).unwrap_err();
         assert!(
-            err.contains("inheritance not yet supported (task 42)"),
+            err.contains("'super' used outside of class method"),
             "got: {}",
             err
         );
@@ -7508,6 +7587,255 @@ assert(a.total == 15)
                 Object::Ref(r) => assert_eq!(*r, inst_ptr),
                 _ => unreachable!(),
             }
+        }
+    }
+
+    // ---- task 42：继承与 super ----
+
+    #[test]
+    fn test_inherit_parent_method() {
+        // 验证标准 1：子类继承父类方法。
+        let src = r#"
+class Animal {
+    fn speak(self) {
+        return "animal speaks"
+    }
+}
+class Dog < Animal {
+}
+d = Dog()
+assert(d.speak() == "animal speaks")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_inherit_method_override() {
+        // 验证标准 2：子类方法覆盖父类方法。
+        let src = r#"
+class Animal {
+    fn speak(self) {
+        return "animal"
+    }
+}
+class Dog < Animal {
+    fn speak(self) {
+        return "dog"
+    }
+}
+assert(Dog().speak() == "dog")
+assert(Animal().speak() == "animal")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_super_method_call() {
+        // 验证标准 3：super.method() 调用父类方法。
+        let src = r#"
+class Base {
+    fn greet(self) {
+        return "hello"
+    }
+}
+class Child < Base {
+    fn greet(self) {
+        return super.greet() + " world"
+    }
+}
+assert(Child().greet() == "hello world")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_super_init_call() {
+        // 验证标准 4：super.__init__() 调用父类构造器。
+        let src = r#"
+class Animal {
+    fn __init__(self, name) {
+        self.name = name
+    }
+}
+class Dog < Animal {
+    fn __init__(self, name, breed) {
+        super.__init__(name)
+        self.breed = breed
+    }
+    fn speak(self) {
+        return self.name + " barks"
+    }
+}
+d = Dog("Rex", "Shepherd")
+assert(d.speak() == "Rex barks")
+assert(d.name == "Rex")
+assert(d.breed == "Shepherd")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_inheritance_chain() {
+        // 验证标准 6/7：继承链 A→B→C，super 沿链回溯。
+        let src = r#"
+class A {
+    fn who(self) {
+        return "A"
+    }
+}
+class B < A {
+    fn who(self) {
+        return "B+" + super.who()
+    }
+}
+class C < B {
+    fn who(self) {
+        return "C+" + super.who()
+    }
+}
+        assert(C().who() == "C+B+A")
+assert(B().who() == "B+A")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_implicit_object_repr() {
+        // 验证标准 5/11：无显式父类的类继承 Object，__repr__ 返回类名 + " instance"。
+        let src = r#"
+class Simple {
+    fn __init__(self) {
+        self.x = 1
+    }
+}
+s = Simple()
+assert(s.__repr__() == "Simple instance")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_type_returns_class_name() {
+        // 验证标准 8：type(instance) 返回类名（非 "instance"）。
+        let src = r#"
+class Simple {
+}
+s = Simple()
+assert(type(s) == "Simple")
+assert(type(42) == "int")
+assert(type("hi") == "string")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_object_eq_ne_identity() {
+        // Object.__eq__ = self is other；Object.__ne__ = not (self is other)。
+        let src = r#"
+class S {
+}
+a = S()
+b = S()
+assert(a.__eq__(a))
+assert(not a.__eq__(b))
+assert(not a.__ne__(a))
+assert(a.__ne__(b))
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_inherit_class_attr() {
+        // 验证标准 6：属性查找沿继承链进行（实例访问继承的类属性，经 find_class_attr）。
+        let src = r#"
+class Base {
+    count = 10
+}
+class Derived < Base {
+}
+d = Derived()
+assert(d.count == 10)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_full_inheritance_program() {
+        // spec §测试用例 test_inheritance.ms 的等价 assert 版本。
+        let src = r#"
+class Animal {
+    fn __init__(self, name) {
+        self.name = name
+    }
+    fn speak(self) {
+        return self.name + " speaks"
+    }
+}
+class Dog < Animal {
+    fn __init__(self, name, breed) {
+        super.__init__(name)
+        self.breed = breed
+    }
+    fn speak(self) {
+        return self.name + " barks"
+    }
+}
+d = Dog("Rex", "Shepherd")
+assert(d.speak() == "Rex barks")
+assert(d.name == "Rex")
+assert(d.breed == "Shepherd")
+
+class Base {
+    fn greet(self) {
+        return "hello from Base"
+    }
+}
+class Child < Base {
+    fn greet(self) {
+        return super.greet() + " and Child"
+    }
+}
+assert(Child().greet() == "hello from Base and Child")
+
+class A {
+    fn who(self) {
+        return "A"
+    }
+}
+class B < A {
+    fn who(self) {
+        return "B+" + super.who()
+    }
+}
+class C < B {
+    fn who(self) {
+        return "C+" + super.who()
+    }
+}
+assert(C().who() == "C+B+A")
+
+class Simple {
+    fn __init__(self) {
+        self.x = 1
+    }
+}
+s = Simple()
+assert(s.__repr__() == "Simple instance")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_object_class_immortal_generation() {
+        // 验证标准 11：Object 基类标为 Immortal 代。
+        let vm = VM::new();
+        assert!(!vm.object_class.is_null());
+        unsafe {
+            assert_eq!(
+                (*vm.object_class).generation(),
+                crate::vm::gc::Generation::Immortal
+            );
+            assert_eq!(read_class(vm.object_class).name.clone(), "Object");
         }
     }
 }
