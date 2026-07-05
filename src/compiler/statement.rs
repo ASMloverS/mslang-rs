@@ -63,14 +63,112 @@ impl Compiler {
                 alias,
                 body,
             } => self.compile_with(expression, alias, body, line),
-            Stmt::Import { .. } | Stmt::FromImport { .. } => {
-                Err("import compilation not yet implemented (task 45)".into())
-            }
+            Stmt::Import {
+                module_path,
+                alias,
+                is_stdlib,
+            } => self.compile_import(module_path, alias, *is_stdlib, line),
+            Stmt::FromImport {
+                module_path,
+                targets,
+                is_stdlib,
+            } => self.compile_from_import(module_path, targets, *is_stdlib, line),
             Stmt::Throw { expr } => self.compile_throw(expr, line),
             Stmt::Decorated { decorators, target } => {
                 self.compile_decorated(decorators, target, line)
             }
         }
+    }
+}
+
+// ---- task 45：import / from...import 编译 ----
+
+impl Compiler {
+    /// 编码模块名为常量池字符串索引。dotted path 用 "." 连接；`@std` 折叠为 "@std:" 前缀
+    ///（§3 前缀编码：无新 opcode，VM/搜索逻辑透明）。
+    fn module_const_idx(&mut self, module_path: &[String], is_stdlib: bool) -> Result<u16, String> {
+        let joined = module_path.join(".");
+        let full = if is_stdlib {
+            format!("@std:{}", joined)
+        } else {
+            joined
+        };
+        let idx = self.add_constant(alloc_string(&full));
+        u16::try_from(idx)
+            .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())
+    }
+
+    /// 发射 IMPORT module_idx(2)，将 Module 对象压栈。
+    fn emit_import(&mut self, module_path: &[String], is_stdlib: bool, line: usize) -> Result<(), String> {
+        let idx = self.module_const_idx(module_path, is_stdlib)?;
+        self.emit_byte(OpCode::Import as u8, line);
+        self.emit_bytes(&idx.to_be_bytes(), line);
+        Ok(())
+    }
+
+    /// 顶层（无父单元）→ STORE_GLOBAL；函数体内 → 声明局部 slot + STORE_LOCAL。
+    /// import 绑定的名字须按作用域存入，使后续引用可解析。
+    fn emit_import_binding(&mut self, name: &str, line: usize) -> Result<(), String> {
+        if self.unit.parent.is_null() {
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::StoreGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+        } else {
+            if self.resolve_local(name).is_none() {
+                self.declare_local(name, line)?;
+            }
+            self.emit_store_name(name, line)?;
+        }
+        Ok(())
+    }
+
+    /// `import foo`        → IMPORT "foo"; STORE "foo"
+    /// `import foo as bar` → IMPORT "foo"; STORE "bar"
+    /// `import a.b.c`      → IMPORT "a.b.c"; STORE "a"（首段绑定；dotted 嵌套属性访问
+    ///   需父包暴露子模块为属性，属后续扩展，本 MVP 绑定首段名）。
+    fn compile_import(
+        &mut self,
+        module_path: &[String],
+        alias: &Option<String>,
+        is_stdlib: bool,
+        line: usize,
+    ) -> Result<(), String> {
+        self.emit_import(module_path, is_stdlib, line)?;
+        // 绑定名：alias 优先，否则首段（单段即模块名）。
+        let bind_name = alias
+            .clone()
+            .or_else(|| module_path.first().cloned())
+            .ok_or_else(|| "import: empty module path".to_string())?;
+        self.emit_import_binding(&bind_name, line)
+    }
+
+    /// `from foo import a, b as c` → IMPORT "foo"; GET_ATTR "a"; STORE "a";
+    ///   GET_ATTR "b"; STORE "c"。每个 target 取模块导出并按名/别名绑定。
+    fn compile_from_import(
+        &mut self,
+        module_path: &[String],
+        targets: &[(String, Option<String>)],
+        is_stdlib: bool,
+        line: usize,
+    ) -> Result<(), String> {
+        if targets.is_empty() {
+            return Err("from...import: no targets".to_string());
+        }
+        for (name, alias) in targets {
+            // 每个 target：压模块 → GET_ATTR name → STORE 绑定名。
+            // （可优化为单次 IMPORT + 多次 GET_ATTR，但保持每 target 自包含便于绑定。）
+            self.emit_import(module_path, is_stdlib, line)?;
+            let attr_idx = self.add_constant(alloc_string(name));
+            let attr_idx = u16::try_from(attr_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::GetAttr as u8, line);
+            self.emit_bytes(&attr_idx.to_be_bytes(), line);
+            let bind_name = alias.clone().unwrap_or_else(|| name.clone());
+            self.emit_import_binding(&bind_name, line)?;
+        }
+        Ok(())
     }
 }
 
@@ -105,6 +203,17 @@ impl Compiler {
                 }
                 None => Err(format!("no binding for nonlocal '{}'", name)),
             };
+        }
+        // task 45 §7：模块模式下顶层（无父单元）const/var/`=` 走 STORE_GLOBAL，
+        // 使 execute_module 能经 globals 捕获模块顶层定义（与 fn/class 顶层一致）。
+        // 函数体内（有父单元）不受影响，仍走局部 slot。
+        if self.module_mode && self.unit.parent.is_null() {
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::StoreGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+            return Ok(());
         }
         let slot = match self.resolve_local(name) {
             Some(slot) => slot,
@@ -1343,18 +1452,8 @@ mod tests {
         assert!(chunk.code.contains(&(OpCode::Return as u8)));
     }
 
-    #[test]
-    fn test_deferred_statement_types_return_error() {
-        // fn/defer/throw 声明已实现，不再报错；其余语句类型仍为 stub。
-        let source = "import os";
-        let program = parse(source);
-        let mut compiler = Compiler::new();
-        assert!(
-            compiler.compile(&program).is_err(),
-            "expected error for deferred statement: {:?}",
-            source
-        );
-    }
+    // task 45：import/from-import 已实现，不再为 stub。
+    // 原 test_deferred_statement_types_return_error 检查 import 编译报错，已移除。
 
     // ---- task 31：默认参数 / 可变参数编译期校验 ----
 

@@ -90,6 +90,12 @@ pub struct Compiler {
     source_file: Option<String>,
     source_lines: Vec<String>,
     exports: Vec<String>,
+    /// task 45：模块私有顶层名（var/:=/=）。模块模式下顶层 var 走 STORE_GLOBAL，
+    /// 这些名在 execute_module 后落入模块的私有 globals（不进 exports）。
+    private_top_level: Vec<String>,
+    /// task 45：模块编译模式。置位后顶层 const/var 走 STORE_GLOBAL（而非局部 slot），
+    /// 使 execute_module 能经 globals 捕获模块顶层定义并拆分导出/私有（§7）。
+    module_mode: bool,
     /// 循环上下文栈，支持 break/continue 与嵌套循环（最内层在栈顶）。
     current_loop: Vec<LoopContext>,
     /// task 37：当前正编译其 try body 的嵌套 try 数量。return/break/continue 在
@@ -136,6 +142,8 @@ impl Compiler {
             source_file: None,
             source_lines: Vec::new(),
             exports: Vec::new(),
+            private_top_level: Vec::new(),
+            module_mode: false,
             current_loop: Vec::new(),
             try_depth: 0,
             with_temp_counter: 0,
@@ -432,7 +440,8 @@ impl Compiler {
         for stmt in &program.statements {
             self.compile_statement(stmt, 0)?;
 
-            // 记录顶层导出名（供模块系统使用）
+            // 记录顶层定义名（供模块系统拆分导出/私有，§7）。
+            // 仅 module_mode 下有意义（顶层走 STORE_GLOBAL 才会被 execute_module 捕获）。
             if self.unit.scope_depth == 0 {
                 match stmt {
                     Stmt::FnDecl { name, .. } | Stmt::ClassDecl { name, .. } => {
@@ -441,7 +450,10 @@ impl Compiler {
                     Stmt::ConstDecl { name, .. } => {
                         self.exports.push(name.clone());
                     }
-                    // var 声明私有，不导出；其他语句不产生导出
+                    // var/:=/=（VarDecl/ShortVarDecl/Assign）为模块私有（§导出规则）
+                    Stmt::VarDecl { name, .. } | Stmt::ShortVarDecl { name, .. } => {
+                        self.private_top_level.push(name.clone());
+                    }
                     _ => {}
                 }
             }
@@ -449,6 +461,30 @@ impl Compiler {
         self.emit_byte(OpCode::ExecDefer as u8, 0);
         self.emit_byte(OpCode::Halt as u8, 0);
         Ok(std::mem::take(&mut self.unit.chunk))
+    }
+}
+
+// ---- task 45：模块编译支持 ----
+
+impl Compiler {
+    /// 开启模块编译模式：顶层 const/var 走 STORE_GLOBAL，使 execute_module 可经
+    /// globals 捕获模块顶层定义。仅由 module::compile_module_source 调用。
+    pub fn set_module_mode(&mut self, on: bool) {
+        self.module_mode = on;
+    }
+
+    /// 设置源文件名（供错误信息与函数 source_file 字段）。
+    pub fn set_source_file(&mut self, file: String) {
+        self.source_file = Some(file);
+    }
+
+    /// 取出已记录的导出名（fn/class/const）与私有顶层名（var/:=/=）。
+    /// compile() 后由 module::compile_module_source 调用。
+    pub fn take_module_kinds(&mut self) -> (Vec<String>, Vec<String>) {
+        (
+            std::mem::take(&mut self.exports),
+            std::mem::take(&mut self.private_top_level),
+        )
     }
 }
 

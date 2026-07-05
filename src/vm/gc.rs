@@ -26,8 +26,8 @@
 
 use crate::vm::frame::CallFrame;
 use crate::vm::object::{
-    read_bound_method, read_class, read_instance, DictMap, MsBoundMethod, MsClass, MsInstance,
-    MsObjHeader, Object, TypeTag,
+    read_bound_method, read_class, read_instance, read_module, read_module_mut, DictMap,
+    MsBoundMethod, MsClass, MsInstance, MsModule, MsObjHeader, Object, TypeTag,
 };
 use crate::vm::DeferEntry;
 use std::collections::{HashMap, HashSet};
@@ -531,6 +531,53 @@ fn free_bound_method(obj: *mut MsObjHeader) {
     }
 }
 
+// ---- task 45 §9：MODULE 的 trace / forward / copy / free ----
+// MsModule 持有 exports + globals（均为 HashMap<String, Object>），其中 Object 值可能
+// 为 Ref。trace/forward 遍历二者的 values；copy 克隆整个 MsModule；free 经 Box::from_raw
+// 正确 Drop。当前 VM 日常分配（alloc_module）未接入 GC 堆，trace/copy/free 实际不被
+// 主循环 GC 调用；注册真实实现以防未来接入后 Ref 槽悬垂（与 CLASS/INSTANCE 同策略）。
+
+fn trace_module(obj: *mut MsObjHeader, cb: &mut dyn FnMut(*mut MsObjHeader)) {
+    let m = unsafe { read_module(obj) };
+    for v in m.exports.values() {
+        if let Object::Ref(r) = v {
+            cb(*r);
+        }
+    }
+    for v in m.globals.values() {
+        if let Object::Ref(r) = v {
+            cb(*r);
+        }
+    }
+}
+
+fn forward_fields_module(obj: *mut MsObjHeader, forwarder: &mut dyn FnMut(&mut Object)) {
+    let m = unsafe { read_module_mut(obj) };
+    for v in m.exports.values_mut() {
+        forwarder(v);
+    }
+    for v in m.globals.values_mut() {
+        forwarder(v);
+    }
+}
+
+fn copy_for_gc_module(src: *mut MsObjHeader) -> *mut MsObjHeader {
+    let s = unsafe { read_module(src) };
+    let new = Box::new(MsModule {
+        header: header_for(TypeTag::MODULE, s.header.size),
+        name: s.name.clone(),
+        exports: s.exports.clone(),
+        globals: s.globals.clone(),
+    });
+    Box::into_raw(new) as *mut MsObjHeader
+}
+
+fn free_module(obj: *mut MsObjHeader) {
+    unsafe {
+        drop(Box::from_raw(obj as *mut MsModule));
+    }
+}
+
 // ---- 静态描述表 ----
 
 static STRING_DESC: TypeDescriptor = TypeDescriptor {
@@ -624,9 +671,19 @@ static BOUND_METHOD_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<MsBoundMethod>(),
 };
 
-// FUNCTION/CLOSURE/CLASS/INSTANCE/MODULE/ITERATOR/GENERATOR/FUTURE/CHANNEL/
-// BOUND_METHOD/JOIN_HANDLE 在当前 Phase 2.5 尚未由 GC 托管，注册占位 noop trace +
-// placeholder copy/free，随对应 task 落地补真实实现。
+// task 45 §9：MODULE 已接入真实 trace/forward/copy/free。
+static MODULE_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::MODULE,
+    name: "module",
+    trace: trace_module,
+    copy_for_gc: copy_for_gc_module,
+    forward_fields: forward_fields_module,
+    free: free_module,
+    finalize: None,
+    size_base: std::mem::size_of::<MsModule>(),
+};
+
+// FUNCTION/CLOSURE/ITERATOR/GENERATOR/FUTURE/CHANNEL/JOIN_HANDLE 在当前 Phase 2.5
 static PLACEHOLDER_DESC: TypeDescriptor = TypeDescriptor {
     type_tag: TypeTag::FUNCTION, // 占位 tag，实际查找不依赖此字段
     name: "placeholder",
@@ -654,11 +711,13 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::INSTANCE as u8 => &INSTANCE_DESC,
         // task 41：BOUND_METHOD 已接入真实 trace/forward/copy/free。
         t if t == TypeTag::BOUND_METHOD as u8 => &BOUND_METHOD_DESC,
-        // 合法但当前未托管 TypeTag（6..=19 与 0xFF）→ 占位 noop trace。
+        // task 45 §9：MODULE 已接入真实 trace/forward/copy/free。
+        t if t == TypeTag::MODULE as u8 => &MODULE_DESC,
+        // 合法但当前未托管 TypeTag（6..=19 除 MODULE，与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。
         // CLOSURE/UPVALUE 真实 trace 待 GC 接管闭包堆分配后补全（future task）。
-        // TODO task 45: MODULE。TODO task 52/26: ITERATOR。
+        // TODO task 52/26: ITERATOR。
         // task 39: GENERATOR — Box 分配（alloc_generator），当前不经 gc_alloc，
         // trace/finalize 不被调用；GC 接管后需 trace stack_snapshot + receiver。
         // TODO task 53: FUTURE/CHANNEL/JOIN_HANDLE。

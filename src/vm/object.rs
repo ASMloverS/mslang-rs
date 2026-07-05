@@ -996,6 +996,67 @@ pub unsafe fn read_bound_method<'a>(ptr: *mut MsObjHeader) -> &'a mut MsBoundMet
     &mut *(ptr as *mut MsBoundMethod)
 }
 
+// ---------------------------------------------------------------------------
+// Module 堆对象（task 45）
+// ---------------------------------------------------------------------------
+
+/// Module 堆对象（TypeTag::MODULE = 10）。
+/// 参照 [45-module-system](../../docs/mslang/tasks/45-module-system.md) §1。
+///
+/// - `name`：模块名（如 "math_utils"）。
+/// - `exports`：可被外部访问的名称（fn/class/const），由 `from...import` / `module.name` 访问。
+/// - `globals`：模块私有全局作用域（var/:=/=），仅模块自身可见。
+///
+/// MVP：`alloc_module` 用 `Box::into_raw` 泄漏分配；task 52 GC 接管后由 TypeDescriptor
+/// （§9）回收。当前 VM 日常分配未接入 GC 堆，故 Module 不被 GC 回收（与 alloc_class 同期）。
+#[repr(C)]
+pub struct MsModule {
+    pub header: MsObjHeader,
+    pub name: String,
+    pub exports: HashMap<String, Object>,
+    pub globals: HashMap<String, Object>,
+}
+
+/// 分配空壳 Module（exports/globals 为空），返回 Object::Ref。
+/// `load()` 先建空壳登记缓存（支持循环导入部分访问），再填充。
+///
+/// MVP：Box 泄漏分配（参照 task 20/22 的 alloc_* 模式）；task 52 GC 上线后由 §9 的
+/// TypeDescriptor 接管。
+pub fn alloc_module(name: &str) -> Object {
+    let m = Box::new(MsModule {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::MODULE as u8,
+            size: std::mem::size_of::<MsModule>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        name: name.to_string(),
+        exports: HashMap::new(),
+        globals: HashMap::new(),
+    });
+    Object::Ref(Box::into_raw(m) as *mut MsObjHeader)
+}
+
+/// 读取 MsModule（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_module` 分配的、在 `'a` 期间有效的 `MsModule`。
+/// 生命周期由调用方约束（`'a`），**不得**用 `'static` — 遵循 task 20 read_* 约定。
+pub unsafe fn read_module<'a>(ptr: *mut MsObjHeader) -> &'a MsModule {
+    debug_assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8, "read_module on non-MODULE");
+    &*(ptr as *mut MsModule)
+}
+
+/// 读取 MsModule（可变，用于 load() 填充 exports/globals）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_module` 分配的、在 `'a` 期间有效的 `MsModule`。
+pub unsafe fn read_module_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsModule {
+    debug_assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8, "read_module_mut on non-MODULE");
+    &mut *(ptr as *mut MsModule)
+}
+
 impl MsClass {
     /// 沿继承链查找方法（task 41 §3）。单继承下链路线性，深度有限。
     /// 找到返回指向 MsClosure 的裸指针；parent 链递归至 None（task 42 前恒 None）。
@@ -1096,6 +1157,8 @@ impl Object {
                     "Error"
                 } else if tag == TypeTag::EXCEPTION_CLASS as u8 {
                     "class"
+                } else if tag == TypeTag::MODULE as u8 {
+                    "module"
                 } else {
                     "object"
                 }
@@ -2100,6 +2163,9 @@ impl fmt::Display for Object {
                     let mut strs: Vec<String> = inner.iter().map(|o| format!("{}", o)).collect();
                     strs.sort();
                     write!(f, "{{{}}}", strs.join(", "))
+                } else if tag == TypeTag::MODULE as u8 {
+                    // SAFETY: type_tag 为 MODULE，指针由 alloc_module 分配。
+                    write!(f, "<module \"{}\">", unsafe { read_module(*ptr) }.name)
                 } else {
                     write!(f, "<object:{}>", tag)
                 }

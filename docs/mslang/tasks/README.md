@@ -81,7 +81,7 @@
 
 | # | 任务 | 状态 |
 |---|---|---|
-| 45 | [模块系统（import）](45-module-system.md) | ⬜ |
+| 45 | [模块系统（import）](45-module-system.md) | ✅ |
 | 46 | [标准库 - io 模块](46-stdlib-io.md) | ⬜ |
 | 47 | [标准库 - math 模块](47-stdlib-math.md) | ⬜ |
 | 48 | [标准库 - os/string/time/path](48-stdlib-os-string-time.md) | ⬜ |
