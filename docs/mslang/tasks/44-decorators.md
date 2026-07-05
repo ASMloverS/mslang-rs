@@ -20,6 +20,8 @@ decorator  = "@" expression newline
 decorated  = decorator+ (fn_def | class_def)
 ```
 
+> **注**：`03-syntax.md` 的语句章节暂未列入 `decorated` 产生式，实际文法以本节（`07-advanced.md` § 装饰器）为准；后续 doc-sync 应将其补入 03-syntax。
+
 ### 语义
 
 装饰器是语法糖，编译时将函数/类定义与装饰器表达式组合：
@@ -97,7 +99,7 @@ fn parse_decorators(&mut self) -> Result<Vec<Expr>> {
 }
 ```
 
-在解析顶层声明时：
+在解析声明时（装饰器可用于顶层或函数体内的 fn/class 定义）：
 
 ```rust
 fn parse_declaration(&mut self) -> Result<Stmt> {
@@ -110,6 +112,11 @@ fn parse_declaration(&mut self) -> Result<Stmt> {
     } else {
         return Err(parse_error("expected function or class after decorator"));
     };
+    
+    // 无装饰器时直接返回，避免所有 fn/class 都被包成 Decorated 节点
+    if decorators.is_empty() {
+        return Ok(stmt);
+    }
     
     Ok(Stmt::Decorated {
         decorators,
@@ -132,56 +139,73 @@ struct Decorated {
 `src/compiler/statement.rs`：
 
 ```
-编译 @d1 @d2 fn f(args) { body }:
+编译 @d1 @d2 fn f(args) { body }（等价于 fn f(args){body}; f = d1(d2(f))）:
 
 1. 编译 fn f(args) { body }
-   → 函数已定义，f 存入局部/全局变量
-   → 栈上留有函数值
+   → fn 定义是语句，编译后栈上不留值
+   → 函数值已绑定到变量 f（顶层=全局，函数体内=局部）
 
 2. 应用装饰器（从内到外，即从下到上）:
-   对于 decorators = [d1, d2]（从上到下）
+   decorators = [d1, d2]（从上到下存储）
    应用顺序：先 d2，再 d1
 
-   // 应用 d2
-   a. 编译 d2 表达式       → 压栈装饰器
-   b. emit SWAP             → 交换栈顶：[func, d2] → [d2, func]
-   c. emit CALL 1           → d2(func)
-   // 栈顶现在是 d2(func) 的结果
+   // 应用 d2：计算 d2(f)
+   a. 编译 d2 表达式        → 栈: [d2]
+   b. emit LOAD f            → 栈: [d2, f]
+   c. emit CALL 1            → 栈: [d2(f)]
+   d. emit STORE f           → f = d2(f)，栈平衡
 
-   // 应用 d1
-   d. 编译 d1 表达式       → 压栈装饰器
-   e. emit SWAP
-   f. emit CALL 1           → d1(d2(func))
+   // 应用 d1：计算 d1(f)
+   e. 编译 d1 表达式        → 栈: [d1]
+   f. emit LOAD f            → 栈: [d1, f]
+   g. emit CALL 1            → 栈: [d1(f)]
+   h. emit STORE f           → f = d1(d2(f))，栈平衡
 
-3. emit STORE_GLOBAL "f"    → 用装饰后的结果覆盖原函数名
+3. 最终变量 f 即为装饰后的结果，无需额外收尾
 ```
+
+关键点：
+- **不需要 SWAP/ROT 指令**。先压装饰器、再压被装饰值，CALL 的栈序天然为 `decorator(func)`（callable 在下、参数在上），与 `11-bytecode-vm.md` 现有指令集一致。
+- **语句编译不留栈值**：`compile_stmt(target)` 编译 fn/class 定义后栈平衡，值已存入对应变量，由后续 `LOAD` 显式取回。
+- **每次循环结尾 STORE 回变量名**，栈始终平衡，无残留。
 
 更精确的实现：
 
 ```rust
 fn compile_decorated(&mut self, decorated: &Decorated) -> Result<()> {
-    // 先编译目标（fn 或 class）
-    self.compile_stmt(&decorated.target)?;
-    
-    // 目标编译后，函数/类值在栈顶，名称已存入全局变量
-    // 重新加载到栈顶
-    let target_name = decorated.target.name();
-    self.emit_load_global(target_name);
-    
-    // 反向遍历装饰器（从内到外）
-    for dec_expr in decorated.decorators.iter().rev() {
-        self.compile_expr(dec_expr)?;  // 装饰器函数
-        // 栈: [current_func, decorator]
-        // 需要交换参数顺序：decorator(current_func)
-        self.emit_swap();
-        self.emit_call(1);
-        // 栈顶为装饰后的结果
+    // 无装饰器：直接编译目标，避免无谓的 load/store
+    if decorated.decorators.is_empty() {
+        return self.compile_stmt(&decorated.target);
     }
-    
-    // 将最终结果存回变量名
-    self.emit_store_global(target_name);
-    
+
+    // 1. 编译目标（fn 或 class）。语句编译不留栈值，值已绑定到变量。
+    self.compile_stmt(&decorated.target)?;
+
+    // 2. 目标名与作用域：顶层用 GLOBAL，函数体内用 LOCAL(slot)
+    let target_name = decorated.target.name();
+    let is_global = self.current_scope().is_top_level();
+
+    // 3. 反向遍历装饰器（从内到外：靠近函数的先应用）
+    for dec_expr in decorated.decorators.iter().rev() {
+        self.compile_expr(dec_expr)?;                 // 栈: [decorator]
+        self.emit_load(target_name, is_global)?;      // 栈: [decorator, current]
+        self.emit_call(1);                            // 栈: [decorator(current)]
+        self.emit_store(target_name, is_global)?;     // 变量 = 结果，栈平衡
+    }
+
     Ok(())
+}
+```
+
+`emit_load` / `emit_store` 按作用域选择指令：
+```rust
+fn emit_load(&mut self, name: &str, is_global: bool) -> Result<()> {
+    if is_global { self.emit_load_global(name) }
+    else { let slot = self.resolve_local(name)?; self.emit_load_local(slot); Ok(()) }
+}
+fn emit_store(&mut self, name: &str, is_global: bool) -> Result<()> {
+    if is_global { self.emit_store_global(name) }
+    else { let slot = self.resolve_local(name)?; self.emit_store_local(slot); Ok(()) }
 }
 ```
 
@@ -204,43 +228,19 @@ fn f() {}
 
 不需要特殊处理——`parse_expression()` 已正确解析 `retry(3)` 为函数调用表达式。
 
-### 5. SWAP 指令
+### 5. 栈序与指令集
 
-需要引入一个 SWAP 或在调用前调整栈：
+装饰器编译**不需要任何新指令**，`11-bytecode-vm.md` 现有的 `LOAD_*` / `STORE_*` / `CALL` 即可完整表达。
 
-```rust
-OpCode::SWAP => {
-    let len = self.stack.len();
-    self.stack.swap(len - 1, len - 2);
-}
-```
+CALL 的栈序约定为 callable 在下、参数在上，因此只要编译顺序为"先装饰器表达式、后被装饰值"，栈即为 `[decorator, func]`，直接 `CALL 1` 得 `decorator(func)`，无需 SWAP/ROT/DUP 交换。
 
-或者不引入新指令，使用已有的 DUP + ROT：
-
-```
-// 调用 decorator(func)：
-// 栈: [func, decorator]
-
-1. emit LOAD_GLOBAL decorator_name
-// 栈: [func, decorator]
-
-2. emit SWAP
-// 栈: [decorator, func]
-
-不对，应该是 decorator(func)：
-栈需要是 [decorator, func]，然后 CALL 1
-
-如果编译顺序是先 func 后 decorator：
-栈: [func, decorator]
-需要 SWAP: [decorator, func]
-然后 CALL 1
-```
+> 注：早期方案曾考虑引入 `OpCode::SWAP`，但 `11-bytecode-vm.md` 的 OpCode 集并不包含 `SWAP` 或 `ROT`，故弃用。
 
 ### 6. 函数 name 属性
 
-被装饰后的函数应保留原始函数名。可以在 Closure 上增加 `name` 属性，装饰后可通过闭包捕获原函数名。
+`fn.name` 返回函数定义时的名称，不受装饰影响——装饰只是替换了变量绑定，原 Function/Closure 对象的 `name` 字段不变（`06-oop.md` 已规定函数对象自动拥有 `name` 属性，类对象拥有 `__name__`）。因此本 task 无需为 name 做额外工作。
 
-或者更简单：`fn.name` 返回函数定义时的名称，不受装饰影响（因为装饰只是替换了变量绑定，原函数的 name 不变）。
+> **AST 依赖**：编译期需获取被装饰目标的名称，要求 AST 中 `Stmt::Function` / `Stmt::Class` 变体暴露 `name()` 方法（分别返回函数名 / 类名）。该接口应由 Phase 1 的 AST 任务提供。
 
 ## 验证标准
 
@@ -250,17 +250,20 @@ OpCode::SWAP => {
 4. 类装饰器正确工作
 5. 装饰后函数可通过原名称调用
 6. 原始函数的 name 属性保留
+7. 装饰器表达式返回非可调用值（如 int）时，后续通过原名称调用抛出 TypeError
+8. `@` 后非 fn/class（如 `@dec\nx = 1`）抛出解析错误
+9. 函数体内的局部 `@dec fn ...` 正确绑定到局部作用域（不污染全局）
 
 ## 测试用例
 
 ```ms
 // test_decorators.ms — 装饰器
 
-// 基本装饰器
+// 基本装饰器（包装单参数函数，避免调用端 *args 展开）
 fn log(func) {
-    return fn(*args) {
+    return fn(x) {
         print("calling " + func.name)
-        result = func(*args)
+        result = func(x)
         print("returned " + str(result))
         return result
     }
@@ -273,11 +276,11 @@ fn double(x) {
 
 result = double(5)
 
-// 带参数的装饰器
+// 带参数的装饰器（包装零参数函数）
 fn add_tag(tag) {
     return fn(func) {
-        return fn(*args) {
-            return "<" + tag + ">" + func(*args) + "</" + tag + ">"
+        return fn() {
+            return "<" + tag + ">" + func() + "</" + tag + ">"
         }
     }
 }
@@ -325,6 +328,34 @@ class Foo {
 
 f = Foo()
 print(f.greet())
+
+// 边界：装饰器返回非可调用值，调用时抛 TypeError
+fn bad(func) {
+    return 42
+}
+
+@bad
+fn h() {
+    return 1
+}
+
+try {
+    h()
+    print("no error")
+} except TypeError {
+    print("TypeError caught")
+}
+
+// 边界：函数体内的局部装饰器，不污染全局
+fn make() {
+    @log
+    fn inner(x) {
+        return x + 1
+    }
+    return inner(10)
+}
+
+print(make())
 ```
 
 预期输出：
@@ -335,4 +366,7 @@ returned 10
 <b>hello</b>
 d1(d2(hi))
 Hello from Foo
+TypeError caught
+calling inner
+returned 11
 ```
