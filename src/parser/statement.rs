@@ -303,6 +303,49 @@ impl Parser {
         }
     }
 
+    // ---- 装饰器（task 44）----
+
+    /// 解析零或多个 `@expression newline` 装饰器。
+    /// 返回的 Vec 从上到下排列（decorators[0] 是最外层装饰器）。
+    fn parse_decorators(&mut self) -> Result<Vec<Expr>> {
+        let mut decorators = Vec::new();
+        while self.match_token(&[TokenKind::At]) {
+            let expr = self.parse_expression()?;
+            self.consume_newline();
+            decorators.push(expr);
+        }
+        Ok(decorators)
+    }
+
+    /// 解析声明：装饰器列表 + (fn_decl | class_decl)。
+    /// 无装饰器时直接返回裸语句（不包成 Decorated 节点）。
+    /// `@` 后非 fn/class 时返回解析错误。
+    pub(super) fn parse_declaration(&mut self) -> Result<Stmt> {
+        let decorators = self.parse_decorators()?;
+
+        let stmt = if self.check(&TokenKind::Fn) {
+            self.parse_fn_decl()?
+        } else if self.check(&TokenKind::Class) {
+            self.parse_class()?
+        } else {
+            let tok = self.peek();
+            return Err(MspError::ParseError {
+                line: tok.span.start.line,
+                column: tok.span.start.column,
+                message: "expected function or class definition after decorator".into(),
+            });
+        };
+
+        if decorators.is_empty() {
+            return Ok(stmt);
+        }
+
+        Ok(Stmt::Decorated {
+            decorators,
+            target: Box::new(stmt),
+        })
+    }
+
     // ---- nonlocal / global ----
 
     pub(super) fn parse_nonlocal(&mut self) -> Result<Stmt> {
@@ -1085,6 +1128,93 @@ mod tests {
                 assert_eq!(targets.len(), 2);
             }
             _ => panic!("expected from import"),
+        }
+    }
+
+    // ---- task 44：装饰器 ----
+
+    #[test]
+    fn test_decorator_basic() {
+        let prog = parse("@log\nfn double(x) {\n    return x * 2\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Decorated { decorators, target } => {
+                assert_eq!(decorators.len(), 1);
+                assert!(matches!(&decorators[0], Expr::Identifier(n) if n == "log"));
+                assert!(matches!(target.as_ref(), Stmt::FnDecl { name, .. } if name == "double"));
+            }
+            _ => panic!("expected decorated"),
+        }
+    }
+
+    #[test]
+    fn test_decorator_multiple() {
+        let prog = parse("@d1\n@d2\nfn greet() {\n    return \"hi\"\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Decorated { decorators, target } => {
+                // decorators[0] = d1 (outermost), decorators[1] = d2 (innermost)
+                assert_eq!(decorators.len(), 2);
+                assert!(matches!(&decorators[0], Expr::Identifier(n) if n == "d1"));
+                assert!(matches!(&decorators[1], Expr::Identifier(n) if n == "d2"));
+                assert!(matches!(target.as_ref(), Stmt::FnDecl { name, .. } if name == "greet"));
+            }
+            _ => panic!("expected decorated"),
+        }
+    }
+
+    #[test]
+    fn test_decorator_parameterized() {
+        let prog = parse("@add_tag(\"b\")\nfn get_text() {\n    return \"hello\"\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Decorated { decorators, .. } => {
+                assert_eq!(decorators.len(), 1);
+                // @add_tag("b") parses as a Call expression
+                assert!(matches!(&decorators[0], Expr::Call { .. }));
+            }
+            _ => panic!("expected decorated"),
+        }
+    }
+
+    #[test]
+    fn test_decorator_class() {
+        let prog = parse("@add_greet\nclass Foo {\n    fn __init__(self) {}\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Decorated { decorators, target } => {
+                assert_eq!(decorators.len(), 1);
+                assert!(matches!(&decorators[0], Expr::Identifier(n) if n == "add_greet"));
+                assert!(matches!(target.as_ref(), Stmt::ClassDecl { name, .. } if name == "Foo"));
+            }
+            _ => panic!("expected decorated class"),
+        }
+    }
+
+    #[test]
+    fn test_no_decorator_returns_bare_stmt() {
+        // fn without @ prefix should NOT be wrapped in Decorated.
+        let prog = parse("fn f() {\n    return 1\n}\n").unwrap();
+        assert!(matches!(&prog.statements[0], Stmt::FnDecl { .. }));
+    }
+
+    #[test]
+    fn test_decorator_error_on_non_fn_class() {
+        // @dec followed by non-fn/class should be a parse error.
+        let result = parse("@dec\nx = 1\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decorator_inside_function_body() {
+        let prog = parse(
+            "fn make() {\n    @log\n    fn inner(x) {\n        return x + 1\n    }\n    return inner(10)\n}\n",
+        )
+        .unwrap();
+        match &prog.statements[0] {
+            Stmt::FnDecl { body, .. } => {
+                assert!(matches!(
+                    &body[0],
+                    Stmt::Decorated { target, .. } if matches!(target.as_ref(), Stmt::FnDecl { name, .. } if name == "inner")
+                ));
+            }
+            _ => panic!("expected outer fn"),
         }
     }
 }

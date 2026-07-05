@@ -67,6 +67,9 @@ impl Compiler {
                 Err("import compilation not yet implemented (task 45)".into())
             }
             Stmt::Throw { expr } => self.compile_throw(expr, line),
+            Stmt::Decorated { decorators, target } => {
+                self.compile_decorated(decorators, target, line)
+            }
         }
     }
 }
@@ -326,7 +329,10 @@ impl Compiler {
         Ok(())
     }
 
-    /// 编译顶层函数声明（task 27/28）：编译闭包 + 绑定函数名到全局。
+    /// 编译顶层函数声明（task 27/28）：编译闭包 + 绑定函数名。
+    ///
+    /// task 44：作用域感知。顶层（parent 为空）用 STORE_GLOBAL；函数体内声明的具名
+    /// 函数声明局部 slot 并用 STORE_LOCAL，使装饰器与局部引用一致，不污染全局。
     fn compile_fn_decl(
         &mut self,
         name: &str,
@@ -335,12 +341,93 @@ impl Compiler {
         line: usize,
     ) -> Result<(), String> {
         self.compile_function_closure(name, params, body, line, false)?;
-        // 绑定函数名到全局（与 task 27 一致）
-        let name_idx = self.add_constant(alloc_string(name));
-        let name_idx = u16::try_from(name_idx)
-            .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
-        self.emit_byte(OpCode::StoreGlobal as u8, line);
-        self.emit_bytes(&name_idx.to_be_bytes(), line);
+        if self.unit.parent.is_null() {
+            // 顶层：STORE_GLOBAL（与 task 27 一致）
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::StoreGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+        } else {
+            // 函数体内：声明局部 slot + STORE_LOCAL（不污染全局）
+            if self.resolve_local(name).is_none() {
+                self.declare_local(name, line)?;
+            }
+            self.emit_store_name(name, line)?;
+        }
+        Ok(())
+    }
+
+    /// task 44：编译装饰器语句。语义糖——等价于先定义 target，再将 target 名称
+    /// 从内到外依次赋值为 `decorator(target)`。
+    ///
+    /// 编译策略（无 SWAP/ROT，栈每轮平衡）：
+    /// 1. 编译 target（fn/class 语句）——值已绑定到对应变量（全局或局部）。
+    /// 2. 反向遍历 decorators（靠近 target 的先应用）：
+    ///    - 编译 decorator 表达式 → [decorator]
+    ///    - emit_load_name(target) → [decorator, current]
+    ///    - CALL 1 → [decorator(current)]
+    ///    - emit_store_name(target) → 栈平衡
+    fn compile_decorated(
+        &mut self,
+        decorators: &[Expr],
+        target: &Stmt,
+        line: usize,
+    ) -> Result<(), String> {
+        // 1. 编译目标（fn 或 class）。语句编译不留栈值，值已绑定到变量。
+        self.compile_statement(target, line)?;
+
+        if decorators.is_empty() {
+            return Ok(());
+        }
+
+        // 2. 目标名（FnDecl/ClassDecl 的声明名）。
+        let target_name = target.decl_name().ok_or_else(|| {
+            "decorator target must be a function or class declaration".to_string()
+        })?;
+
+        // 3. 反向遍历（从内到外：靠近 target 的先应用）。
+        for dec_expr in decorators.iter().rev() {
+            self.compile_expression(dec_expr, line)?; // [decorator]
+            self.emit_load_name(target_name, line)?; // [decorator, current]
+            self.emit_byte(OpCode::Call as u8, line); // [decorator(current)]
+            self.emit_byte(1, line);
+            self.emit_store_name(target_name, line)?; // 变量 = 结果，栈平衡
+        }
+
+        Ok(())
+    }
+
+    /// task 44：按作用域加载变量名。顶层用 LOAD_GLOBAL，函数体内用 LOAD_LOCAL(slot)。
+    fn emit_load_name(&mut self, name: &str, line: usize) -> Result<(), String> {
+        if let Some(slot) = self.resolve_local(name) {
+            let slot = u8::try_from(slot).map_err(|_| "local slot exceeds 255".to_string())?;
+            self.emit_byte(OpCode::LoadLocal as u8, line);
+            self.emit_byte(slot, line);
+        } else {
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::LoadGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+        }
+        Ok(())
+    }
+
+    /// task 44：按作用域存储变量名。顶层用 STORE_GLOBAL，函数体内用 STORE_LOCAL(slot)。
+    /// 栈顶值弹出后写入目标。嵌套作用域的具名函数声明经此存为局部。
+    fn emit_store_name(&mut self, name: &str, line: usize) -> Result<(), String> {
+        if let Some(slot) = self.resolve_local(name) {
+            let slot = u8::try_from(slot).map_err(|_| "local slot exceeds 255".to_string())?;
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(slot, line);
+        } else {
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::StoreGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+        }
         Ok(())
     }
 
@@ -1379,5 +1466,49 @@ mod tests {
         let program = parse("defer 42");
         let mut compiler = Compiler::new();
         assert!(compiler.compile(&program).is_err());
+    }
+
+    // ---- task 44：装饰器编译 ----
+
+    #[test]
+    fn test_compile_decorator_emits_load_call_store() {
+        // @dec\nfn f() {...} 应编译为：CLOSURE + STORE_GLOBAL(f) + LOAD_GLOBAL(dec)
+        // + LOAD_GLOBAL(f) + CALL 1 + STORE_GLOBAL(f)。
+        let source = "@dec\nfn f() {\n    return 1\n}\n";
+        let chunk = compile(source);
+        // 验证存在 CALL 1（装饰器应用）。
+        let call_pos = chunk
+            .code
+            .windows(2)
+            .position(|w| w[0] == OpCode::Call as u8 && w[1] == 1)
+            .expect("CALL 1 for decorator application");
+        // CALL 前应有 LOAD_GLOBAL（dec 和 f 各一次）。
+        assert!(call_pos >= 2);
+    }
+
+    #[test]
+    fn test_compile_multiple_decorators_two_calls() {
+        // @d1\n@d2\nfn f() {} → 两次 CALL 1（d2 先应用，d1 后应用）。
+        let source = "@d1\n@d2\nfn f() {\n    return 1\n}\n";
+        let chunk = compile(source);
+        let call_count = chunk
+            .code
+            .windows(2)
+            .filter(|w| w[0] == OpCode::Call as u8 && w[1] == 1)
+            .count();
+        assert_eq!(call_count, 2, "expected 2 CALL 1 for 2 decorators");
+    }
+
+    #[test]
+    fn test_compile_no_decorator_no_extra_call() {
+        // 普通 fn 声明不应有装饰器的 CALL 1。
+        let source = "fn f() {\n    return 1\n}\n";
+        let chunk = compile(source);
+        let call_count = chunk
+            .code
+            .windows(2)
+            .filter(|w| w[0] == OpCode::Call as u8 && w[1] == 1)
+            .count();
+        assert_eq!(call_count, 0, "bare fn should have no decorator CALL");
     }
 }

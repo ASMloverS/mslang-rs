@@ -99,7 +99,9 @@ impl Parser {
     fn parse_statement(&mut self) -> Result<Stmt> {
         self.skip_newlines();
 
-        if self.check(&TokenKind::Var) {
+        if self.check(&TokenKind::At) {
+            self.parse_declaration()
+        } else if self.check(&TokenKind::Var) {
             self.parse_var_decl()
         } else if self.check(&TokenKind::Const) {
             self.parse_const_decl()

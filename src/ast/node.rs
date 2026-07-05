@@ -164,6 +164,23 @@ pub enum Stmt {
     Global {
         names: Vec<String>,
     },
+    /// task 44：装饰器。`decorators` 从上到下存储（decorators[0] 最外层），
+    /// `target` 为 FnDecl 或 ClassDecl。无装饰器时解析器直接返回裸 target，不经此变体。
+    Decorated {
+        decorators: Vec<Expr>,
+        target: Box<Stmt>,
+    },
+}
+
+impl Stmt {
+    /// 返回声明语句的名称（FnDecl → 函数名，ClassDecl → 类名），供编译器
+    /// 在装饰器场景下确定 load/store 的目标变量名。其余变体返回 None。
+    pub fn decl_name(&self) -> Option<&str> {
+        match self {
+            Stmt::FnDecl { name, .. } | Stmt::ClassDecl { name, .. } => Some(name),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -614,6 +631,12 @@ impl std::fmt::Display for Stmt {
             },
             Stmt::Nonlocal { names } => write!(f, "nonlocal {}", names.join(", ")),
             Stmt::Global { names } => write!(f, "global {}", names.join(", ")),
+            Stmt::Decorated { decorators, target } => {
+                for dec in decorators {
+                    writeln!(f, "@{}", dec)?;
+                }
+                write!(f, "{}", target)
+            }
         }
     }
 }

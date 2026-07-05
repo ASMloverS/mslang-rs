@@ -2512,6 +2512,22 @@ impl VM {
                                 ));
                             }
                         }
+                        // task 44：闭包 name 属性 — 返回底层 MsFunction.name。
+                        // 装饰器仅替换变量绑定，闭包对象的 name 字段保持定义时名称。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::CLOSURE as u8 =>
+                        {
+                            if attr == "name" {
+                                let cl = unsafe { read_closure(*ptr) };
+                                let n = unsafe { read_function(cl.function) }.function.name.clone();
+                                self.push(alloc_string(&n))?;
+                            } else {
+                                return Err(format!(
+                                    "AttributeError: 'function' has no attribute '{}'",
+                                    attr
+                                ));
+                            }
+                        }
                         _ => {
                             return Err(format!(
                                 "AttributeError: '{}' has no attribute '{}'",
@@ -8260,5 +8276,236 @@ len(Bad())
 "#;
         let err = compile_and_run(src).unwrap_err();
         assert!(err.contains("should return an int"), "got: {}", err);
+    }
+
+    // ---- task 44：装饰器 ----
+
+    /// 验证标准 1 + 5：基本装饰器等价于 `fn f() {}; f = dec(f)`，且装饰后可通过原名称调用。
+    #[test]
+    fn test_decorator_basic() {
+        let src = r#"
+fn dec(func) {
+    return fn(x) {
+        return func(x) + 1
+    }
+}
+@dec
+fn base(x) {
+    return x * 2
+}
+assert(base(5) == 11, str(base(5)))
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 验证标准 2：多重装饰器从下到上应用（靠近函数的先执行）。
+    #[test]
+    fn test_decorator_multiple_order() {
+        let src = r#"
+fn d1(func) {
+    return fn() {
+        return "d1(" + func() + ")"
+    }
+}
+fn d2(func) {
+    return fn() {
+        return "d2(" + func() + ")"
+    }
+}
+@d1
+@d2
+fn greet() {
+    return "hi"
+}
+assert(greet() == "d1(d2(hi))", greet())
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 验证标准 3：带参数的装饰器 `@dec(args)` 正确解析和执行。
+    #[test]
+    fn test_decorator_parameterized() {
+        let src = r#"
+fn add_tag(tag) {
+    return fn(func) {
+        return fn() {
+            return "<" + tag + ">" + func() + "</" + tag + ">"
+        }
+    }
+}
+@add_tag("b")
+fn get_text() {
+    return "hello"
+}
+assert(get_text() == "<b>hello</b>", get_text())
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 验证标准 4：类装饰器正确工作。
+    #[test]
+    fn test_decorator_class() {
+        // 类装饰器：装饰器接收类对象，可添加属性后返回。cls.attr = val 经 SET_ATTR
+        // 写入 class_attrs（非 methods），故通过类名或实例访问属性值。
+        let src = r#"
+fn add_greet(cls) {
+    cls.greeting = "Hello from " + cls.__name__
+    return cls
+}
+@add_greet
+class Foo {
+    fn __init__(self) {}
+}
+assert(Foo.greeting == "Hello from Foo", Foo.greeting)
+f = Foo()
+assert(f.greeting == "Hello from Foo", f.greeting)
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "class decorator failed: {:?}", r.err());
+    }
+
+    /// 验证标准 6：原始函数的 name 属性保留（装饰仅替换变量绑定）。
+    #[test]
+    fn test_decorator_preserves_name() {
+        let src = r#"
+fn passthrough(func) {
+    return func
+}
+@passthrough
+fn myfunc(x) {
+    return x
+}
+assert(myfunc.name == "myfunc", myfunc.name)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 验证标准 6 扩展：装饰器包装后的闭包 name 仍为原函数名。
+    #[test]
+    fn test_decorator_wrapped_name() {
+        let src = r#"
+fn log(func) {
+    return fn(x) {
+        return func.name
+    }
+}
+@log
+fn double(x) {
+    return x * 2
+}
+assert(double(5) == "double", double(5))
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 验证标准 7：装饰器返回非可调用值时，通过原名称调用抛出 TypeError。
+    #[test]
+    fn test_decorator_non_callable_errors() {
+        let src = r#"
+fn bad(func) {
+    return 42
+}
+@bad
+fn h() {
+    return 1
+}
+h()
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        assert!(err.contains("not callable"), "got: {}", err);
+    }
+
+    /// 验证标准 9：函数体内的局部 `@dec fn ...` 正确绑定到局部作用域。
+    #[test]
+    fn test_decorator_local_scope() {
+        let src = r#"
+fn wrapper(func) {
+    return fn(x) {
+        return func(x) + 100
+    }
+}
+fn make() {
+    @wrapper
+    fn inner(x) {
+        return x + 1
+    }
+    return inner(10)
+}
+assert(make() == 111, str(make()))
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    /// 完整集成测试：综合验证所有装饰器场景（等价于 test_decorators.ms）。
+    #[test]
+    fn test_decorator_integration() {
+        let src = r#"
+fn log(func) {
+    return fn(x) {
+        return func.name
+    }
+}
+@log
+fn double(x) {
+    return x * 2
+}
+assert(double(5) == "double")
+
+fn add_tag(tag) {
+    return fn(func) {
+        return fn() {
+            return "<" + tag + ">" + func() + "</" + tag + ">"
+        }
+    }
+}
+@add_tag("b")
+fn get_text() {
+    return "hello"
+}
+assert(get_text() == "<b>hello</b>")
+
+fn d1(func) {
+    return fn() {
+        return "d1(" + func() + ")"
+    }
+}
+fn d2(func) {
+    return fn() {
+        return "d2(" + func() + ")"
+    }
+}
+@d1
+@d2
+fn greet() {
+    return "hi"
+}
+assert(greet() == "d1(d2(hi))")
+
+fn add_greet(cls) {
+    cls.greeting = "Hello from " + cls.__name__
+    return cls
+}
+@add_greet
+class Foo {
+    fn __init__(self) {}
+}
+assert(Foo.greeting == "Hello from Foo")
+
+fn wrapper(func) {
+    return fn(x) {
+        return func(x) + 100
+    }
+}
+fn make() {
+    @wrapper
+    fn inner(x) {
+        return x + 1
+    }
+    return inner(10)
+}
+assert(make() == 111)
+"#;
+        assert!(compile_and_run(src).is_ok());
     }
 }
