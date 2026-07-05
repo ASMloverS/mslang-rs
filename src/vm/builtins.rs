@@ -245,29 +245,34 @@ pub(crate) fn object_to_string(vm: &mut VM, obj: &Object) -> Result<String, Stri
             let class_ptr = unsafe { read_instance(inst_ptr) }.class;
             let (str_ptr_opt, repr_ptr_opt, name) = {
                 let c = unsafe { read_class(class_ptr) };
-                (
-                    c.methods.get("__str__").copied(),
-                    c.methods.get("__repr__").copied(),
-                    c.name.clone(),
-                )
+                let s = unsafe { c.find_method("__str__") };
+                let r = unsafe { c.find_method("__repr__") };
+                (s, r, c.name.clone())
             };
-            // TODO task 43: __str__ 优先于 __repr__
-            if str_ptr_opt.is_some() {
-                let _ = str_ptr_opt; // task 43 实现 __str__ 调用
+            // task 43 §3：__str__ 优先于 __repr__，返回值须为 String。
+            if let Some(str_ptr) = str_ptr_opt {
+                let result = vm.invoke_method(str_ptr, obj.clone(), &[])?;
+                return rust_string(&result, "__str__");
             }
             if let Some(repr_ptr) = repr_ptr_opt {
                 let result = vm.invoke_method(repr_ptr, obj.clone(), &[])?;
-                return match &result {
-                    Object::Ref(p) if unsafe { (**p).type_tag } == TypeTag::STRING as u8 => {
-                        Ok(unsafe { read_str(*p) }.to_owned())
-                    }
-                    _ => Err("__repr__ must return a string".to_string()),
-                };
+                return rust_string(&result, "__repr__");
             }
             return Ok(format!("<{} instance>", name));
         }
     }
     Ok(format!("{}", obj))
+}
+
+/// task 43 §3：从预期为 String 的 Object 提取 Rust String；非 String 报错。
+/// `method_name` 用于错误信息（如 "__str__ must return a string"）。
+fn rust_string(obj: &Object, method_name: &str) -> Result<String, String> {
+    match obj {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+            Ok(unsafe { read_str(*ptr) }.to_owned())
+        }
+        _ => Err(format!("{} must return a string", method_name)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -287,8 +292,25 @@ fn builtin_type(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     Ok(alloc_string(arg.type_name()))
 }
 
-fn builtin_len(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+fn builtin_len(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("len() requires 1 argument")?;
+    // task 43 §9：Instance 有 __len__ 时分派（沿继承链），返回值须为 Int。
+    if let Object::Ref(ptr) = arg {
+        if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+            let len_ptr = unsafe {
+                let class_ptr = read_instance(*ptr).class;
+                read_class(class_ptr).find_method("__len__")
+            };
+            let len_ptr = len_ptr.ok_or_else(|| {
+                format!("TypeError: object of type '{}' has no len()", arg.type_name())
+            })?;
+            let result = vm.invoke_method(len_ptr, arg.clone(), &[])?;
+            return match &result {
+                Object::Int(n) => Ok(Object::Int(*n)),
+                _ => Err("__len__() should return an int".to_string()),
+            };
+        }
+    }
     match arg {
         Object::Ref(ptr) => {
             debug_assert!(!ptr.is_null(), "null Object::Ref");

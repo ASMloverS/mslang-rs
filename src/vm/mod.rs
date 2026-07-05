@@ -743,6 +743,27 @@ impl VM {
             Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
                 self.call_class(*ptr, argc)?;
             }
+            // task 43 §5：Instance 有 __call__ 时，替换栈上 callee 为 BoundMethod
+            // （receiver=实例），递归 call_value 走已有 BOUND_METHOD 调用路径。
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
+                let call_ptr = unsafe {
+                    let class_ptr = read_instance(*ptr).class;
+                    read_class(class_ptr).find_method("__call__")
+                };
+                match call_ptr {
+                    Some(mp) => {
+                        let bound = alloc_bound_method(self.stack[callee_idx].clone(), mp);
+                        self.stack[callee_idx] = bound;
+                        return self.call_value(argc);
+                    }
+                    None => {
+                        let name = unsafe { read_class(read_instance(*ptr).class) }
+                            .name
+                            .clone();
+                        return Err(format!("TypeError: '{}' object is not callable", name));
+                    }
+                }
+            }
             _ => {
                 return Err(format!(
                     "TypeError: '{}' object is not callable",
@@ -837,6 +858,41 @@ impl VM {
             self.run_loop(Some(caller_depth))?;
         }
         self.pop()
+    }
+
+    /// task 43 §8：若 obj 是 Instance 且其类（沿继承链）定义了 `method_name`，
+    /// 调用 obj.method(args...) 并返回 Ok(Some(result))；否则返回 Ok(None)，
+    /// 由调用方决定 fallback（内置运算）或报错。
+    /// 复用 invoke_method（§8）：内部创建 BoundMethod、压参、call_value、嵌套 run_loop、
+    /// 弹出返回值。GC 安全：invoke_method 在调用前将 receiver/args 压栈（栈为 GC 根集）。
+    fn try_instance_magic(
+        &mut self,
+        obj: &Object,
+        method_name: &str,
+        args: &[Object],
+    ) -> Result<Option<Object>, String> {
+        let method_ptr = if let Object::Ref(ptr) = obj {
+            if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+                let class_ptr = unsafe { read_instance(*ptr) }.class;
+                unsafe { read_class(class_ptr).find_method(method_name) }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match method_ptr {
+            Some(mp) => Ok(Some(self.invoke_method(mp, obj.clone(), args)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// task 43：判断 obj 是否为用户 Instance。
+    fn is_instance(obj: &Object) -> bool {
+        matches!(
+            obj,
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8
+        )
     }
 }
 
@@ -1388,50 +1444,71 @@ impl VM {
                 OpCode::Add => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.add(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__add__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.add(&b)?)?;
+                    }
                 }
 
                 OpCode::Subtract => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.subtract(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__sub__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.subtract(&b)?)?;
+                    }
                 }
 
                 OpCode::Multiply => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.multiply(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__mul__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.multiply(&b)?)?;
+                    }
                 }
 
                 OpCode::Divide => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.divide(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__div__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.divide(&b)?)?;
+                    }
                 }
 
                 OpCode::FloorDiv => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.floor_divide(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__floordiv__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.floor_divide(&b)?)?;
+                    }
                 }
 
                 OpCode::Modulo => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.modulo(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__mod__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.modulo(&b)?)?;
+                    }
                 }
 
                 OpCode::Power => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.power(&b)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__pow__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.power(&b)?)?;
+                    }
                 }
 
                 OpCode::Negate => {
@@ -1486,41 +1563,61 @@ impl VM {
                 OpCode::Equal => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    self.push(Object::Bool(a == b))?;
+                    if let Some(r) = self.try_instance_magic(&a, "__eq__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(Object::Bool(a == b))?;
+                    }
                 }
 
                 OpCode::NotEqual => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    self.push(Object::Bool(a != b))?;
+                    if let Some(r) = self.try_instance_magic(&a, "__ne__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(Object::Bool(a != b))?;
+                    }
                 }
 
                 OpCode::Less => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.compare(&b, CmpOp::Less)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__lt__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.compare(&b, CmpOp::Less)?)?;
+                    }
                 }
 
                 OpCode::Greater => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.compare(&b, CmpOp::Greater)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__gt__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.compare(&b, CmpOp::Greater)?)?;
+                    }
                 }
 
                 OpCode::LessEqual => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.compare(&b, CmpOp::LessEqual)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__le__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.compare(&b, CmpOp::LessEqual)?)?;
+                    }
                 }
 
                 OpCode::GreaterEqual => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    let result = a.compare(&b, CmpOp::GreaterEqual)?;
-                    self.push(result)?;
+                    if let Some(r) = self.try_instance_magic(&a, "__ge__", std::slice::from_ref(&b))? {
+                        self.push(r)?;
+                    } else {
+                        self.push(a.compare(&b, CmpOp::GreaterEqual)?)?;
+                    }
                 }
 
                 OpCode::Is => {
@@ -1530,12 +1627,18 @@ impl VM {
                 }
 
                 OpCode::In => {
-                    let b = self.pop()?;
-                    let a = self.pop()?;
-                    // 当前仅支持 String 子串判断（contains_str，src/vm/object.rs:744）。
-                    // List/Dict/Set 的成员判断由 task 22 扩展（或 task 26 容器函数）补全。
-                    let result = b.contains_str(&a)?;
-                    self.push(result)?;
+                    let container = self.pop()?;
+                    let item = self.pop()?;
+                    if Self::is_instance(&container) {
+                        if let Some(r) = self.try_instance_magic(&container, "__contains__", std::slice::from_ref(&item))? {
+                            self.push(r)?;
+                        } else {
+                            return Err("argument of type 'instance' is not iterable".into());
+                        }
+                    } else {
+                        // task 22/24 内置成员判断（String 子串、List/Set/Dict 成员）。
+                        self.push(container.contains_str(&item)?)?;
+                    }
                 }
 
                 OpCode::Not => {
@@ -2541,20 +2644,36 @@ impl VM {
                 }
 
                 // GET_INDEX（task 35）：[obj, key] → [result]。obj[key] 读取。
+                // task 43 §4：Instance 有 __getitem__ 时分派，否则报错。
                 OpCode::GetIndex => {
                     let key = self.pop()?;
                     let obj = self.pop()?;
-                    self.push(get_item(obj, key)?)?;
+                    if Self::is_instance(&obj) {
+                        if let Some(r) = self.try_instance_magic(&obj, "__getitem__", std::slice::from_ref(&key))? {
+                            self.push(r)?;
+                        } else {
+                            return Err("'instance' object is not subscriptable".into());
+                        }
+                    } else {
+                        self.push(get_item(obj, key)?)?;
+                    }
                 }
 
                 // SET_INDEX（task 35）：编译端 compile_assignment 先压 value（并 DUP 留结果），
                 // 再由 compile_store_target 压 obj、key，故栈底→顶为 [val, obj, key]。
                 // 按 LIFO 弹 key、obj、val；不压栈（DUP 的结果副本由上层 POP 处理）。
+                // task 43 §4：Instance 有 __setitem__ 时分派，否则报错。
                 OpCode::SetIndex => {
                     let key = self.pop()?;
                     let obj = self.pop()?;
                     let val = self.pop()?;
-                    set_item(obj, key, val)?;
+                    if Self::is_instance(&obj) {
+                        if self.try_instance_magic(&obj, "__setitem__", &[key, val])?.is_none() {
+                            return Err("'instance' object does not support item assignment".into());
+                        }
+                    } else {
+                        set_item(obj, key, val)?;
+                    }
                 }
 
                 // GET_SLICE（task 35）：flags(bit0=start/bit1=stop/bit2=step)。
@@ -7091,13 +7210,13 @@ assert(str(Point(3, 4)) == "Point(3, 4)")
 
     #[test]
     fn test_default_repr_when_none() {
-        // 无 __repr__ 时 print/str 返回 <ClassName instance>。
+        // task 43：无 __repr__ 时经继承链命中 Object.__repr__ → "ClassName instance"。
         let src = r#"
 class Plain {
     fn __init__(self) {
     }
 }
-assert(str(Plain()) == "<Plain instance>")
+assert(str(Plain()) == "Plain instance")
 "#;
         assert!(compile_and_run(src).is_ok());
     }
@@ -7837,5 +7956,309 @@ assert(s.__repr__() == "Simple instance")
             );
             assert_eq!(read_class(vm.object_class).name.clone(), "Object");
         }
+    }
+
+    // ---- task 43：魔术方法（自动分派）----
+
+    #[test]
+    fn test_magic_str_priority_over_repr() {
+        // 标准 1：__str__ 优先于 __repr__（print/str 调用）。
+        let src = r#"
+class Named {
+    fn __str__(self) {
+        return "str form"
+    }
+    fn __repr__(self) {
+        return "repr form"
+    }
+}
+n = Named()
+assert(str(n) == "str form")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_repr_no_str_falls_to_repr() {
+        // 标准 1：仅有 __repr__ 时被 print/str 调用。
+        let src = r#"
+class Box {
+    fn __init__(self, v) {
+        self.v = v
+    }
+    fn __repr__(self) {
+        return "Box(" + str(self.v) + ")"
+    }
+}
+assert(str(Box(42)) == "Box(42)")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_arithmetic_dispatch() {
+        // 标准 2：7 种算术运算符自动调用对应魔术方法。
+        let src = r#"
+class N {
+    fn __init__(self, v) {
+        self.v = v
+    }
+    fn __add__(self, o) {
+        return N(self.v + o.v)
+    }
+    fn __sub__(self, o) {
+        return N(self.v - o.v)
+    }
+    fn __mul__(self, o) {
+        return N(self.v * o.v)
+    }
+    fn __div__(self, o) {
+        return N(self.v // o.v)
+    }
+    fn __floordiv__(self, o) {
+        return N(self.v // o.v)
+    }
+    fn __mod__(self, o) {
+        return N(self.v % o.v)
+    }
+    fn __pow__(self, o) {
+        return N(self.v ** o.v)
+    }
+}
+a = N(20)
+b = N(3)
+assert((a + b).v == 23)
+assert((a - b).v == 17)
+assert((a * b).v == 60)
+assert((a / b).v == 6)
+assert((a // b).v == 6)
+assert((a % b).v == 2)
+assert((a ** b).v == 8000)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_comparison_dispatch() {
+        // 标准 3：6 种比较运算符自动调用对应魔术方法。
+        let src = r#"
+class V {
+    fn __init__(self, x) {
+        self.x = x
+    }
+    fn __eq__(self, o) {
+        return self.x == o.x
+    }
+    fn __ne__(self, o) {
+        return self.x != o.x
+    }
+    fn __lt__(self, o) {
+        return self.x < o.x
+    }
+    fn __le__(self, o) {
+        return self.x <= o.x
+    }
+    fn __gt__(self, o) {
+        return self.x > o.x
+    }
+    fn __ge__(self, o) {
+        return self.x >= o.x
+    }
+}
+a = V(5)
+b = V(5)
+c = V(9)
+assert(a == b)
+assert(a != c)
+assert(a < c)
+assert(a <= b)
+assert(c > a)
+assert(c >= a)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_call() {
+        // 标准 4：__call__ 使实例可调用。
+        let src = r#"
+class Multiplier {
+    fn __init__(self, factor) {
+        self.factor = factor
+    }
+    fn __call__(self, x) {
+        return x * self.factor
+    }
+}
+double = Multiplier(2)
+assert(double(5) == 10)
+triple = Multiplier(3)
+assert(triple(4) == 12)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_len() {
+        // 标准 5：__len__ 使 len() 工作（builtin_len INSTANCE 分派）。
+        let src = r#"
+class MyList {
+    fn __init__(self, items) {
+        self.items = items
+    }
+    fn __len__(self) {
+        return len(self.items)
+    }
+}
+ml = MyList([10, 20, 30])
+assert(len(ml) == 3)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_getitem_setitem() {
+        // 标准 6：__getitem__/__setitem__ 使下标访问工作。
+        let src = r#"
+class Store {
+    fn __init__(self) {
+        self.data = {}
+    }
+    fn __getitem__(self, key) {
+        return self.data[key]
+    }
+    fn __setitem__(self, key, val) {
+        self.data[key] = val
+    }
+}
+s = Store()
+s["a"] = 100
+s["b"] = 200
+assert(s["a"] == 100)
+assert(s["b"] == 200)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_contains() {
+        // 标准 7：__contains__ 使 in 运算符工作。
+        let src = r#"
+class Range10 {
+    fn __contains__(self, item) {
+        return item >= 0 and item < 10
+    }
+}
+r = Range10()
+assert(5 in r)
+assert(not (15 in r))
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_magic_str_non_string_error() {
+        // 标准 9：__str__ 返回非 String 报错。
+        let src = r#"
+class Bad {
+    fn __str__(self) {
+        return 42
+    }
+}
+str(Bad())
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("must return a string"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_magic_repr_non_string_error() {
+        // 标准 9：__repr__ 返回非 String 报错。
+        let src = r#"
+class Bad {
+    fn __repr__(self) {
+        return 42
+    }
+}
+str(Bad())
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("must return a string"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_magic_enter_exit_via_instance() {
+        // 标准 10：__enter__/__exit__ 经 Instance 路径工作（task 41 GET_ATTR + CALL）。
+        let src = r#"
+class Ctx {
+    fn __enter__(self) {
+        return "resource"
+    }
+    fn __exit__(self, err, msg, tb) {
+        return false
+    }
+}
+result = ""
+with Ctx() as r {
+    result = r
+}
+assert(result == "resource")
+"#;
+        let r = compile_and_run(src);
+        assert!(r.is_ok(), "with via Instance failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_magic_binary_left_operand_only() {
+        // 标准 11：二元运算仅检查左操作数。Int + Instance（左 Int 无 __add__）
+        // fallback 到内置 (Int, Ref) 匹配失败 → TypeError（无反射运算符）。
+        let src = r#"
+class V {
+    fn __init__(self, x) {
+        self.x = x
+    }
+    fn __add__(self, o) {
+        return V(self.x + o.x)
+    }
+}
+v = V(5)
+x = 1 + v
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(
+            err.contains("TypeError") && err.contains("unsupported operand"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_magic_getitem_without_method_errors() {
+        // Instance 无 __getitem__ 时报 not subscriptable。
+        let src = r#"
+class Bare {
+    fn __init__(self) {
+    }
+}
+b = Bare()
+x = b[0]
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("not subscriptable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_magic_len_non_int_return_errors() {
+        // __len__ 返回非 Int 报错。
+        let src = r#"
+class Bad {
+    fn __len__(self) {
+        return "nope"
+    }
+}
+len(Bad())
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("should return an int"), "got: {}", err);
     }
 }
