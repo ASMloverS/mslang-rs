@@ -46,7 +46,12 @@ impl Compiler {
             Stmt::FnDecl {
                 name, params, body, ..
             } => self.compile_fn_decl(name, params, body, line),
-            Stmt::ClassDecl { .. } => Err("class compilation not yet implemented (task 40)".into()),
+            Stmt::ClassDecl {
+                name,
+                parent,
+                methods,
+                class_vars,
+            } => self.compile_class_decl(name, parent, methods, class_vars, line),
             Stmt::Defer { expr } => self.compile_defer(expr, line),
             Stmt::Try {
                 try_block,
@@ -194,12 +199,13 @@ impl Compiler {
         Ok(())
     }
 
-    /// 编译函数声明（task 27/28）。
+    /// 编译函数/方法体为 CLOSURE 指令（含逐上值操作数），闭包留在栈顶，**不**绑定名。
     /// 创建独立编译单元（parent 链接父单元以启用上值解析），预留 slot 0 给被调用者
     /// （closure 自身），参数从 slot 1 起。编译函数体后追加隐式 `NIL + RETURN`。
     /// task 28 改造：存 **Function**（非 Closure）入常量池，发 `CLOSURE` 指令 +
     /// 逐上值操作数（运行期包装），并写真值 `upvalue_count`。
-    fn compile_fn_decl(
+    /// 顶层函数（compile_fn_decl）后接 STORE_GLOBAL；类方法（compile_class_decl）后接 METHOD。
+    fn compile_function_closure(
         &mut self,
         name: &str,
         params: &[crate::ast::node::Param],
@@ -300,12 +306,101 @@ impl Compiler {
             self.emit_byte(idx, line);
         }
 
+        Ok(())
+    }
+
+    /// 编译顶层函数声明（task 27/28）：编译闭包 + 绑定函数名到全局。
+    fn compile_fn_decl(
+        &mut self,
+        name: &str,
+        params: &[crate::ast::node::Param],
+        body: &[Stmt],
+        line: usize,
+    ) -> Result<(), String> {
+        self.compile_function_closure(name, params, body, line)?;
         // 绑定函数名到全局（与 task 27 一致）
         let name_idx = self.add_constant(alloc_string(name));
         let name_idx = u16::try_from(name_idx)
             .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
         self.emit_byte(OpCode::StoreGlobal as u8, line);
         self.emit_bytes(&name_idx.to_be_bytes(), line);
+        Ok(())
+    }
+
+    /// 编译 class 定义（task 40）。
+    /// 字节码布局：
+    ///   CLASS name            → 类对象压栈
+    ///   [每个类属性] DUP class; <expr>; SET_ATTR name   → 仍留 [class]
+    ///   [每个方法]   <CLOSURE>;  METHOD name            → 仍留 [class]
+    ///   STORE_GLOBAL name     → 存为全局变量
+    /// 仅支持顶层 class 定义；继承语法（parent 非空）编译期报错（task 42）。
+    fn compile_class_decl(
+        &mut self,
+        name: &str,
+        parent: &Option<String>,
+        methods: &[Stmt],
+        class_vars: &[(String, Expr)],
+        line: usize,
+    ) -> Result<(), String> {
+        // R2/B4：继承语法由 task 42 实现，本任务编译期拒绝（parser 已接受 `< Parent`）。
+        if parent.is_some() {
+            return Err("inheritance not yet supported (task 42)".into());
+        }
+        // 函数内定义 class 暂不支持（task 17 局部变量规则未覆盖 class）。
+        if !self.unit.parent.is_null() {
+            return Err("class definition inside function not supported".into());
+        }
+
+        // CLASS name → [class]
+        let name_idx = self.add_constant(alloc_string(name));
+        let name_idx = u16::try_from(name_idx)
+            .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+        self.emit_byte(OpCode::Class as u8, line);
+        self.emit_bytes(&name_idx.to_be_bytes(), line);
+
+        // STORE_GLOBAL name → []（提前存储，使 class_vars / methods 可经 LOAD_GLOBAL 引用类自身）
+        self.emit_byte(OpCode::StoreGlobal as u8, line);
+        self.emit_bytes(&name_idx.to_be_bytes(), line);
+
+        // 类属性：value; DUP; LOAD_GLOBAL name; SET_ATTR attr → [value]; POP
+        // （SET_ATTR 约定 obj=pop(栈顶)，故 class 须在 value 之上，与 compile_store_target(Dot) 一致）
+        for (attr_name, attr_expr) in class_vars {
+            self.compile_expression(attr_expr, line)?;
+            self.emit_byte(OpCode::Dup as u8, line);
+            self.emit_byte(OpCode::LoadGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+            let attr_idx = self.add_constant(alloc_string(attr_name));
+            let attr_idx = u16::try_from(attr_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::SetAttr as u8, line);
+            self.emit_bytes(&attr_idx.to_be_bytes(), line);
+            self.emit_byte(OpCode::Pop as u8, line);
+        }
+
+        // 方法：LOAD_GLOBAL name; CLOSURE; METHOD name → [class]; POP
+        for method in methods {
+            let (m_name, m_params, m_body) =
+                match method {
+                    Stmt::FnDecl {
+                        name, params, body, ..
+                    } => (name, params, body),
+                    _ => return Err(
+                        "class body member must be a method or class variable (fn / name = expr)"
+                            .into(),
+                    ),
+                };
+            self.emit_byte(OpCode::LoadGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+            self.compile_function_closure(m_name, m_params, m_body, line)?;
+            let m_idx = self.add_constant(alloc_string(m_name));
+            let m_idx = u16::try_from(m_idx)
+                .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
+            self.emit_byte(OpCode::Method as u8, line);
+            self.emit_bytes(&m_idx.to_be_bytes(), line);
+            self.emit_byte(OpCode::Pop as u8, line);
+        }
+
+        // 类已在上文 STORE_GLOBAL，无需重复存储。
         Ok(())
     }
 

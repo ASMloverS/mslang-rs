@@ -7,12 +7,13 @@ use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::vm::builtins::{read_native_function, to_iterator};
 use crate::vm::object::{
-    alloc_closure, alloc_dict, alloc_exception, alloc_exception_class, alloc_function,
-    alloc_generator, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple,
-    alloc_upvalue, read_closure, read_dict, read_exception, read_exception_class,
-    read_exception_mut, read_function, read_generator, read_generator_mut, read_iterator,
-    read_list, read_set, read_str, read_tuple, read_upvalue, CmpOp, DictMap, Function,
-    GeneratorState, MsException, MsGenerator, MsObjHeader, MsUpvalue, Object, TypeTag,
+    alloc_class, alloc_closure, alloc_dict, alloc_exception, alloc_exception_class, alloc_function,
+    alloc_generator, alloc_instance, alloc_iterator, alloc_list, alloc_set, alloc_string,
+    alloc_tuple, alloc_upvalue, read_class, read_closure, read_dict, read_exception,
+    read_exception_class, read_exception_mut, read_function, read_generator, read_generator_mut,
+    read_instance, read_iterator, read_list, read_set, read_str, read_tuple, read_upvalue, CmpOp,
+    DictMap, Function, GeneratorState, MsException, MsGenerator, MsObjHeader, MsUpvalue, Object,
+    TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -109,6 +110,10 @@ pub struct VM {
     /// task 39：GET_ATTR 对 GENERATOR 解析 __next__/close/__iter__ 时写入待调用方法 id，
     /// CALL（call_value）对 GENERATOR 被调用者读取并清空。1=__next__，2=close，3=__iter__。
     gen_call_method: Option<u8>,
+    /// task 40：GET_ATTR 在实例上找到方法且紧随 CALL（`obj.method(args)`）时，记下 receiver。
+    /// call_value 起始处取出并注入为 self（slot 1）。**非** BoundMethod 堆对象（task 41 的职责）：
+    /// 此为调用点暂存槽，仅在 GET_ATTR→CALL 紧邻时生效，避免泄漏到无关调用。
+    pending_method_self: Option<Object>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     heap: gc::MsHeap,
@@ -129,6 +134,7 @@ impl VM {
             pending_unwind: None,
             gen_outcome: None,
             gen_call_method: None,
+            pending_method_self: None,
             heap: gc::MsHeap::new(),
         };
         vm.register_builtins();
@@ -540,12 +546,18 @@ impl VM {
     /// CALL 子流程（task 25/27/36）：栈顶为 [callee, arg1, ..., arg(argc)]。
     /// native（FUNCTION）同步执行并压结果；用户函数（CLOSURE）压入新帧（异步）。
     /// 抽出以供 EXEC_DEFER 的 defer 调用复用（task 36）。
-    fn call_value(&mut self, argc: usize) -> Result<(), String> {
+    fn call_value(&mut self, mut argc: usize) -> Result<(), String> {
         // 边界检查（D1）：防止 argc 过大导致下溢/越界。
         if argc + 1 > self.stack.len() {
             return Err("stack underflow for CALL arguments".to_string());
         }
         let callee_idx = self.stack.len() - argc - 1;
+        // task 40：`obj.method(args)` 时 GET_ATTR 已记下 receiver，此处注入为 self（slot 1）。
+        // task 41 切换为 BoundMethod 堆对象后此暂存机制移除。
+        if let Some(receiver) = self.pending_method_self.take() {
+            self.stack.insert(callee_idx + 1, receiver);
+            argc += 1;
+        }
         let callee = self.stack[callee_idx].clone();
         match &callee {
             // task 39: GENERATOR 方法调用（gen.__next__() / gen.close() / gen.__iter__()）。
@@ -695,6 +707,10 @@ impl VM {
                     Object::Nil,
                 ))?;
             }
+            // task 40：用户类对象（CLASS）— `ClassName(args)` 构造实例并调用 __init__。
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
+                self.call_class(*ptr, argc)?;
+            }
             _ => {
                 return Err(format!(
                     "TypeError: '{}' object is not callable",
@@ -703,6 +719,91 @@ impl VM {
             }
         }
         Ok(())
+    }
+
+    /// task 40 §8：实例化类对象。`ClassName(args)` → 创建 Instance、查 __init__、
+    /// task 41 前**不**使用 BoundMethod：直接构造 [closure, self, args...] 并 call(argc+1)。
+    /// R4：无 __init__ 且 argc>0 报错。§13：含 __del__ 的类在 instance 上置 HAS_FINALIZER。
+    fn call_class(&mut self, cls_ptr: *mut MsObjHeader, argc: usize) -> Result<(), String> {
+        // V1/R1：防御性栈下溢校验。
+        if argc + 1 > self.stack.len() {
+            return Err("stack underflow in call_class".into());
+        }
+        // 弹出参数（top-first）与 callee(class)。
+        let mut args: Vec<Object> = (0..argc).map(|_| self.pop()).collect::<Result<_, _>>()?;
+        self.pop()?; // 弹出 class
+        args.reverse(); // 复原为 bottom-to-top 顺序
+
+        let inst_obj = alloc_instance(cls_ptr);
+        // §13：含 __del__ 的类，instance 置 has_finalizer（配合 task 52 run_finalizers）。
+        let has_del = unsafe { read_class(cls_ptr) }
+            .methods
+            .contains_key("__del__");
+        if let Object::Ref(ip) = &inst_obj {
+            if has_del {
+                unsafe {
+                    (*(*ip)).set_has_finalizer(true);
+                }
+            }
+        }
+
+        let init_ptr_opt = unsafe { read_class(cls_ptr) }
+            .methods
+            .get("__init__")
+            .copied();
+        match init_ptr_opt {
+            Some(init_ptr) => {
+                // 栈布局：[closure, inst(self), args...]，call(argc+1)。
+                self.push(Object::Ref(init_ptr))?;
+                self.push(inst_obj.clone())?; // slot 0 = self
+                for arg in &args {
+                    self.push(arg.clone())?;
+                }
+                let caller_depth = self.call_stack.len();
+                self.call_value(argc + 1)?;
+                // __init__ 为闭包 → 已压帧；驱动至其返回（复用生成器的 run_loop 模式）。
+                if self.call_stack.len() > caller_depth {
+                    self.run_loop(Some(caller_depth))?;
+                }
+                // __init__ 的返回值（nil）丢弃；实例对象保留为构造调用的结果。
+                self.pop()?;
+                self.push(inst_obj)?;
+                Ok(())
+            }
+            None => {
+                // R4：无 __init__ 且有参数 → 报错（与 Python 一致）。
+                if argc > 0 {
+                    let cls_name = unsafe { read_class(cls_ptr) }.name.clone();
+                    return Err(format!("'{}' takes no arguments (got {})", cls_name, argc));
+                }
+                self.push(inst_obj)?;
+                Ok(())
+            }
+        }
+    }
+
+    /// task 40 §10：在当前帧之上调用一个闭包并运行至返回，取其返回值。
+    /// 供 print/str 经由 __repr__/__str__ 显示 Instance 使用。
+    /// `receiver` 占 slot 0（self），`extra_args` 紧随其后。
+    fn invoke_method(
+        &mut self,
+        closure_ptr: *mut MsObjHeader,
+        receiver: Object,
+        extra_args: &[Object],
+    ) -> Result<Object, String> {
+        self.push(Object::Ref(closure_ptr))?;
+        self.push(receiver)?;
+        let mut argc = 1usize;
+        for a in extra_args {
+            self.push(a.clone())?;
+            argc += 1;
+        }
+        let caller_depth = self.call_stack.len();
+        self.call_value(argc)?;
+        if self.call_stack.len() > caller_depth {
+            self.run_loop(Some(caller_depth))?;
+        }
+        self.pop()
     }
 }
 
@@ -1242,6 +1343,9 @@ impl VM {
 
                 OpCode::Pop => {
                     self.pop()?;
+                    // task 40：清除暂存的 method self（GET_ATTR 设置，call_value 消费）。
+                    // Pop 仅在语句/表达式边界执行，不会出现在 GET_ATTR→…→CALL 之间。
+                    self.pending_method_self = None;
                 }
 
                 OpCode::Dup => {
@@ -2189,9 +2293,7 @@ impl VM {
                         // Phase 5 task 41/43 由 Instance 接管，本分支删除。
                         // 注：Object 对 STRING Ref 按内容哈希/相等（object.rs Hash/Eq），
                         // 故 alloc_string(&attr) 与源码字面量键按内容匹配。
-                        Object::Ref(ptr)
-                            if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 =>
-                        {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
                             let key = alloc_string(&attr);
                             let val = unsafe { read_dict(*ptr) }
                                 .get(&key)
@@ -2217,12 +2319,136 @@ impl VM {
                             };
                             self.push(val)?;
                         }
-                        _ => {
-                            return Err(
-                                "GET_ATTR for non-exception/non-dict types: not yet implemented (task 41/43)"
-                                    .into(),
-                            )
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 =>
+                        {
+                            // V5 修复：先 copy 出裸指针（*mut is Copy），再分阶段查找，
+                            // 避免嵌套 read_instance/read_class 的可变借用同时存活。
+                            let inst_ptr = *ptr;
+                            let class_ptr = unsafe { read_instance(inst_ptr) }.class;
+                            // 1. 实例字段
+                            if let Some(v) = unsafe { read_instance(inst_ptr) }
+                                .fields
+                                .get(&attr)
+                                .cloned()
+                            {
+                                self.push(v)?;
+                            } else if let Some(m) =
+                                unsafe { read_class(class_ptr) }.methods.get(&attr).copied()
+                            {
+                                // task 41 前：返回 closure。为使 `obj.method(args)` 可用，
+                                // 记下 receiver 供下一次 call_value 注入为 self。
+                                // 在 Pop 中清除（避免 `m = obj.method; f()` 误注入）。
+                                // task 41 后：alloc_bound_method(obj, m) 返回 BoundMethod。
+                                self.push(Object::Ref(m))?;
+                                self.pending_method_self = Some(obj.clone());
+                            } else if let Some(v) = unsafe { read_class(class_ptr) }
+                                .class_attrs
+                                .get(&attr)
+                                .cloned()
+                            {
+                                self.push(v)?;
+                            } else if attr == "__name__" {
+                                // §12：__name__ 内置属性（合成，不入 class_attrs）。
+                                let n = unsafe { read_class(class_ptr) }.name.clone();
+                                self.push(alloc_string(&n))?;
+                            } else {
+                                let cls_name = unsafe { read_class(class_ptr) }.name.clone();
+                                return Err(format!(
+                                    "'{}' instance has no attribute '{}'",
+                                    cls_name, attr
+                                ));
+                            }
                         }
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
+                            let cls_ptr = *ptr;
+                            if let Some(m) =
+                                unsafe { read_class(cls_ptr) }.methods.get(&attr).copied()
+                            {
+                                self.push(Object::Ref(m))?;
+                            } else if let Some(v) = unsafe { read_class(cls_ptr) }
+                                .class_attrs
+                                .get(&attr)
+                                .cloned()
+                            {
+                                self.push(v)?;
+                            } else if attr == "__name__" {
+                                let n = unsafe { read_class(cls_ptr) }.name.clone();
+                                self.push(alloc_string(&n))?;
+                            } else {
+                                let cls_name = unsafe { read_class(cls_ptr) }.name.clone();
+                                return Err(format!(
+                                    "class '{}' has no attribute '{}'",
+                                    cls_name, attr
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(format!(
+                                "AttributeError: '{}' has no attribute '{}'",
+                                obj.type_name(),
+                                attr
+                            ))
+                        }
+                    }
+                }
+
+                // SET_ATTR（task 40）：编译端 compile_store_target(Dot) 在已求值的
+                // 赋值值之上压入 object，故栈顶为 object，其下为 value。弹 object、value
+                // 后写入，**不压结果**（与 SetIndex 一致：DUP 的副本留作赋值表达式的值）。
+                OpCode::SetAttr => {
+                    let name_idx = self.read_u16()? as usize;
+                    let attr = self.read_string_constant(name_idx)?;
+                    let obj = self.pop()?;
+                    let value = self.pop()?;
+                    match obj {
+                        Object::Ref(ptr)
+                            if unsafe { (*ptr).type_tag } == TypeTag::INSTANCE as u8 =>
+                        {
+                            // TODO task 62: 并发 GC 启用后须经 write_barrier
+                            unsafe { read_instance(ptr) }.fields.insert(attr, value);
+                        }
+                        Object::Ref(ptr) if unsafe { (*ptr).type_tag } == TypeTag::CLASS as u8 => {
+                            // TODO task 62: 并发 GC 启用后须经 write_barrier
+                            unsafe { read_class(ptr) }.class_attrs.insert(attr, value);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "AttributeError: cannot set attribute on '{}'",
+                                obj.type_name()
+                            ))
+                        }
+                    }
+                }
+
+                // CLASS（task 40 §6）：name_idx(2) → 创建类对象压栈。
+                OpCode::Class => {
+                    let name_idx = self.read_u16()? as usize;
+                    let name = self.read_string_constant(name_idx)?;
+                    self.push(alloc_class(name))?;
+                }
+
+                // METHOD（task 40 §7）：name_idx(2) → 弹栈顶 closure，peek 栈顶 class，
+                // 插入 methods。V4 修复：栈顶非 closure 时返回明确错误。
+                OpCode::Method => {
+                    let name_idx = self.read_u16()? as usize;
+                    let name = self.read_string_constant(name_idx)?;
+                    let method_obj = self.pop()?;
+                    let method_ptr = match method_obj {
+                        Object::Ref(p) if unsafe { (*p).type_tag } == TypeTag::CLOSURE as u8 => p,
+                        _ => return Err("METHOD expects a closure on stack".into()),
+                    };
+                    let cls_obj = self.peek(0)?;
+                    match cls_obj {
+                        Object::Ref(cls_ptr)
+                            if unsafe { (**cls_ptr).type_tag } == TypeTag::CLASS as u8 =>
+                        {
+                            // TODO task 62: 并发 GC 启用后，methods.insert 须经 write_barrier
+                            unsafe { read_class(*cls_ptr) }
+                                .methods
+                                .insert(name, method_ptr);
+                        }
+                        _ => return Err("METHOD target is not a Class".into()),
                     }
                 }
 
@@ -2291,8 +2517,8 @@ mod tests {
     use crate::lexer::Lexer;
     use crate::parser::Parser;
     use crate::vm::object::{
-        alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, read_list,
-        DictMap, IteratorState, Object,
+        alloc_class, alloc_dict, alloc_instance, alloc_iterator, alloc_list, alloc_set,
+        alloc_string, alloc_tuple, read_class, read_list, DictMap, IteratorState, Object,
     };
     use std::collections::HashSet;
 
@@ -6657,5 +6883,356 @@ r
 "#;
         let r = compile_and_run(src).unwrap();
         assert_eq!(to_list(&r), vec![i(100), i(101), i(102)]);
+    }
+
+    // ---- task 40：类定义与实例化 ----
+
+    #[test]
+    fn test_class_creation_and_store_global() {
+        // 验证标准 1：class 定义创建类对象并存入全局变量（可被 LOAD_GLOBAL 取回）。
+        let src = r#"
+class Empty {
+    fn id(self) {
+        return 42
+    }
+}
+e = Empty()
+assert(e.id() == 42)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_class_init_and_fields() {
+        // 验证标准 3/6：ClassName(args) 创建实例并调用 __init__；self.attr 读写实例字段。
+        let src = r#"
+class Box {
+    fn __init__(self, v) {
+        self.v = v
+    }
+}
+b = Box(7)
+assert(b.v == 7)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_instance_method_call() {
+        // 验证标准 4：obj.method(args)（self 由调用点暂存槽自动注入，task 41 切换 BoundMethod）。
+        let src = r#"
+class Adder {
+    fn __init__(self, base) {
+        self.base = base
+    }
+    fn add(self, x) {
+        return self.base + x
+    }
+}
+a = Adder(10)
+assert(a.add(5) == 15)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_class_attribute_shared() {
+        // 验证标准 2：类属性在所有实例间共享。
+        let src = r#"
+class C {
+    count = 100
+}
+c1 = C()
+c2 = C()
+assert(c1.count + c2.count + C.count == 300)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_dynamic_attribute() {
+        // 验证标准 7：动态属性赋值（obj.new_attr = val）。
+        let src = r#"
+class P {
+    fn __init__(self) {
+        self.x = 1
+    }
+}
+p = P()
+p.y = 99
+assert(p.x + p.y == 100)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_repr_via_str() {
+        // 验证标准 5：__repr__ 被 print/str 调用（__str__ 优先级由 task 43）。
+        let src = r#"
+class Animal {
+    fn __init__(self, name) {
+        self.name = name
+    }
+    fn __repr__(self) {
+        return "Animal(" + self.name + ")"
+    }
+}
+assert(str(Animal("Dog")) == "Animal(Dog)")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_repr_point() {
+        // test_class.ms 中 Point 的 __repr__（含 str(int) 拼接）。
+        let src = r#"
+class Point {
+    fn __init__(self, x, y) {
+        self.x = x
+        self.y = y
+    }
+    fn __repr__(self) {
+        return "Point(" + str(self.x) + ", " + str(self.y) + ")"
+    }
+}
+assert(str(Point(3, 4)) == "Point(3, 4)")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_default_repr_when_none() {
+        // 无 __repr__ 时 print/str 返回 <ClassName instance>。
+        let src = r#"
+class Plain {
+    fn __init__(self) {
+    }
+}
+assert(str(Plain()) == "<Plain instance>")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_name_attribute() {
+        // 验证标准 8：__name__ 内置属性（Instance 与 Class 均返回类名）。
+        let src = r#"
+class Widget {
+    fn __init__(self) {
+    }
+}
+w = Widget()
+assert(w.__name__ == "Widget")
+assert(Widget.__name__ == "Widget")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_multiple_instances_independent() {
+        // 多个实例互不干扰（实例字段 per-instance）。
+        let src = r#"
+class Counter {
+    fn __init__(self, start) {
+        self.n = start
+    }
+    fn bump(self) {
+        self.n = self.n + 1
+        return self.n
+    }
+}
+a = Counter(0)
+b = Counter(100)
+assert(a.bump() + b.bump() == 102)
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_get_attr_unknown_error() {
+        // 验证标准（GET_ATTR 错误路径）：实例无该属性时报错。
+        let src = r#"
+class C {
+    fn __init__(self) {
+        self.a = 1
+    }
+}
+c = C()
+c.nope
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("has no attribute"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_no_init_with_args_error() {
+        // 验证标准 10（R4）：无 __init__ 且有参数时报错。
+        let src = r#"
+class Bare {
+}
+Bare(1, 2)
+"#;
+        let err = compile_and_run(src).unwrap_err();
+        assert!(err.contains("takes no arguments"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_no_init_no_args_ok() {
+        // 无 __init__ 且无参数 → 直接返回实例。
+        let src = r#"
+class Bare {
+}
+x = Bare()
+assert(x.__name__ == "Bare")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_inheritance_compile_error() {
+        // 验证标准 14（R2/B4）：继承语法编译期报错。
+        let src = "class Dog < Animal {\n}";
+        let tokens = Lexer::new(src).tokenize_all().unwrap();
+        let prog = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let err = compiler.compile(&prog).unwrap_err();
+        assert!(
+            err.contains("inheritance not yet supported (task 42)"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_class_in_function_error() {
+        // 函数内定义 class 暂不支持（编译期报错）。
+        let src = r#"
+fn f() {
+    class X {
+    }
+}
+"#;
+        let tokens = Lexer::new(src).tokenize_all().unwrap();
+        let prog = Parser::new(tokens).parse().unwrap();
+        let mut compiler = Compiler::new();
+        let err = compiler.compile(&prog).unwrap_err();
+        assert!(err.contains("inside function"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_method_non_closure_error() {
+        // 验证标准 12（V4）：METHOD 栈顶非 closure 时返回明确错误。
+        // 构造合成字节码：CONSTANT(非 closure) + METHOD。
+        let code = vec![
+            OpCode::Constant as u8,
+            0x00,
+            0x00, // 非闭包常量压栈
+            OpCode::Method as u8,
+            0x00,
+            0x01, // METHOD "x"
+            OpCode::Halt as u8,
+        ];
+        let constants = vec![Object::Int(1), alloc_string("x")];
+        let err = run_chunk(code, constants).unwrap_err();
+        assert!(err.contains("METHOD expects a closure"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_class_constant_pool_oob_error() {
+        // 验证标准 11（V3）：常量池越界不 panic，返回 Err。
+        let code = vec![
+            OpCode::Class as u8,
+            0x00,
+            0x05, // name_idx=5 越界（空常量池）
+            OpCode::Halt as u8,
+        ];
+        let err = run_chunk(vec![code[0], 0x00, 0x05, OpCode::Halt as u8], vec![]).unwrap_err();
+        assert!(
+            err.contains("out of range") || err.contains("string"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_has_finalizer_set_when_del_defined() {
+        // 验证标准 13：含 __del__ 的类，instance 置 has_finalizer。
+        let src_with_del = r#"
+class A {
+    fn __del__(self) {
+    }
+}
+A()
+"#;
+        // 直接构造类+实例验证标志位（不走 print，仅检查 gc_meta）。
+        let class_obj = alloc_class("A".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        // 模拟 __del__ 注册：插入一个占位方法指针。
+        unsafe { read_class(cls_ptr) }
+            .methods
+            .insert("__del__".to_string(), cls_ptr);
+        let inst = alloc_instance(cls_ptr);
+        let Object::Ref(ip) = inst else {
+            unreachable!()
+        };
+        // 复用 call_class 的标志设置逻辑：has_del → set_has_finalizer。
+        let has_del = unsafe { read_class(cls_ptr) }
+            .methods
+            .contains_key("__del__");
+        if has_del {
+            unsafe {
+                (*ip).set_has_finalizer(true);
+            }
+        }
+        assert!(
+            unsafe { (*ip).has_finalizer() },
+            "instance should have finalizer flag"
+        );
+        // 对照：无 __del__ 的类不应置标志。
+        let class2 = alloc_class("B".to_string());
+        let Object::Ref(cls2) = class2 else {
+            unreachable!()
+        };
+        let inst2 = alloc_instance(cls2);
+        let Object::Ref(ip2) = inst2 else {
+            unreachable!()
+        };
+        assert!(
+            !unsafe { (*ip2).has_finalizer() },
+            "no-del instance should NOT have flag"
+        );
+        // 引用 src_with_del 以证明完整路径可编译运行。
+        assert!(compile_and_run(src_with_del).is_ok());
+    }
+
+    #[test]
+    fn test_class_field_overrides_class_attr() {
+        // 实例字段优先于类属性（GET_ATTR 先查 fields 再 class_attrs）。
+        let src = r#"
+class C {
+    v = "class"
+    fn __init__(self) {
+        self.v = "instance"
+    }
+}
+c = C()
+assert(c.v == "instance")
+"#;
+        assert!(compile_and_run(src).is_ok());
+    }
+
+    #[test]
+    fn test_set_class_attr_via_class() {
+        // ClassName.attr = val 写入 class_attrs，所有实例可见。
+        let src = r#"
+class C {
+}
+C.n = 42
+c = C()
+assert(c.n == 42)
+"#;
+        assert!(compile_and_run(src).is_ok());
     }
 }

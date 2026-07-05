@@ -853,6 +853,103 @@ pub unsafe fn read_exception_class<'a>(ptr: *mut MsObjHeader) -> &'a MsException
 }
 
 // ---------------------------------------------------------------------------
+// 类与实例（task 40）
+// ---------------------------------------------------------------------------
+
+/// Class 堆对象（TypeTag::CLASS = 8）。
+/// methods 每项指向 MsClosure（堆对象）；class_attrs 为类属性（所有实例共享）。
+/// parent 指向父类 MsClass（task 42 继承；task 40 恒为 None）。
+#[repr(C)]
+pub struct MsClass {
+    pub header: MsObjHeader,
+    pub name: String,
+    pub methods: HashMap<String, *mut MsObjHeader>,
+    pub parent: Option<*mut MsObjHeader>,
+    pub class_attrs: HashMap<String, Object>,
+}
+
+/// Instance 堆对象（TypeTag::INSTANCE = 9）。
+/// class 指向 MsClass；fields 为实例自身属性（per-instance）。
+#[repr(C)]
+pub struct MsInstance {
+    pub header: MsObjHeader,
+    pub class: *mut MsObjHeader,
+    pub fields: HashMap<String, Object>,
+}
+
+/// 分配 MsClass 堆对象，返回 Object::Ref。
+/// MVP：Box 分配（与既有 alloc_* 一致，VM 日常分配暂未接入 GC 堆）。
+pub fn alloc_class(name: String) -> Object {
+    let obj = Box::new(MsClass {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::CLASS as u8,
+            size: std::mem::size_of::<MsClass>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        name,
+        methods: HashMap::new(),
+        parent: None,
+        class_attrs: HashMap::new(),
+    });
+    debug_assert!(
+        std::mem::size_of::<MsClass>() <= crate::vm::gc::LARGE_OBJ_THRESHOLD,
+        "MsClass too large, use LOS"
+    );
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 分配 MsInstance 堆对象，返回 Object::Ref。
+///
+/// # Safety
+/// `class_ptr` 必须指向由 `alloc_class` 分配的有效 MsClass。
+pub fn alloc_instance(class_ptr: *mut MsObjHeader) -> Object {
+    let obj = Box::new(MsInstance {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::INSTANCE as u8,
+            size: std::mem::size_of::<MsInstance>() as u16,
+            _padding: 0,
+            class_ptr: class_ptr as u64,
+        },
+        class: class_ptr,
+        fields: HashMap::new(),
+    });
+    debug_assert!(
+        std::mem::size_of::<MsInstance>() <= crate::vm::gc::LARGE_OBJ_THRESHOLD,
+        "MsInstance too large, use LOS"
+    );
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsClass（可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_class` 分配的、在 `'a` 期间有效的 `MsClass`。
+pub unsafe fn read_class<'a>(ptr: *mut MsObjHeader) -> &'a mut MsClass {
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::CLASS as u8,
+        "read_class on non-CLASS"
+    );
+    &mut *(ptr as *mut MsClass)
+}
+
+/// 读取 MsInstance（可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_instance` 分配的、在 `'a` 期间有效的 `MsInstance`。
+pub unsafe fn read_instance<'a>(ptr: *mut MsObjHeader) -> &'a mut MsInstance {
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::INSTANCE as u8,
+        "read_instance on non-INSTANCE"
+    );
+    &mut *(ptr as *mut MsInstance)
+}
+
+// ---------------------------------------------------------------------------
 // Object 行为
 // ---------------------------------------------------------------------------
 

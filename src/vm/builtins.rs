@@ -12,9 +12,9 @@
 #![allow(clippy::get_first)]
 
 use super::object::{
-    alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, read_dict,
-    read_iterator, read_list, read_set, read_str, read_tuple, CmpOp, DictMap, IteratorState,
-    MsObjHeader, Object, TypeTag,
+    alloc_dict, alloc_iterator, alloc_list, alloc_set, alloc_string, alloc_tuple, read_class,
+    read_dict, read_instance, read_iterator, read_list, read_set, read_str, read_tuple, CmpOp,
+    DictMap, IteratorState, MsObjHeader, Object, TypeTag,
 };
 use super::VM;
 use std::collections::HashSet;
@@ -152,8 +152,11 @@ impl VM {
 // I/O
 // ---------------------------------------------------------------------------
 
-fn builtin_print(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let output: Vec<String> = args.iter().map(|a| format!("{}", a)).collect();
+fn builtin_print(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let mut output: Vec<String> = Vec::with_capacity(args.len());
+    for a in args {
+        output.push(object_to_string(vm, a)?);
+    }
     println!("{}", output.join(" "));
     Ok(Object::Nil)
 }
@@ -161,6 +164,42 @@ fn builtin_print(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 /// `println` 是 `print` 的别名（行为完全一致）。
 fn builtin_println(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     builtin_print(vm, args)
+}
+
+/// task 40 §10：将任意 Object 转为显示字符串。
+/// Instance：优先 `__str__`（task 43），次 `__repr__`，最后默认 `<ClassName instance>`。
+/// 调用 `__repr__` 需运行闭包，故需 `&mut VM`（经 invoke_method 驱动子帧至返回）。
+pub(crate) fn object_to_string(vm: &mut VM, obj: &Object) -> Result<String, String> {
+    if let Object::Ref(ptr) = obj {
+        debug_assert!(!ptr.is_null(), "null Object::Ref");
+        if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+            let inst_ptr = *ptr;
+            let class_ptr = unsafe { read_instance(inst_ptr) }.class;
+            let (str_ptr_opt, repr_ptr_opt, name) = {
+                let c = unsafe { read_class(class_ptr) };
+                (
+                    c.methods.get("__str__").copied(),
+                    c.methods.get("__repr__").copied(),
+                    c.name.clone(),
+                )
+            };
+            // TODO task 43: __str__ 优先于 __repr__
+            if str_ptr_opt.is_some() {
+                let _ = str_ptr_opt; // task 43 实现 __str__ 调用
+            }
+            if let Some(repr_ptr) = repr_ptr_opt {
+                let result = vm.invoke_method(repr_ptr, obj.clone(), &[])?;
+                return match &result {
+                    Object::Ref(p) if unsafe { (**p).type_tag } == TypeTag::STRING as u8 => {
+                        Ok(unsafe { read_str(*p) }.to_owned())
+                    }
+                    _ => Err("__repr__ must return a string".to_string()),
+                };
+            }
+            return Ok(format!("<{} instance>", name));
+        }
+    }
+    Ok(format!("{}", obj))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,9 +256,9 @@ fn builtin_float(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     arg.to_float()
 }
 
-fn builtin_str(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+fn builtin_str(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let arg = args.get(0).ok_or("str() requires 1 argument")?;
-    Ok(arg.to_str())
+    Ok(alloc_string(&object_to_string(vm, arg)?))
 }
 
 fn builtin_bool(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {

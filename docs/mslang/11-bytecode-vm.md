@@ -286,6 +286,7 @@ Class {
     name: String
     methods: HashMap<String, *mut MsObjHeader>  // 指向 Closure
     parent: Option<*mut MsObjHeader>             // 指向父 Class
+    class_attrs: HashMap<String, Object>         // 类属性（task 40 扩展）
 }
 ```
 

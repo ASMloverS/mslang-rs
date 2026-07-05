@@ -25,7 +25,9 @@
 //! 随对应 task 落地（task 28/36/45/53/65）。
 
 use crate::vm::frame::CallFrame;
-use crate::vm::object::{DictMap, MsObjHeader, Object, TypeTag};
+use crate::vm::object::{
+    read_class, read_instance, DictMap, MsClass, MsInstance, MsObjHeader, Object, TypeTag,
+};
 use crate::vm::DeferEntry;
 use std::collections::{HashMap, HashSet};
 
@@ -383,6 +385,108 @@ fn free_placeholder(obj: *mut MsObjHeader) {
     }
 }
 
+// ---- task 40：CLASS/INSTANCE 的 trace / forward / copy / free ----
+// 当前 VM 日常分配（alloc_class/alloc_instance）未接入 GC 堆，trace/copy/free 实际不被
+// 主循环 GC 调用；注册真实实现以防未来接入后子指针悬垂（spec §11 V2 修复）。
+
+/// 遍历 MsClass 内所有 Ref 槽：methods 值 + parent + class_attrs 值。
+fn trace_class(obj: *mut MsObjHeader, cb: &mut dyn FnMut(*mut MsObjHeader)) {
+    let c = unsafe { read_class(obj) };
+    for m in c.methods.values() {
+        cb(*m);
+    }
+    if let Some(p) = c.parent {
+        cb(p);
+    }
+    for v in c.class_attrs.values() {
+        if let Object::Ref(r) = v {
+            cb(*r);
+        }
+    }
+}
+
+/// 遍历 MsInstance 内所有 Ref 槽：class + fields 值。
+fn trace_instance(obj: *mut MsObjHeader, cb: &mut dyn FnMut(*mut MsObjHeader)) {
+    let i = unsafe { read_instance(obj) };
+    cb(i.class);
+    for v in i.fields.values() {
+        if let Object::Ref(r) = v {
+            cb(*r);
+        }
+    }
+}
+
+/// Cheney 复制时修正 MsClass 内的 Ref 槽（Minor GC）。
+fn forward_fields_class(obj: *mut MsObjHeader, forwarder: &mut dyn FnMut(&mut Object)) {
+    let c = unsafe { read_class(obj) };
+    for m in c.methods.values_mut() {
+        let mut tmp = Object::Ref(*m);
+        forwarder(&mut tmp);
+        if let Object::Ref(new) = tmp {
+            *m = new;
+        }
+    }
+    if let Some(p) = c.parent {
+        let mut tmp = Object::Ref(p);
+        forwarder(&mut tmp);
+        if let Object::Ref(new) = tmp {
+            c.parent = Some(new);
+        }
+    }
+    for v in c.class_attrs.values_mut() {
+        forwarder(v);
+    }
+}
+
+/// Cheney 复制时修正 MsInstance 内的 Ref 槽（Minor GC）。
+fn forward_fields_instance(obj: *mut MsObjHeader, forwarder: &mut dyn FnMut(&mut Object)) {
+    let i = unsafe { read_instance(obj) };
+    let mut class_obj = Object::Ref(i.class);
+    forwarder(&mut class_obj);
+    if let Object::Ref(new) = class_obj {
+        i.class = new;
+    }
+    for v in i.fields.values_mut() {
+        forwarder(v);
+    }
+}
+
+/// Minor GC 复制：MsClass 含 HashMap（独立堆缓冲），不可盲字节拷贝。
+fn copy_for_gc_class(src: *mut MsObjHeader) -> *mut MsObjHeader {
+    let s = unsafe { read_class(src) };
+    let new = Box::new(MsClass {
+        header: header_for(TypeTag::CLASS, s.header.size),
+        name: s.name.clone(),
+        methods: s.methods.clone(),
+        parent: s.parent,
+        class_attrs: s.class_attrs.clone(),
+    });
+    Box::into_raw(new) as *mut MsObjHeader
+}
+
+/// Minor GC 复制：MsInstance 含 HashMap，不可盲字节拷贝。
+fn copy_for_gc_instance(src: *mut MsObjHeader) -> *mut MsObjHeader {
+    let s = unsafe { read_instance(src) };
+    let new = Box::new(MsInstance {
+        header: header_for(TypeTag::INSTANCE, s.header.size),
+        class: s.class,
+        fields: s.fields.clone(),
+    });
+    Box::into_raw(new) as *mut MsObjHeader
+}
+
+fn free_class(obj: *mut MsObjHeader) {
+    unsafe {
+        drop(Box::from_raw(obj as *mut MsClass));
+    }
+}
+
+fn free_instance(obj: *mut MsObjHeader) {
+    unsafe {
+        drop(Box::from_raw(obj as *mut MsInstance));
+    }
+}
+
 // ---- 静态描述表 ----
 
 static STRING_DESC: TypeDescriptor = TypeDescriptor {
@@ -440,6 +544,30 @@ static SET_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<GcSet>(),
 };
 
+// task 40：CLASS/INSTANCE 由 GC 托管的 trace/forward/copy/free（finalize 由 task 52
+// run_finalizers 在 VM 侧调用 __del__，此处 finalize=None）。
+static CLASS_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::CLASS,
+    name: "class",
+    trace: trace_class,
+    copy_for_gc: copy_for_gc_class,
+    forward_fields: forward_fields_class,
+    free: free_class,
+    finalize: None,
+    size_base: std::mem::size_of::<MsClass>(),
+};
+
+static INSTANCE_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::INSTANCE,
+    name: "instance",
+    trace: trace_instance,
+    copy_for_gc: copy_for_gc_instance,
+    forward_fields: forward_fields_instance,
+    free: free_instance,
+    finalize: None,
+    size_base: std::mem::size_of::<MsInstance>(),
+};
+
 // FUNCTION/CLOSURE/CLASS/INSTANCE/MODULE/ITERATOR/GENERATOR/FUTURE/CHANNEL/
 // BOUND_METHOD/JOIN_HANDLE 在当前 Phase 2.5 尚未由 GC 托管，注册占位 noop trace +
 // placeholder copy/free，随对应 task 落地补真实实现。
@@ -465,11 +593,14 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::DICT as u8 => &DICT_DESC,
         t if t == TypeTag::TUPLE as u8 => &TUPLE_DESC,
         t if t == TypeTag::SET as u8 => &SET_DESC,
+        // task 40：CLASS/INSTANCE 已接入真实 trace/forward/copy/free。
+        t if t == TypeTag::CLASS as u8 => &CLASS_DESC,
+        t if t == TypeTag::INSTANCE as u8 => &INSTANCE_DESC,
         // 合法但当前未托管 TypeTag（6..=19 与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。
         // CLOSURE/UPVALUE 真实 trace 待 GC 接管闭包堆分配后补全（future task）。
-        // TODO task 40/41: CLASS/INSTANCE/BOUND_METHOD。
+        // TODO task 41: BOUND_METHOD。
         // TODO task 45: MODULE。TODO task 52/26: ITERATOR。
         // task 39: GENERATOR — Box 分配（alloc_generator），当前不经 gc_alloc，
         // trace/finalize 不被调用；GC 接管后需 trace stack_snapshot + receiver。
@@ -1182,5 +1313,119 @@ mod tests {
             let r = *heap.old_objects.last().unwrap();
             assert_eq!(gc_read_list(r).clone(), vec![Object::Int(7)]);
         }
+    }
+
+    // ---- task 40：CLASS / INSTANCE GC 集成 ----
+    use crate::vm::object::{alloc_class, alloc_instance};
+
+    #[test]
+    fn test_trace_class_methods_and_attrs() {
+        let class_obj = alloc_class("Foo".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let lst = gc_alloc_list(&mut MsHeap::new(), vec![Object::Int(1)]);
+        let Object::Ref(lst_ptr) = lst else {
+            unreachable!()
+        };
+        unsafe { read_class(cls_ptr) }
+            .class_attrs
+            .insert("data".to_string(), lst);
+        unsafe { read_class(cls_ptr) }
+            .methods
+            .insert("bar".to_string(), lst_ptr);
+
+        let mut traced: Vec<*mut MsObjHeader> = Vec::new();
+        trace_class(cls_ptr, &mut |p| traced.push(p));
+        assert_eq!(traced.len(), 2);
+        assert!(traced.contains(&lst_ptr));
+    }
+
+    #[test]
+    fn test_trace_instance_class_and_fields() {
+        let class_obj = alloc_class("Bar".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let Object::Ref(inst_ptr) = inst_obj else {
+            unreachable!()
+        };
+        let lst = gc_alloc_list(&mut MsHeap::new(), vec![Object::Int(2)]);
+        let Object::Ref(lst_ptr) = lst else {
+            unreachable!()
+        };
+        unsafe { read_instance(inst_ptr) }
+            .fields
+            .insert("items".to_string(), lst);
+
+        let mut traced: Vec<*mut MsObjHeader> = Vec::new();
+        trace_instance(inst_ptr, &mut |p| traced.push(p));
+        assert_eq!(traced.len(), 2);
+        assert!(traced.contains(&cls_ptr));
+        assert!(traced.contains(&lst_ptr));
+    }
+
+    #[test]
+    fn test_copy_for_gc_class_deep_copy() {
+        let class_obj = alloc_class("Orig".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        unsafe { read_class(cls_ptr) }
+            .class_attrs
+            .insert("n".to_string(), Object::Int(42));
+
+        let copy_ptr = copy_for_gc_class(cls_ptr);
+        unsafe { read_class(cls_ptr) }
+            .class_attrs
+            .insert("n".to_string(), Object::Int(99));
+        assert_eq!(
+            unsafe { read_class(copy_ptr) }.class_attrs.get("n"),
+            Some(&Object::Int(42))
+        );
+        free_class(copy_ptr);
+    }
+
+    #[test]
+    fn test_copy_for_gc_instance_deep_copy() {
+        let class_obj = alloc_class("C".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let inst_obj = alloc_instance(cls_ptr);
+        let Object::Ref(inst_ptr) = inst_obj else {
+            unreachable!()
+        };
+        unsafe { read_instance(inst_ptr) }
+            .fields
+            .insert("x".to_string(), Object::Int(7));
+
+        let copy_ptr = copy_for_gc_instance(inst_ptr);
+        unsafe { read_instance(inst_ptr) }
+            .fields
+            .insert("x".to_string(), Object::Int(8));
+        assert_eq!(
+            unsafe { read_instance(copy_ptr) }.fields.get("x"),
+            Some(&Object::Int(7))
+        );
+        free_instance(copy_ptr);
+    }
+
+    #[test]
+    fn test_type_descriptor_routes_class_and_instance() {
+        let class_obj = alloc_class("D".to_string());
+        let Object::Ref(cls_ptr) = class_obj else {
+            unreachable!()
+        };
+        let desc = type_descriptor(unsafe { (*cls_ptr).type_tag });
+        assert_eq!(desc.name, "class");
+
+        let inst_obj = alloc_instance(cls_ptr);
+        let Object::Ref(inst_ptr) = inst_obj else {
+            unreachable!()
+        };
+        let desc2 = type_descriptor(unsafe { (*inst_ptr).type_tag });
+        assert_eq!(desc2.name, "instance");
     }
 }
