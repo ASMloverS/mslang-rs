@@ -163,7 +163,26 @@ impl VM {
         vm.native_arities.insert("read_file".to_string(), 1);
         vm.native_arities.insert("write_file".to_string(), 2);
         vm.native_arities.insert("exists".to_string(), 1);
-        // "open" 已由 register_builtins 注册为 usize::MAX（可变），io.open 同名复用。
+        // "open" 已由 register_builtins 注册为 usize::MAX（可变参数），io.open 同名复用。
+
+        // task 47：注册原生 math 模块 + 模块函数 arity（经 module.fn() 走 GET_ATTR→CALL 校验）。
+        let math_ptr = stdlib::register_math_module();
+        vm.module_resolver
+            .native_modules
+            .insert("math".to_string(), math_ptr);
+        // 仅注册 math 独有函数的 arity。abs/ceil/floor/round 与全局内置同名，已由
+        // register_builtins 登记（abs=1, ceil=1, floor=1, round=MAX）；此处不可覆盖，
+        // 否则 round 的可变参数形式 round(n, digits) 会退化为固定 1 参（CALL 按 name
+        // 查 native_arities，name 在全局/模块间共享）。
+        vm.native_arities.insert("sqrt".to_string(), 1);
+        vm.native_arities.insert("pow".to_string(), 2);
+        vm.native_arities.insert("sin".to_string(), 1);
+        vm.native_arities.insert("cos".to_string(), 1);
+        vm.native_arities.insert("tan".to_string(), 1);
+        vm.native_arities.insert("log".to_string(), 1);
+        vm.native_arities.insert("log2".to_string(), 1);
+        vm.native_arities.insert("log10".to_string(), 1);
+        vm.native_arities.insert("exp".to_string(), 1);
         vm
     }
 
@@ -8940,19 +8959,22 @@ assert(make() == 111)
         let dir = write_module(
             "mslang_mod_std",
             &[
-                // 当前目录「恶意」math.ms：仅含 FAKE，无 real。
-                ("math.ms", "const FAKE = true"),
-                // stdlib 子目录的正式 math.ms：含 real。
-                ("stdlib/math.ms", "fn real() { return 42 }\nconst V = 9"),
+                // 当前目录「恶意」geo.ms：仅含 FAKE，无 real。
+                // 注：模块名用 "geo" 而非 "math"——task 47 起 "math" 为原生模块，会命中
+                // native_modules 注册表而跳过磁盘，故此 @std 语义测试改用非保留名（同 task 46
+                // 将 "io" 改为 "sample" 的处理）。
+                ("geo.ms", "const FAKE = true"),
+                // stdlib 子目录的正式 geo.ms：含 real。
+                ("stdlib/geo.ms", "fn real() { return 42 }\nconst V = 9"),
             ],
         );
         let stdlib = dir.join("stdlib");
-        let main = "import @std math\nassert(math.V == 9)\nassert(math.real() == 42)";
+        let main = "import @std geo\nassert(geo.V == 9)\nassert(geo.real() == 42)";
         let program = parse(main);
         let mut compiler = Compiler::new();
         let chunk = compiler.compile(&program).unwrap();
         let mut vm = VM::new();
-        // 当前目录（含恶意 math.ms）置于搜索首位；stdlib 单独指定。
+        // 当前目录（含恶意 geo.ms）置于搜索首位；stdlib 单独指定。
         vm.add_module_search_path(dir.clone());
         vm.module_resolver.stdlib_dir = stdlib;
         let r = vm.interpret(chunk);
