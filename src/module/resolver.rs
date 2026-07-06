@@ -36,6 +36,9 @@ pub struct ModuleResolver {
     pub loading_stack: HashSet<PathBuf>,
     /// 安全模式（`MS_SAFE=1` 或 `ms run --safe`）：为真时拒绝非 `@std` 的 import。
     pub safe_mode: bool,
+    /// task 46：原生模块注册表（键为规范模块名，如 "io"）。命中则直接返回缓存指针，
+    /// 跳过磁盘搜索与执行。注册表查找在 `@std:` 前缀剥离之后。
+    pub native_modules: HashMap<String, *mut MsObjHeader>,
 }
 
 impl ModuleResolver {
@@ -71,6 +74,7 @@ impl ModuleResolver {
             cache: HashMap::new(),
             loading_stack: HashSet::new(),
             safe_mode,
+            native_modules: HashMap::new(),
         }
     }
 
@@ -84,6 +88,7 @@ impl ModuleResolver {
             cache: HashMap::new(),
             loading_stack: HashSet::new(),
             safe_mode,
+            native_modules: HashMap::new(),
         }
     }
 

@@ -46,6 +46,9 @@ pub enum TypeTag {
     /// 内置异常类对象（task 37 新增）。MsExceptionClass：仅 name。注册为全局变量，
     /// CALL 时构造 EXCEPTION。Phase 5 升级为正式 Class 后废弃。
     EXCEPTION_CLASS = 19,
+    /// 文件句柄（task 46 新增）。MsFileHandle：path/mode/file 二级分配。
+    /// 持 Rust 资源（std::fs::File），Immortal 代 + has_finalizer。
+    FILE_HANDLE = 20,
     LARGE_OBJECT = 0xFF,
 }
 
@@ -1057,6 +1060,79 @@ pub unsafe fn read_module_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsModule {
     &mut *(ptr as *mut MsModule)
 }
 
+// ---------------------------------------------------------------------------
+// FileHandle 堆对象（task 46）
+// ---------------------------------------------------------------------------
+
+/// 文件句柄堆对象（TypeTag::FILE_HANDLE = 20）。参照 task 46 §2。
+///
+/// path/mode/file 各自独立二级分配（`Box::into_raw`），对象内仅存指针；
+/// 故 Minor GC 复制对象时仅复制指针，不复制 `std::fs::File`（其不实现 Clone）。
+/// `file_ptr` 指向 `Option<File>`：close 后置 None（幂等），读/写检测 None 报 IOError。
+///
+/// GC：Immortal 代 + has_finalizer（task 46 §8）。trace 为 noop（无 Object::Ref）；
+/// copy_for_gc 不应被调用（Immortal 不进 Young）；finalize 关闭 fd + 回收二级分配。
+#[repr(C)]
+pub struct MsFileHandle {
+    pub header: MsObjHeader,
+    pub path_ptr: *const u8,
+    pub path_len: u32,
+    pub mode_ptr: *const u8,
+    pub mode_len: u32,
+    pub file_ptr: *mut Option<std::fs::File>,
+}
+
+/// 分配 FileHandle 堆对象，返回 Object::Ref。
+///
+/// 设 Immortal 代 + HAS_FINALIZER（task 46 §8）：`std::fs::File` 不实现 Clone，
+/// 不进 Young 代半空间复制；finalize 兜底关闭 fd。
+pub fn alloc_file_handle(path: &str, mode: &str, file: std::fs::File) -> Object {
+    let path_box: Box<[u8]> = Box::from(path.as_bytes());
+    let path_len = path_box.len() as u32;
+    let path_ptr = Box::into_raw(path_box) as *const u8;
+    let mode_box: Box<[u8]> = Box::from(mode.as_bytes());
+    let mode_len = mode_box.len() as u32;
+    let mode_ptr = Box::into_raw(mode_box) as *const u8;
+    let file_box: Box<Option<std::fs::File>> = Box::new(Some(file));
+    let file_ptr = Box::into_raw(file_box);
+
+    let mut h = Box::new(MsFileHandle {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::FILE_HANDLE as u8,
+            size: std::mem::size_of::<MsFileHandle>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        path_ptr,
+        path_len,
+        mode_ptr,
+        mode_len,
+        file_ptr,
+    });
+    // Immortal 代（不进 Young 复制）+ has_finalizer（兜底关闭 fd）。
+    h.header
+        .set_generation(crate::vm::gc::Generation::Immortal);
+    h.header.set_has_finalizer(true);
+    Object::Ref(Box::into_raw(h) as *mut MsObjHeader)
+}
+
+/// 读取 MsFileHandle（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_file_handle` 分配的、在 `'a` 期间有效的 `MsFileHandle`。
+pub unsafe fn read_file_handle<'a>(ptr: *mut MsObjHeader) -> &'a MsFileHandle {
+    &*(ptr as *const MsFileHandle)
+}
+
+/// 读取 MsFileHandle（可变，用于 close/write）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_file_handle` 分配的、在 `'a` 期间有效的 `MsFileHandle`。
+pub unsafe fn read_file_handle_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsFileHandle {
+    &mut *(ptr as *mut MsFileHandle)
+}
+
 impl MsClass {
     /// 沿继承链查找方法（task 41 §3）。单继承下链路线性，深度有限。
     /// 找到返回指向 MsClosure 的裸指针；parent 链递归至 None（task 42 前恒 None）。
@@ -1159,6 +1235,8 @@ impl Object {
                     "class"
                 } else if tag == TypeTag::MODULE as u8 {
                     "module"
+                } else if tag == TypeTag::FILE_HANDLE as u8 {
+                    "file"
                 } else {
                     "object"
                 }

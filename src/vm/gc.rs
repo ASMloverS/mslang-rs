@@ -26,8 +26,9 @@
 
 use crate::vm::frame::CallFrame;
 use crate::vm::object::{
-    read_bound_method, read_class, read_instance, read_module, read_module_mut, DictMap,
-    MsBoundMethod, MsClass, MsInstance, MsModule, MsObjHeader, Object, TypeTag,
+    read_bound_method, read_class, read_file_handle, read_instance, read_module, read_module_mut,
+    DictMap, MsBoundMethod, MsClass, MsFileHandle, MsInstance, MsModule, MsObjHeader, Object,
+    TypeTag,
 };
 use crate::vm::DeferEntry;
 use std::collections::{HashMap, HashSet};
@@ -578,6 +579,49 @@ fn free_module(obj: *mut MsObjHeader) {
     }
 }
 
+// ---- task 46：FILE_HANDLE 的 trace / forward / copy / free / finalize ----
+// MsFileHandle 持 Rust 资源（std::fs::File，不实现 Clone）：
+// - trace 为 noop（path/mode/file 均非 GC 对象）。
+// - copy_for_gc 不应被调用——对象 Immortal 代，不进 Young 半空间复制。防御 panic。
+// - finalize 关闭 fd（drop File）；free 回收 3 个二级 Box + 主体。
+// 当前 alloc_file_handle 用 Box::into_raw（未接入 GC 堆），trace/copy/free 实际不被
+// 主循环 GC 调用；注册真实实现以防未来接入后资源泄漏（与 CLASS/INSTANCE 同策略）。
+
+fn copy_for_gc_file_handle(_src: *mut MsObjHeader) -> *mut MsObjHeader {
+    // FileHandle 为 Immortal 代，不应进入 Young 复制。若被调用表明逻辑错误。
+    panic!("FileHandle (Immortal) must not be copied by minor GC");
+}
+
+fn free_file_handle(obj: *mut MsObjHeader) {
+    // SAFETY: obj 由 alloc_file_handle 经 Box::into_raw 分配。
+    unsafe {
+        let h = Box::from_raw(obj as *mut MsFileHandle);
+        // 关闭可能仍打开的 File（finalize 后为 None，但 free 可能在未 finalize 路径触发）。
+        if let Some(f) = (*h.file_ptr).take() {
+            drop(f);
+        }
+        // 回收 3 个二级 Box（path / mode / file）。
+        let path_fat = std::ptr::slice_from_raw_parts_mut(h.path_ptr as *mut u8, h.path_len as usize);
+        drop(Box::from_raw(path_fat));
+        let mode_fat = std::ptr::slice_from_raw_parts_mut(h.mode_ptr as *mut u8, h.mode_len as usize);
+        drop(Box::from_raw(mode_fat));
+        drop(Box::from_raw(h.file_ptr));
+        // h（MsFileHandle 主体）随 Box 超出作用域自动回收。
+    }
+}
+
+/// finalizer：关闭 fd（兜底清理，task 46 §8）。仅关闭 File，不回收内存（由 free 在
+/// 下次 GC 回收）。run_finalizers 调用后清 has_finalizer，对象下次 GC 正常释放。
+fn finalize_file_handle(obj: *mut MsObjHeader) {
+    // SAFETY: obj 由 alloc_file_handle 分配的有效 MsFileHandle。
+    unsafe {
+        let h = read_file_handle(obj);
+        if let Some(f) = (*h.file_ptr).take() {
+            drop(f);
+        }
+    }
+}
+
 // ---- 静态描述表 ----
 
 static STRING_DESC: TypeDescriptor = TypeDescriptor {
@@ -683,6 +727,18 @@ static MODULE_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<MsModule>(),
 };
 
+// task 46：FILE_HANDLE。Immortal 代（不进 Young 复制），has_finalizer 关闭 fd。
+static FILE_HANDLE_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::FILE_HANDLE,
+    name: "file",
+    trace: trace_noop,
+    copy_for_gc: copy_for_gc_file_handle,
+    forward_fields: forward_noop,
+    free: free_file_handle,
+    finalize: Some(finalize_file_handle),
+    size_base: std::mem::size_of::<MsFileHandle>(),
+};
+
 // FUNCTION/CLOSURE/ITERATOR/GENERATOR/FUTURE/CHANNEL/JOIN_HANDLE 在当前 Phase 2.5
 static PLACEHOLDER_DESC: TypeDescriptor = TypeDescriptor {
     type_tag: TypeTag::FUNCTION, // 占位 tag，实际查找不依赖此字段
@@ -713,6 +769,8 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::BOUND_METHOD as u8 => &BOUND_METHOD_DESC,
         // task 45 §9：MODULE 已接入真实 trace/forward/copy/free。
         t if t == TypeTag::MODULE as u8 => &MODULE_DESC,
+        // task 46：FILE_HANDLE（Immortal + finalizer）。trace/copy/free/defensive。
+        t if t == TypeTag::FILE_HANDLE as u8 => &FILE_HANDLE_DESC,
         // 合法但当前未托管 TypeTag（6..=19 除 MODULE，与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。

@@ -2,6 +2,7 @@ pub mod builtins;
 pub mod frame;
 pub mod gc;
 pub mod object;
+pub mod stdlib;
 
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
@@ -154,6 +155,15 @@ impl VM {
         vm.init_exception_classes();
         // task 45：快照基线全局（内置函数 + 异常类），供 execute_module 隔离复用。
         vm.baseline_globals = vm.globals.clone();
+        // task 46：注册原生 io 模块 + 模块函数 arity（经 module.fn() 走 GET_ATTR→CALL 校验）。
+        let io_ptr = stdlib::register_io_module();
+        vm.module_resolver
+            .native_modules
+            .insert("io".to_string(), io_ptr);
+        vm.native_arities.insert("read_file".to_string(), 1);
+        vm.native_arities.insert("write_file".to_string(), 2);
+        vm.native_arities.insert("exists".to_string(), 1);
+        // "open" 已由 register_builtins 注册为 usize::MAX（可变），io.open 同名复用。
         vm
     }
 
@@ -2572,6 +2582,24 @@ impl VM {
                                 continue;
                             }
                         }
+                        // task 46：FileHandle 方法分派（read/write/close/lines/__enter__/__exit__）。
+                        // 返回 BoundMethod（receiver=FileHandle + method=native），后续 CALL
+                        // BOUND_METHOD→FUNCTION 自动注入 receiver 为 args[0]。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::FILE_HANDLE as u8 =>
+                        {
+                            match stdlib::lookup_file_method(&attr) {
+                                Some(method_ptr) => {
+                                    self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "AttributeError: FileHandle has no attribute '{}'",
+                                        attr
+                                    ));
+                                }
+                            }
+                        }
                         _ => {
                             return Err(format!(
                                 "AttributeError: '{}' has no attribute '{}'",
@@ -2807,6 +2835,12 @@ impl VM {
     /// 返回指向 MsModule 的裸指针（TypeTag::MODULE）。失败返回 ImportError 消息。
     pub fn load_module(&mut self, name: &str) -> Result<*mut MsObjHeader, String> {
         let (stdlib_only, mod_name) = module::parse_std_prefix(name);
+
+        // task 46：原生模块注册表（@std 前缀剥离后查表）。命中则直接返回缓存指针，
+        // 跳过磁盘搜索与执行。
+        if let Some(&ptr) = self.module_resolver.native_modules.get(mod_name) {
+            return Ok(ptr);
+        }
 
         // 1. 安全模式：仅允许 @std import。
         if self.module_resolver.safe_mode && !stdlib_only {
@@ -8931,10 +8965,12 @@ assert(make() == 111)
         // 标准 10：from @std module import name。
         let dir = write_module(
             "mslang_mod_fromstd",
-            &[("stdlib/io.ms", "fn open() { return \"opened\" }\nconst MODE = 1")],
+            // 注：模块名用 "sample" 而非 "io"——task 46 起 "io" 为原生模块，会命中
+            // native_modules 注册表而跳过磁盘，故此 @std 语义测试改用非保留名。
+            &[("stdlib/sample.ms", "fn open() { return \"opened\" }\nconst MODE = 1")],
         );
         let stdlib = dir.join("stdlib");
-        let main = "from @std io import open\nassert(open() == \"opened\")";
+        let main = "from @std sample import open\nassert(open() == \"opened\")";
         let program = parse(main);
         let mut compiler = Compiler::new();
         let chunk = compiler.compile(&program).unwrap();

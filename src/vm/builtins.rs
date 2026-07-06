@@ -680,9 +680,9 @@ fn builtin_assert(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 // 其他全局内置（参照 10-builtins.md）
 // ---------------------------------------------------------------------------
 
-/// open(path, mode?) -> File。占位：真实实现由 task 46（stdlib-io）。
-fn builtin_open(_vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
-    Err("not yet implemented: open() (task 46 stdlib-io)".to_string())
+/// open(path, mode?) -> FileHandle。全局快捷方式，委托 io.open（task 46 stdlib-io）。
+fn builtin_open(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    super::stdlib::native_io_open(vm, args)
 }
 
 /// input(prompt?) -> string。
