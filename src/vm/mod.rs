@@ -215,6 +215,13 @@ impl VM {
         vm.native_arities.insert("dir".to_string(), 1);
         vm.native_arities.insert("join".to_string(), usize::MAX);
 
+        // task 49：注册原生 json 模块 + 模块函数 arity。
+        vm.module_resolver
+            .native_modules
+            .insert("json".to_string(), stdlib::register_json_module());
+        vm.native_arities.insert("parse".to_string(), 1);
+        vm.native_arities.insert("stringify".to_string(), 1);
+
         vm
     }
 

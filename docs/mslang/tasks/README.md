@@ -85,7 +85,7 @@
 | 46 | [标准库 - io 模块](46-stdlib-io.md) | ✅ |
 | 47 | [标准库 - math 模块](47-stdlib-math.md) | ✅ |
 | 48 | [标准库 - os/string/time/path](48-stdlib-os-string-time.md) | ✅ |
-| 49 | [标准库 - json 模块](49-stdlib-json.md) | ⬜ |
+| 49 | [标准库 - json 模块](49-stdlib-json.md) | ✅ |
 | 50 | [内置类型方法 - String](50-builtin-methods-string.md) | ⬜ |
 | 51 | [内置类型方法 - List/Dict/Set](51-builtin-methods-list-dict-set.md) | ⬜ |
 | 60 | [标准库 - gc 模块](60-stdlib-gc.md) | ⬜ |
