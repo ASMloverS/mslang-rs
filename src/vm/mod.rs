@@ -183,6 +183,38 @@ impl VM {
         vm.native_arities.insert("log2".to_string(), 1);
         vm.native_arities.insert("log10".to_string(), 1);
         vm.native_arities.insert("exp".to_string(), 1);
+
+        // task 48：注册原生 os/string/time/path 模块 + 模块函数 arity。
+        for (name, ptr) in [
+            ("os", stdlib::register_os_module()),
+            ("string", stdlib::register_string_module()),
+            ("time", stdlib::register_time_module()),
+            ("path", stdlib::register_path_module()),
+        ] {
+            vm.module_resolver
+                .native_modules
+                .insert(name.to_string(), ptr);
+        }
+        // 仅注册模块独有函数 arity（CALL 按 name 查 native_arities，全局/模块间共享）。
+        // format/join 为可变参（usize::MAX）；string.format 与 time.format 同名同 arity，无冲突。
+        vm.native_arities.insert("getenv".to_string(), 1);
+        vm.native_arities.insert("setenv".to_string(), 2);
+        vm.native_arities.insert("getcwd".to_string(), 0);
+        vm.native_arities.insert("chdir".to_string(), 1);
+        vm.native_arities.insert("exec".to_string(), 1);
+        vm.native_arities.insert("exit".to_string(), 1);
+        vm.native_arities.insert("repeat".to_string(), 2);
+        vm.native_arities.insert("reverse".to_string(), 1);
+        vm.native_arities.insert("is_alpha".to_string(), 1);
+        vm.native_arities.insert("is_digit".to_string(), 1);
+        vm.native_arities.insert("now".to_string(), 0);
+        vm.native_arities.insert("sleep".to_string(), 1);
+        vm.native_arities.insert("format".to_string(), usize::MAX);
+        vm.native_arities.insert("ext".to_string(), 1);
+        vm.native_arities.insert("base".to_string(), 1);
+        vm.native_arities.insert("dir".to_string(), 1);
+        vm.native_arities.insert("join".to_string(), usize::MAX);
+
         vm
     }
 

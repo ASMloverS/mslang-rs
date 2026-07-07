@@ -14,6 +14,7 @@ use super::object::{
     read_file_handle_mut, read_module_mut, read_str, MsObjHeader, Object, TypeTag,
 };
 use super::VM;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
 // io 模块
@@ -393,6 +394,411 @@ fn native_math_round(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     // Rust f64::round()：半远离零（round(2.5)→3，非 Python 银行家舍入）。
     let x = expect_number(args.get(0), "round(x)")?;
     float_to_int(x.round(), "round")
+}
+
+// ---------------------------------------------------------------------------
+// os 模块
+// ---------------------------------------------------------------------------
+
+/// 构造 `os` 原生模块，返回指向 MsModule 的裸指针（TypeTag::MODULE）。
+/// exports 含 getenv/setenv/getcwd/chdir/exec/exit 六个原生函数 + args 列表属性。
+pub fn register_os_module() -> *mut MsObjHeader {
+    let mut exports = std::collections::HashMap::new();
+    let funcs: [(&str, NativeFn); 6] = [
+        ("getenv", native_os_getenv),
+        ("setenv", native_os_setenv),
+        ("getcwd", native_os_getcwd),
+        ("chdir", native_os_chdir),
+        ("exec", native_os_exec),
+        ("exit", native_os_exit),
+    ];
+    for (name, func) in funcs {
+        exports.insert(
+            name.to_string(),
+            alloc_native_function(NativeFunction {
+                name: name.to_string(),
+                func,
+            }),
+        );
+    }
+    // args 为 List 属性（非函数）：注册时一次性快照命令行参数。
+    exports.insert("args".to_string(), build_args_list());
+    let m = alloc_module("os");
+    match m {
+        Object::Ref(p) => {
+            // SAFETY: alloc_module 返回有效 MsModule Ref。
+            unsafe {
+                read_module_mut(p).exports = exports;
+            }
+            p
+        }
+        _ => unreachable!("alloc_module must return Ref"),
+    }
+}
+
+/// 构建 os.args 列表：std::env::args() → alloc_string → alloc_list。
+/// 在 register_os_module 时调用一次，结果存入 exports（不需 vm）。
+fn build_args_list() -> Object {
+    let items: Vec<Object> = std::env::args().map(|a| alloc_string(&a)).collect();
+    alloc_list(items)
+}
+
+fn native_os_getenv(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let key = expect_string(args.get(0), "getenv(key)")?;
+    match std::env::var(&key) {
+        Ok(val) => Ok(alloc_string(&val)),
+        Err(_) => Ok(Object::Nil), // 不存在返回 nil（非异常）
+    }
+}
+
+fn native_os_setenv(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let key = expect_string(args.get(0), "setenv(key, val)")?;
+    let val = expect_string(args.get(1), "setenv(key, val)")?;
+    // 进程级可变状态操作；MVP 单线程 VM 下安全。
+    // 注：Rust 2024 edition 将 set_var 标记为 unsafe，升级 edition 时需加 unsafe 块。
+    std::env::set_var(&key, &val);
+    Ok(Object::Nil)
+}
+
+fn native_os_getcwd(_vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
+    let dir = std::env::current_dir().map_err(|e| format!("IOError: {}", e))?;
+    Ok(alloc_string(&dir.to_string_lossy()))
+}
+
+fn native_os_chdir(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let path = expect_string(args.get(0), "chdir(path)")?;
+    std::env::set_current_dir(&path).map_err(|e| format!("IOError: {}", e))?;
+    Ok(Object::Nil)
+}
+
+/// os.exec(cmd) → 经 shell 执行，返回 stdout。
+/// 安全警告：cmd 经 shell（Windows cmd /C、Unix sh -c）执行，用户可控输入直接拼入
+/// 存在命令注入风险（10-builtins.md:303）。调用者须自行消毒输入。MVP 不提供安全变体。
+fn native_os_exec(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let cmd = expect_string(args.get(0), "exec(cmd)")?;
+    #[cfg(windows)]
+    let output = std::process::Command::new("cmd").args(["/C", &cmd]).output();
+    #[cfg(not(windows))]
+    let output = std::process::Command::new("sh").args(["-c", &cmd]).output();
+    let output = output.map_err(|e| format!("IOError: exec failed: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "IOError: command failed (exit code {:?})",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(alloc_string(&stdout))
+}
+
+/// os.exit(code) → 不直接调 std::process::exit（绕过 defer/GC）。
+/// 改为返回特殊标记 Err("__EXIT__{code}")：作为异常沿调用栈传播，defer/finally 在
+/// 解栈过程中执行。VM 顶层 run 循环应检测此前缀，运行 finalizer 后以 code 退出。
+/// 已知限制（MVP）：run 循环尚未特判此前缀，故 exit 经 interpret 以 Err 返回给宿主。
+fn native_os_exit(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let code = match args.get(0) {
+        Some(Object::Int(n)) => *n as i32,
+        other => {
+            return Err(format!(
+                "TypeError: exit(code) expects int, got {}",
+                other.map(|o| o.type_name()).unwrap_or("missing")
+            ))
+        }
+    };
+    Err(format!("__EXIT__{}", code))
+}
+
+// ---------------------------------------------------------------------------
+// string 模块
+// ---------------------------------------------------------------------------
+
+/// 构造 `string` 原生模块，返回指向 MsModule 的裸指针（TypeTag::MODULE）。
+/// exports 含 format/repeat/reverse/is_alpha/is_digit 五个原生函数。
+pub fn register_string_module() -> *mut MsObjHeader {
+    let mut exports = std::collections::HashMap::new();
+    let funcs: [(&str, NativeFn); 5] = [
+        ("format", native_string_format),
+        ("repeat", native_string_repeat),
+        ("reverse", native_string_reverse),
+        ("is_alpha", native_string_is_alpha),
+        ("is_digit", native_string_is_digit),
+    ];
+    for (name, func) in funcs {
+        exports.insert(
+            name.to_string(),
+            alloc_native_function(NativeFunction {
+                name: name.to_string(),
+                func,
+            }),
+        );
+    }
+    let m = alloc_module("string");
+    match m {
+        Object::Ref(p) => {
+            // SAFETY: alloc_module 返回有效 MsModule Ref。
+            unsafe {
+                read_module_mut(p).exports = exports;
+            }
+            p
+        }
+        _ => unreachable!("alloc_module must return Ref"),
+    }
+}
+
+/// string.format(template, *args) → 替换 {} 占位符。
+/// 非 string 参数经 object_to_string 转换（与 print/str 一致）：
+///   Int→"42", Float→"3.14", Bool→"true"/"false", Nil→"nil", String→原串。
+fn native_string_format(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let template = expect_string(args.get(0), "format(template, ...)")?;
+    let mut result = String::new();
+    let mut arg_idx = 1usize;
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' && chars.peek() == Some(&'}') {
+            chars.next(); // 消费 '}'
+            let val = args.get(arg_idx).ok_or_else(|| {
+                format!(
+                    "ValueError: format: not enough arguments for placeholder #{}",
+                    arg_idx
+                )
+            })?;
+            result.push_str(&super::builtins::object_to_string(vm, val)?);
+            arg_idx += 1;
+        } else {
+            result.push(c);
+        }
+    }
+    Ok(alloc_string(&result))
+}
+
+/// string.repeat(s, n) → s 重复 n 次。负数 / 超大 n → ValueError。
+fn native_string_repeat(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "repeat(s, n)")?;
+    let n = match args.get(1) {
+        Some(Object::Int(n)) if *n >= 0 && *n <= 1_000_000 => *n as usize,
+        Some(Object::Int(n)) if *n < 0 => {
+            return Err("ValueError: repeat count cannot be negative".into())
+        }
+        Some(Object::Int(_)) => {
+            return Err("ValueError: repeat count too large (max 1000000)".into())
+        }
+        other => {
+            return Err(format!(
+                "TypeError: repeat(s, n) expects int, got {}",
+                other.map(|o| o.type_name()).unwrap_or("missing")
+            ))
+        }
+    };
+    Ok(alloc_string(&s.repeat(n)))
+}
+
+fn native_string_reverse(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "reverse(s)")?;
+    Ok(alloc_string(&s.chars().rev().collect::<String>()))
+}
+
+fn native_string_is_alpha(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "is_alpha(s)")?;
+    Ok(Object::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphabetic())))
+}
+
+fn native_string_is_digit(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "is_digit(s)")?;
+    Ok(Object::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())))
+}
+
+// ---------------------------------------------------------------------------
+// time 模块
+// ---------------------------------------------------------------------------
+
+/// 构造 `time` 原生模块，返回指向 MsModule 的裸指针（TypeTag::MODULE）。
+/// exports 含 now/sleep/format 三个原生函数。
+pub fn register_time_module() -> *mut MsObjHeader {
+    let mut exports = std::collections::HashMap::new();
+    let funcs: [(&str, NativeFn); 3] = [
+        ("now", native_time_now),
+        ("sleep", native_time_sleep),
+        ("format", native_time_format),
+    ];
+    for (name, func) in funcs {
+        exports.insert(
+            name.to_string(),
+            alloc_native_function(NativeFunction {
+                name: name.to_string(),
+                func,
+            }),
+        );
+    }
+    let m = alloc_module("time");
+    match m {
+        Object::Ref(p) => {
+            // SAFETY: alloc_module 返回有效 MsModule Ref。
+            unsafe {
+                read_module_mut(p).exports = exports;
+            }
+            p
+        }
+        _ => unreachable!("alloc_module must return Ref"),
+    }
+}
+
+/// time.now() → 当前 Unix 时间戳（秒，f64）。
+/// 不使用 .unwrap()：系统时间早于 epoch 时返回 Err 而非 panic。
+fn native_time_now(_vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("ClockError: system time before epoch: {}", e))?;
+    Ok(Object::Float(dur.as_secs_f64()))
+}
+
+/// time.sleep(secs) → 阻塞指定秒数（int 或 float）。
+/// 单位为秒（与 10-builtins.md:326 一致，非毫秒）。负数 / 非有限值 → ValueError。
+fn native_time_sleep(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let secs = match args.get(0) {
+        Some(Object::Int(n)) => *n as f64,
+        Some(Object::Float(x)) => *x,
+        other => {
+            return Err(format!(
+                "TypeError: sleep(secs) expects number, got {}",
+                other.map(|o| o.type_name()).unwrap_or("missing")
+            ))
+        }
+    };
+    // from_secs_f64 在 NaN/±Inf 上 panic，须先拒绝非有限值。
+    if !secs.is_finite() {
+        return Err("ValueError: sleep duration must be finite".into());
+    }
+    if secs < 0.0 {
+        return Err("ValueError: sleep duration cannot be negative".into());
+    }
+    std::thread::sleep(Duration::from_secs_f64(secs));
+    Ok(Object::Nil)
+}
+
+/// time.format(ts) → 将 Unix 时间戳格式化为 UTC 字符串 "YYYY-MM-DD HH:MM:SS"。
+/// MVP 手动格式化（不引入 chrono 依赖）。时区固定 UTC。
+fn native_time_format(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ts = match args.get(0) {
+        Some(Object::Int(n)) => *n as f64,
+        Some(Object::Float(x)) => *x,
+        other => {
+            return Err(format!(
+                "TypeError: format(ts) expects number, got {}",
+                other.map(|o| o.type_name()).unwrap_or("missing")
+            ))
+        }
+    };
+    if ts < 0.0 {
+        return Err("ValueError: timestamp cannot be negative".into());
+    }
+    let secs = ts as u64;
+    let (year, month, day, hour, min, sec) = unix_to_ymdhms(secs);
+    Ok(alloc_string(&format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hour, min, sec
+    )))
+}
+
+/// Unix 时间戳（秒）→ UTC 年月日时分秒（民用历法算法，Howard Hinnant
+/// `civil_from_days`）。纯整数运算，无 chrono 依赖。
+fn unix_to_ymdhms(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64; // 自 1970-01-01 的天数
+    let rem = secs % 86_400;
+    let hour = (rem / 3_600) as u32;
+    let min = ((rem % 3_600) / 60) as u32;
+    let sec = (rem % 60) as u32;
+
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year, m as u32, d as u32, hour, min, sec)
+}
+
+// ---------------------------------------------------------------------------
+// path 模块
+// ---------------------------------------------------------------------------
+
+/// 构造 `path` 原生模块，返回指向 MsModule 的裸指针（TypeTag::MODULE）。
+/// exports 含 join/ext/base/dir 四个原生函数。
+pub fn register_path_module() -> *mut MsObjHeader {
+    let mut exports = std::collections::HashMap::new();
+    let funcs: [(&str, NativeFn); 4] = [
+        ("join", native_path_join),
+        ("ext", native_path_ext),
+        ("base", native_path_base),
+        ("dir", native_path_dir),
+    ];
+    for (name, func) in funcs {
+        exports.insert(
+            name.to_string(),
+            alloc_native_function(NativeFunction {
+                name: name.to_string(),
+                func,
+            }),
+        );
+    }
+    let m = alloc_module("path");
+    match m {
+        Object::Ref(p) => {
+            // SAFETY: alloc_module 返回有效 MsModule Ref。
+            unsafe {
+                read_module_mut(p).exports = exports;
+            }
+            p
+        }
+        _ => unreachable!("alloc_module must return Ref"),
+    }
+}
+
+/// path.join(*parts) → 连接路径段。可变参（arity = usize::MAX）。
+/// 输出保留平台分隔符（Windows `\`，Unix `/`），不归一化为 `/`。
+fn native_path_join(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.is_empty() {
+        return Err("ValueError: path.join requires at least one argument".into());
+    }
+    let mut result = std::path::PathBuf::new();
+    for (i, arg) in args.iter().enumerate() {
+        let part = expect_string(Some(arg), &format!("path.join part #{}", i))?;
+        result.push(&part);
+    }
+    Ok(alloc_string(&result.to_string_lossy()))
+}
+
+/// path.ext(p) → 扩展名（含 "."），无扩展名返回 ""。
+fn native_path_ext(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let p = expect_string(args.get(0), "ext(p)")?;
+    let ext = std::path::Path::new(&p)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    Ok(alloc_string(&ext))
+}
+
+/// path.base(p) → 文件名部分，无文件名返回 ""。
+fn native_path_base(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let p = expect_string(args.get(0), "base(p)")?;
+    let base = std::path::Path::new(&p)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(alloc_string(&base))
+}
+
+/// path.dir(p) → 目录部分，无父目录返回 ""。
+fn native_path_dir(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let p = expect_string(args.get(0), "dir(p)")?;
+    let dir = std::path::Path::new(&p)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(alloc_string(&dir))
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,5 +1446,518 @@ assert(type(f) == "float")
 "#;
         let r = run_source(src);
         assert!(r.is_ok(), "math abs type failed: {:?}", r.err());
+    }
+
+    // ---- task 48：os 模块 ----
+
+    /// 提取 Object::String 内部值（单测辅助）。
+    fn strval(o: &Object) -> String {
+        match o {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+                unsafe { read_str(*ptr) }.to_owned()
+            }
+            _ => panic!("expected String, got {}", o.type_name()),
+        }
+    }
+
+    #[test]
+    fn test_os_module_registration() {
+        let ptr = register_os_module();
+        // SAFETY: ptr 由 register_os_module 返回的有效 MsModule。
+        unsafe {
+            assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8);
+            let m = read_module_mut(ptr);
+            assert_eq!(m.name, "os");
+            for name in ["getenv", "setenv", "getcwd", "chdir", "exec", "exit", "args"] {
+                assert!(m.exports.contains_key(name), "missing export: {}", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_os_getenv_setenv() {
+        let mut v = vm();
+        let key = "__MSLANG_OS_TEST_K1__";
+        // 不存在 → nil（非异常）
+        std::env::remove_var(key);
+        assert_eq!(native_os_getenv(&mut v, &[s(key)]).unwrap(), Object::Nil);
+        // setenv → nil，再 getenv → 设定值
+        assert_eq!(
+            native_os_setenv(&mut v, &[s(key), s("hello")]).unwrap(),
+            Object::Nil
+        );
+        assert_eq!(native_os_getenv(&mut v, &[s(key)]).unwrap(), s("hello"));
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn test_os_getcwd() {
+        let mut v = vm();
+        let r = native_os_getcwd(&mut v, &[]).unwrap();
+        assert!(!strval(&r).is_empty());
+    }
+
+    #[test]
+    fn test_os_getenv_type_error() {
+        let mut v = vm();
+        // 非字符串入参 → TypeError
+        let err = native_os_getenv(&mut v, &[Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError"));
+        // 缺参 → TypeError (missing)
+        let err = native_os_getenv(&mut v, &[]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("missing"));
+    }
+
+    #[test]
+    fn test_os_exec_success() {
+        let mut v = vm();
+        // echo 在 Windows cmd / Unix sh 均存在；输出含探测串。
+        let r = native_os_exec(&mut v, &[s("echo mslang_probe_xyz")]).unwrap();
+        assert!(strval(&r).contains("mslang_probe_xyz"));
+    }
+
+    #[test]
+    fn test_os_exec_failure() {
+        let mut v = vm();
+        // 命令返回非零退出码 → IOError
+        #[cfg(windows)]
+        let cmd = "exit /b 7";
+        #[cfg(not(windows))]
+        let cmd = "exit 7";
+        let err = native_os_exec(&mut v, &[s(cmd)]).unwrap_err();
+        assert!(err.contains("IOError") && err.contains("command failed"));
+    }
+
+    #[test]
+    fn test_os_exit_sentinel() {
+        let mut v = vm();
+        // exit(0) → Err("__EXIT__0")；不直接 std::process::exit
+        let err = native_os_exit(&mut v, &[Object::Int(0)]).unwrap_err();
+        assert_eq!(err, "__EXIT__0");
+        let err = native_os_exit(&mut v, &[Object::Int(42)]).unwrap_err();
+        assert_eq!(err, "__EXIT__42");
+    }
+
+    #[test]
+    fn test_os_exit_type_error() {
+        let mut v = vm();
+        let err = native_os_exit(&mut v, &[Object::Float(1.0)]).unwrap_err();
+        assert!(err.contains("TypeError"));
+        let err = native_os_exit(&mut v, &[]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("missing"));
+    }
+
+    #[test]
+    fn test_os_args_is_list() {
+        // args 属性为 List，至少含程序名（长度 >= 1）。
+        let obj = build_args_list();
+        let Object::Ref(ptr) = &obj else {
+            panic!("expected Ref");
+        };
+        // SAFETY: build_args_list 返回有效 LIST。
+        let items = unsafe { read_list(*ptr) };
+        assert!(!items.is_empty());
+    }
+
+    // ---- task 48：string 模块 ----
+
+    #[test]
+    fn test_string_module_registration() {
+        let ptr = register_string_module();
+        // SAFETY: ptr 由 register_string_module 返回的有效 MsModule。
+        unsafe {
+            assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8);
+            let m = read_module_mut(ptr);
+            assert_eq!(m.name, "string");
+            for name in ["format", "repeat", "reverse", "is_alpha", "is_digit"] {
+                assert!(m.exports.contains_key(name), "missing export: {}", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_string_format_basic() {
+        let mut v = vm();
+        assert_eq!(
+            native_string_format(&mut v, &[s("{} + {} = {}"), Object::Int(1), Object::Int(2), Object::Int(3)]).unwrap(),
+            s("1 + 2 = 3")
+        );
+        // 无占位符 → 原样返回
+        assert_eq!(native_string_format(&mut v, &[s("plain")]).unwrap(), s("plain"));
+        // 字符串参数
+        assert_eq!(
+            native_string_format(&mut v, &[s("hi {}"), s("there")]).unwrap(),
+            s("hi there")
+        );
+    }
+
+    #[test]
+    fn test_string_format_type_conversion() {
+        let mut v = vm();
+        // 非 string 参数经 object_to_string 转换（与 print/str 一致）
+        assert_eq!(native_string_format(&mut v, &[s("{}"), Object::Int(42)]).unwrap(), s("42"));
+        assert_eq!(native_string_format(&mut v, &[s("{}"), Object::Float(3.5)]).unwrap(), s("3.5"));
+        assert_eq!(native_string_format(&mut v, &[s("{}"), Object::Float(3.0)]).unwrap(), s("3.0"));
+        assert_eq!(native_string_format(&mut v, &[s("{}"), Object::Bool(true)]).unwrap(), s("true"));
+        assert_eq!(native_string_format(&mut v, &[s("{}"), Object::Bool(false)]).unwrap(), s("false"));
+        assert_eq!(native_string_format(&mut v, &[s("{}"), Object::Nil]).unwrap(), s("nil"));
+    }
+
+    #[test]
+    fn test_string_format_missing_arg() {
+        let mut v = vm();
+        let err = native_string_format(&mut v, &[s("{} {}"), Object::Int(1)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("not enough arguments"));
+    }
+
+    #[test]
+    fn test_string_format_template_type_error() {
+        let mut v = vm();
+        let err = native_string_format(&mut v, &[Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError"));
+    }
+
+    #[test]
+    fn test_string_repeat() {
+        let mut v = vm();
+        assert_eq!(native_string_repeat(&mut v, &[s("ab"), Object::Int(3)]).unwrap(), s("ababab"));
+        assert_eq!(native_string_repeat(&mut v, &[s("x"), Object::Int(0)]).unwrap(), s(""));
+        assert_eq!(native_string_repeat(&mut v, &[s("万"), Object::Int(2)]).unwrap(), s("万万"));
+    }
+
+    #[test]
+    fn test_string_repeat_errors() {
+        let mut v = vm();
+        // 负数 → ValueError
+        let err = native_string_repeat(&mut v, &[s("a"), Object::Int(-1)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("negative"));
+        // 超大 → ValueError
+        let err = native_string_repeat(&mut v, &[s("a"), Object::Int(1_000_001)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("too large"));
+        // 边界：1_000_000 仍允许
+        let r = native_string_repeat(&mut v, &[s("a"), Object::Int(1_000_000)]).unwrap();
+        assert_eq!(strval(&r).len(), 1_000_000);
+        // 非整数 n → TypeError
+        let err = native_string_repeat(&mut v, &[s("a"), Object::Float(2.0)]).unwrap_err();
+        assert!(err.contains("TypeError"));
+    }
+
+    #[test]
+    fn test_string_reverse() {
+        let mut v = vm();
+        assert_eq!(native_string_reverse(&mut v, &[s("hello")]).unwrap(), s("olleh"));
+        // Unicode 安全：按 char（标量值）反转
+        assert_eq!(native_string_reverse(&mut v, &[s("你好世")]).unwrap(), s("世好你"));
+        assert_eq!(native_string_reverse(&mut v, &[s("")]).unwrap(), s(""));
+    }
+
+    #[test]
+    fn test_string_is_alpha() {
+        let mut v = vm();
+        assert_eq!(native_string_is_alpha(&mut v, &[s("abc")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_alpha(&mut v, &[s("AbC")]).unwrap(), Object::Bool(true));
+        // 空串 → false
+        assert_eq!(native_string_is_alpha(&mut v, &[s("")]).unwrap(), Object::Bool(false));
+        // 含数字 → false
+        assert_eq!(native_string_is_alpha(&mut v, &[s("abc123")]).unwrap(), Object::Bool(false));
+        // 含空格 → false
+        assert_eq!(native_string_is_alpha(&mut v, &[s("ab c")]).unwrap(), Object::Bool(false));
+    }
+
+    #[test]
+    fn test_string_is_digit() {
+        let mut v = vm();
+        assert_eq!(native_string_is_digit(&mut v, &[s("123")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_digit(&mut v, &[s("007")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_digit(&mut v, &[s("")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_digit(&mut v, &[s("12a")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_digit(&mut v, &[s("-5")]).unwrap(), Object::Bool(false));
+    }
+
+    // ---- task 48：time 模块 ----
+
+    #[test]
+    fn test_time_module_registration() {
+        let ptr = register_time_module();
+        // SAFETY: ptr 由 register_time_module 返回的有效 MsModule。
+        unsafe {
+            assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8);
+            let m = read_module_mut(ptr);
+            assert_eq!(m.name, "time");
+            for name in ["now", "sleep", "format"] {
+                assert!(m.exports.contains_key(name), "missing export: {}", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_time_now() {
+        let mut v = vm();
+        let r = native_time_now(&mut v, &[]).unwrap();
+        let ts = fval(&r);
+        // 合理的时间戳（> 2001-09-09，即 > 1e9）
+        assert!(ts > 1_000_000_000.0, "time.now() returned {}", ts);
+    }
+
+    #[test]
+    fn test_time_sleep_zero() {
+        let mut v = vm();
+        // sleep(0) / sleep(0.0) 立即返回 nil
+        assert_eq!(native_time_sleep(&mut v, &[Object::Int(0)]).unwrap(), Object::Nil);
+        assert_eq!(
+            native_time_sleep(&mut v, &[Object::Float(0.0)]).unwrap(),
+            Object::Nil
+        );
+    }
+
+    #[test]
+    fn test_time_sleep_errors() {
+        let mut v = vm();
+        // 负数 → ValueError
+        let err = native_time_sleep(&mut v, &[Object::Int(-1)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("negative"));
+        let err = native_time_sleep(&mut v, &[Object::Float(-0.5)]).unwrap_err();
+        assert!(err.contains("ValueError"));
+        // NaN/Inf → ValueError（防止 from_secs_f64 panic）
+        let err = native_time_sleep(&mut v, &[Object::Float(f64::NAN)]).unwrap_err();
+        assert!(err.contains("ValueError"));
+        let err = native_time_sleep(&mut v, &[Object::Float(f64::INFINITY)]).unwrap_err();
+        assert!(err.contains("ValueError"));
+        // 非数值 → TypeError
+        let err = native_time_sleep(&mut v, &[s("x")]).unwrap_err();
+        assert!(err.contains("TypeError"));
+    }
+
+    #[test]
+    fn test_unix_to_ymdhms_epoch() {
+        assert_eq!(unix_to_ymdhms(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    #[test]
+    fn test_unix_to_ymdhms_known() {
+        // 1700000000 = 2023-11-14 22:13:20 UTC
+        assert_eq!(unix_to_ymdhms(1_700_000_000), (2023, 11, 14, 22, 13, 20));
+        // 1000000000 = 2001-09-09 01:46:40 UTC
+        assert_eq!(unix_to_ymdhms(1_000_000_000), (2001, 9, 9, 1, 46, 40));
+    }
+
+    #[test]
+    fn test_unix_to_ymdhms_leap_day() {
+        // 2020-02-29 12:00:00 UTC = 1582977600（闰日）
+        assert_eq!(unix_to_ymdhms(1_582_977_600), (2020, 2, 29, 12, 0, 0));
+    }
+
+    #[test]
+    fn test_time_format() {
+        let mut v = vm();
+        // Int 时间戳
+        assert_eq!(
+            native_time_format(&mut v, &[Object::Int(0)]).unwrap(),
+            s("1970-01-01 00:00:00")
+        );
+        assert_eq!(
+            native_time_format(&mut v, &[Object::Int(1_700_000_000)]).unwrap(),
+            s("2023-11-14 22:13:20")
+        );
+        // Float 时间戳（截断小数）
+        assert_eq!(
+            native_time_format(&mut v, &[Object::Float(0.0)]).unwrap(),
+            s("1970-01-01 00:00:00")
+        );
+        assert_eq!(
+            native_time_format(&mut v, &[Object::Float(1_700_000_000.999)]).unwrap(),
+            s("2023-11-14 22:13:20")
+        );
+    }
+
+    #[test]
+    fn test_time_format_errors() {
+        let mut v = vm();
+        let err = native_time_format(&mut v, &[Object::Int(-1)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("negative"));
+        let err = native_time_format(&mut v, &[s("x")]).unwrap_err();
+        assert!(err.contains("TypeError"));
+    }
+
+    // ---- task 48：path 模块 ----
+
+    #[test]
+    fn test_path_module_registration() {
+        let ptr = register_path_module();
+        // SAFETY: ptr 由 register_path_module 返回的有效 MsModule。
+        unsafe {
+            assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8);
+            let m = read_module_mut(ptr);
+            assert_eq!(m.name, "path");
+            for name in ["join", "ext", "base", "dir"] {
+                assert!(m.exports.contains_key(name), "missing export: {}", name);
+            }
+        }
+    }
+
+    #[test]
+    fn test_path_join() {
+        let mut v = vm();
+        // 用正斜杠输入：std::path 在 Windows 也接受，输出为平台分隔符。
+        let expected = {
+            let mut p = std::path::PathBuf::new();
+            p.push("a");
+            p.push("b");
+            p.push("c");
+            p.to_string_lossy().into_owned()
+        };
+        let r = native_path_join(&mut v, &[s("a"), s("b"), s("c")]).unwrap();
+        assert_eq!(strval(&r), expected);
+        // 单段 → 原样
+        assert_eq!(native_path_join(&mut v, &[s("alone")]).unwrap(), s("alone"));
+    }
+
+    #[test]
+    fn test_path_join_empty() {
+        let mut v = vm();
+        let err = native_path_join(&mut v, &[]).unwrap_err();
+        assert!(err.contains("ValueError"));
+    }
+
+    #[test]
+    fn test_path_ext() {
+        let mut v = vm();
+        assert_eq!(native_path_ext(&mut v, &[s("file.txt")]).unwrap(), s(".txt"));
+        assert_eq!(native_path_ext(&mut v, &[s("archive.tar.gz")]).unwrap(), s(".gz"));
+        assert_eq!(native_path_ext(&mut v, &[s("noext")]).unwrap(), s(""));
+        assert_eq!(native_path_ext(&mut v, &[s(".hidden")]).unwrap(), s(""));
+    }
+
+    #[test]
+    fn test_path_base() {
+        let mut v = vm();
+        assert_eq!(native_path_base(&mut v, &[s("a/b/c.txt")]).unwrap(), s("c.txt"));
+        assert_eq!(native_path_base(&mut v, &[s("file.txt")]).unwrap(), s("file.txt"));
+        // 根目录无文件名 → ""
+        assert_eq!(native_path_base(&mut v, &[s("/")]).unwrap(), s(""));
+    }
+
+    #[test]
+    fn test_path_dir() {
+        let mut v = vm();
+        assert_eq!(native_path_dir(&mut v, &[s("file.txt")]).unwrap(), s(""));
+        assert_eq!(
+            native_path_dir(&mut v, &[s("a/b/c.txt")]).unwrap(),
+            s("a/b")
+        );
+    }
+
+    #[test]
+    fn test_path_type_errors() {
+        let mut v = vm();
+        // 非字符串入参 / 缺参 → TypeError（直接调用层面；arity 由 VM CALL 校验）
+        let err = native_path_ext(&mut v, &[Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError"));
+        let err = native_path_base(&mut v, &[]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("missing"));
+        let err = native_path_dir(&mut v, &[Object::Bool(true)]).unwrap_err();
+        assert!(err.contains("TypeError"));
+    }
+
+    // ---- task 48：端到端集成测试 ----
+
+    #[test]
+    fn test_integration_os() {
+        let src = r#"
+import os
+assert(type(os.getcwd()) == "string")
+assert(len(os.getcwd()) > 0)
+assert(os.getenv("__MSLANG_NOT_SET_X9Z__") == nil)
+os.setenv("__MSLANG_INTTEST_K__", "v42")
+assert(os.getenv("__MSLANG_INTTEST_K__") == "v42")
+assert(type(os.args) == "list")
+assert(len(os.args) >= 1)
+"#;
+        let r = run_source(src);
+        std::env::remove_var("__MSLANG_INTTEST_K__");
+        assert!(r.is_ok(), "os integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_string() {
+        let src = r#"
+import string
+assert(string.format("{} + {} = {}", 1, 2, 3) == "1 + 2 = 3")
+assert(string.format("{}", 3.5) == "3.5")
+assert(string.format("{}", true) == "true")
+assert(string.format("{}", nil) == "nil")
+assert(string.format("hi {}", "there") == "hi there")
+assert(string.repeat("ab", 3) == "ababab")
+assert(string.repeat("x", 0) == "")
+assert(string.reverse("hello") == "olleh")
+assert(string.is_alpha("abc"))
+assert(not string.is_alpha(""))
+assert(not string.is_alpha("abc123"))
+assert(string.is_digit("123"))
+assert(not string.is_digit(""))
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "string integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_time() {
+        let src = r#"
+import time
+assert(time.format(0) == "1970-01-01 00:00:00")
+assert(time.format(1700000000) == "2023-11-14 22:13:20")
+assert(time.now() > 1000000000)
+assert(time.sleep(0) == nil)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "time integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_path() {
+        let src = r#"
+import path
+assert(path.ext("file.txt") == ".txt")
+assert(path.ext("noext") == "")
+assert(path.base("a/b/c.txt") == "c.txt")
+assert(path.dir("file.txt") == "")
+j = path.join("a", "b", "c")
+assert(len(j) == 5)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "path integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_from_imports() {
+        let src = r#"
+from string import format, repeat, reverse, is_alpha, is_digit
+assert(format("{}!", "go") == "go!")
+assert(repeat("na", 2) == "nana")
+assert(reverse("abc") == "cba")
+assert(is_alpha("hi"))
+assert(is_digit("9"))
+from time import format as tfmt
+assert(tfmt(0) == "1970-01-01 00:00:00")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "from-imports failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_os_string_time_path_std_prefix() {
+        // import @std os/string/time/path：@std 前缀命中原生模块。
+        let src = r#"
+import @std os
+assert(type(os.getcwd()) == "string")
+import @std string
+assert(string.reverse("abc") == "cba")
+import @std time
+assert(time.format(0) == "1970-01-01 00:00:00")
+import @std path
+assert(path.ext("f.txt") == ".txt")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "import @std failed: {:?}", r.err());
     }
 }
