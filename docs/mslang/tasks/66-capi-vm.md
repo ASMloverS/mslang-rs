@@ -71,26 +71,73 @@ MS_API void msVmUnlock(MsVM* vm);
 
 ### 文件位置
 
-- `src/capi/mod.rs` — C API 模块入口，声明子模块并 re-export
+- `src/capi/mod.rs` — C API 模块入口（task 65 已创建，本任务扩展：添加 `pub mod types;`）
+- `src/capi/types.rs` — **本任务新建**：Rust 侧 MsValue/MsStatus/MsType 等类型定义（与 types.h C 头文件对应）
 - `src/capi/vm.rs` — VM 生命周期、配置、执行、全局变量、锁
-- `src/capi/types.rs` — MsValue 不透明类型、MsStatus 等枚举定义（由 65-capi-infrastructure 创建，本任务扩展）
 
 ### 模块声明
 
-`src/lib.rs` 新增：
+> **M8 注意**：`src/lib.rs` 的 `#[cfg(feature = "capi")] pub mod capi;` 已由 task 65 完成，本任务无需修改 lib.rs。
+
+`src/capi/mod.rs`（在 task 65 基础上追加 `types` 模块）：
 
 ```rust
-pub mod capi;
-```
-
-`src/capi/mod.rs`：
-
-```rust
-pub mod types;
+#[cfg(feature = "capi")]
+pub mod types;   // ← 本任务新增
+#[cfg(feature = "capi")]
 pub mod vm;
+// ... 其余 task 65 已有声明的模块不变
 ```
 
-### MsVM 不透明结构
+### Rust 侧类型定义 — `src/capi/types.rs`（本任务新建）
+
+task 65 在 C 头文件 `types.h` 中定义了 MsType/MsStatus/MsGcType/MsFutureState 枚举和 MsGcStats 结构体。本任务在 Rust 侧创建对应的 `#[repr(C)]` 类型，使 cbindgen 能从 Rust 源码生成 C 头文件：
+
+```rust
+use crate::vm::object::Object;
+
+/// C API 值的不透明包装。C 侧操作 `MsValue*`，Rust 侧经 Box 管理。
+#[repr(C)]
+pub struct MsValue {
+    pub inner: Object,
+}
+
+/// C API 返回状态（与 types.h 中 MsStatus 对应）。
+#[repr(i32)]
+pub enum MsStatus {
+    MS_OK    =  0,
+    MS_ERROR = -1,
+    MS_YIELD =  1,
+}
+
+/// C API 类型标签（与 types.h 中 MsType 对应）。
+/// 注意：此枚举与内部 TypeTag（14-gc.md:89-112）不同——MsType 包含
+/// Nil/Bool/Int/Float 内联类型，TypeTag 仅含堆类型。转换映射由 task 67 实现。
+#[repr(u8)]
+pub enum MsType {
+    Nil          = 0,
+    Bool         = 1,
+    Int          = 2,
+    Float        = 3,
+    String       = 4,
+    List         = 5,
+    Dict         = 6,
+    Tuple        = 7,
+    Set          = 8,
+    Function     = 9,
+    Class        = 10,
+    Instance     = 11,
+    Module       = 12,
+    Generator    = 13,
+    Future       = 14,
+    Channel      = 15,
+    Iterator     = 16,
+    BoundMethod  = 17,
+    JoinHandle   = 18,
+}
+```
+
+> MsValue 在 C 侧为不透明指针 `MsValue*`，实际由 `Box<MsValue>` 经 `Box::into_raw` 转为裸指针返回给 C。MsValue 的释放见 `msValueFree`（§msValueFree）。
 
 `src/capi/vm.rs`：
 
@@ -103,7 +150,7 @@ pub struct MsVM {
 }
 
 struct VmInner {
-    vm: crate::vm::Vm,
+    vm: crate::vm::VM,
     module_paths: Vec<String>,
     args: Vec<String>,
     stdout_cb: Option<WriteCallback>,
@@ -119,7 +166,7 @@ unsafe impl Send for WriteCallback {}
 unsafe impl Sync for WriteCallback {}
 ```
 
-`VmInner` 持有实际 VM 状态。`MsVM` 对外仅暴露不透明指针，C 侧无法访问内部字段。
+`VmInner` 持有实际 VM 状态（类型为 `crate::vm::VM`，注意全大写）。`MsVM` 对外仅暴露不透明指针，C 侧无法访问内部字段。
 
 ### MsWriteFn 类型
 
@@ -127,22 +174,23 @@ unsafe impl Sync for WriteCallback {}
 type MsWriteFn = Option<extern "C" fn(data: *const i8, len: usize, userdata: *mut std::ffi::c_void) -> i32>;
 ```
 
-与 13-capi.md 中 `typedef int (*MsWriteFn)(const char* data, size_t len, void* userdata)` 对应。
+与 13-capi.md 中 `typedef int (*MsWriteFn)(const char* data, size_t len, void* userdata)` 对应。使用 `Option<fn>` 表示可空函数指针（标准 FFI 模式，NULL = None = 恢复默认输出）。
 
-### MsValue 不透明类型
+### VM 访问器扩展（M2 修复）
 
-`src/capi/types.rs`（由 65-capi-infrastructure 定义基础框架，本任务确认接口）：
+VM 的 `globals` 字段为 private（`src/vm/mod.rs:97`）。需在 `VM` 上添加公开访问器：
 
 ```rust
-use crate::vm::object::Object;
-
-#[repr(C)]
-pub struct MsValue {
-    inner: Object,
+// src/vm/mod.rs — 新增公开访问器
+impl VM {
+    pub fn globals(&self) -> &HashMap<String, Object> {
+        &self.globals
+    }
+    pub fn globals_mut(&mut self) -> &mut HashMap<String, Object> {
+        &mut self.globals
+    }
 }
 ```
-
-MsValue 在 C 侧为不透明指针 `MsValue*`，实际由 `Box<MsValue>` 经 `Box::into_raw` 转为裸指针返回给 C。
 
 ### msVmNew
 
@@ -150,7 +198,7 @@ MsValue 在 C 侧为不透明指针 `MsValue*`，实际由 `Box<MsValue>` 经 `B
 #[no_mangle]
 pub extern "C" fn msVmNew() -> *mut MsVM {
     let inner = VmInner {
-        vm: crate::vm::Vm::new(),
+        vm: crate::vm::VM::new(),
         module_paths: Vec::new(),
         args: Vec::new(),
         stdout_cb: None,
@@ -225,7 +273,7 @@ pub extern "C" fn msSetArgs(vm: *mut MsVM, argc: i32, argv: *const *const i8) {
 }
 ```
 
-从 C 的 `argc/argv` 转为 `Vec<String>` 存储。
+从 C 的 `argc/argv` 转为 `Vec<String>` 存储。`argc` 为负时已由外层 `argc > 0` 跳过。`argv` 为 NULL 但 argc > 0 时已由 `!argv.is_null()` 跳过。
 
 ### msSetStdout / msSetStderr
 
@@ -333,7 +381,11 @@ fn exec_source(vm: *mut MsVM, source: &str, filename: Option<&str>) -> MsStatus 
 
 完整的编译执行管线：Lexer → Parser → Compiler → VM.interpret。加锁后在整个流程中持有锁，保证线程安全。
 
+> **R4 注意**：exec 系列函数持有 VM 锁直到脚本执行完成。长时间运行的脚本（死循环、大计算）会阻塞同 VM 的其他线程。需并行的场景建议使用多 VM 实例（`13-capi.md:159`：每个 VM 独立 GC 堆 + 模块缓存）。
+
 ### msEval
+
+> **M3 注意**：Parser 仅有 `parse()` 方法（解析完整 Program），**无 `parse_expression()`**。msEval 改为将表达式包装为 `return <expr>;` 的完整脚本，经标准 parse → compile → interpret 管线执行，取 interpret 返回值。
 
 ```rust
 #[no_mangle]
@@ -344,15 +396,17 @@ pub extern "C" fn msEval(vm: *mut MsVM, expr: *const i8) -> *mut MsValue {
     let expr_str = unsafe {
         std::ffi::CStr::from_ptr(expr).to_string_lossy().into_owned()
     };
+    // 包装为 return <expr> 脚本，使 interpret 返回表达式的值。
+    let source = format!("return {}", expr_str);
 
     let vm_ref = unsafe { &*vm };
     let mut inner = vm_ref.inner.lock().unwrap();
 
-    let tokens = match crate::lexer::Lexer::new(&expr_str).collect::<Result<Vec<_>, _>>() {
+    let tokens = match crate::lexer::Lexer::new(&source).collect::<Result<Vec<_>, _>>() {
         Ok(t) => t,
         Err(_) => return std::ptr::null_mut(),
     };
-    let ast = match crate::parser::Parser::new(tokens).parse_expression() {
+    let ast = match crate::parser::Parser::new(tokens).parse() {
         Ok(a) => a,
         Err(_) => return std::ptr::null_mut(),
     };
@@ -368,7 +422,6 @@ pub extern "C" fn msEval(vm: *mut MsVM, expr: *const i8) -> *mut MsValue {
         Err(_) => std::ptr::null_mut(),
     }
 }
-```
 
 编译表达式，执行，返回结果作为新的 `MsValue*`（所有权转移给 C 侧）。错误返回 NULL。
 
@@ -439,33 +492,7 @@ pub extern "C" fn msDelGlobal(vm: *mut MsVM, name: *const i8) {
 
 ### msVmLock / msVmUnlock
 
-```rust
-#[no_mangle]
-pub extern "C" fn msVmLock(vm: *mut MsVM) {
-    if vm.is_null() {
-        return;
-    }
-    let vm_ref = unsafe { &*vm };
-    let guard = vm_ref.inner.lock().unwrap();
-    std::mem::forget(guard);
-}
-
-#[no_mangle]
-pub extern "C" fn msVmUnlock(vm: *mut MsVM) {
-    if vm.is_null() {
-        return;
-    }
-    let vm_ref = unsafe { &*vm };
-    let guard = vm_ref.inner.lock().unwrap();
-    drop(guard);
-}
-```
-
-`msVmLock`：获取锁后通过 `mem::forget` 阻止 guard drop，保持锁持有状态。
-
-`msVmUnlock`：重新获取锁（此时已持有，需要调整策略——见下方 ReentrantMutex 方案）。
-
-**实际实现使用 `parking_lot::ReentrantMutex`**：
+> **M5/V1 决策**：`std::sync::Mutex` **不可重入**——`msVmLock` 后调用任何 `ms*` API（内部也 `lock()`）会死锁。必须使用 `parking_lot::ReentrantMutex`。Cargo.toml 需追加 `parking_lot` 依赖（见 §Cargo.toml 变更）。
 
 ```rust
 use parking_lot::ReentrantMutex;
@@ -474,48 +501,29 @@ use parking_lot::ReentrantMutex;
 pub struct MsVM {
     inner: ReentrantMutex<VmInner>,
 }
-```
-
-`ReentrantMutex` 允许同一线程多次获取锁。`msVmLock` 调用 `lock()` 获取并 `forget` guard；`msVmUnlock` 再次 `lock()` 获取（因同线程可重入）然后 drop。
-
-更安全的方案：使用 `RawMutex` + 手动计数：
-
-```rust
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[repr(C)]
-pub struct MsVM {
-    inner: Mutex<VmInner>,
-    lock_count: AtomicUsize,
-}
 
 #[no_mangle]
 pub extern "C" fn msVmLock(vm: *mut MsVM) {
-    if vm.is_null() {
-        return;
-    }
+    if vm.is_null() { return; }
     let vm_ref = unsafe { &*vm };
-    let _guard = vm_ref.inner.lock().unwrap();
-    std::mem::forget(_guard);
-    vm_ref.lock_count.fetch_add(1, Ordering::SeqCst);
+    let guard = vm_ref.inner.lock();
+    std::mem::forget(guard);
+    // ReentrantMutex: 同线程可再次 lock() 不阻塞。
+    // forget 阻止 guard drop，锁保持持有直到 msVmUnlock。
 }
 
 #[no_mangle]
 pub extern "C" fn msVmUnlock(vm: *mut MsVM) {
-    if vm.is_null() {
-        return;
-    }
+    if vm.is_null() { return; }
     let vm_ref = unsafe { &*vm };
-    if vm_ref.lock_count.load(Ordering::SeqCst) == 0 {
-        return;
-    }
-    let guard = vm_ref.inner.lock().unwrap();
+    // ReentrantMutex 可重入：再次 lock() 获取 guard，drop 释放一层。
+    // 配对的 msVmLock 已 forget 一个 guard，此 lock+drop 释放它。
+    let guard = vm_ref.inner.lock();
     drop(guard);
-    vm_ref.lock_count.fetch_sub(1, Ordering::SeqCst);
 }
 ```
 
-> **决策**：优先使用 `parking_lot::ReentrantMutex`，避免手动锁计数。Cargo.toml 添加 `parking_lot` 依赖。如果团队倾向减少依赖，则使用 `std::sync::Mutex` + `lock_count` 方案。
+> **ReentrantMutex 原理**：同线程多次 `lock()` 不阻塞（内部计数），每次 `drop` 递减计数，归零时释放锁。`msVmLock` forget 一个 guard（计数+1），`msVmUnlock` lock+drop 一个 guard（计数+1 再-1 = 净0，但 forget 的那个仍在 → 需配对使用）。如果用户 lock 后直接调用其他 `ms*` 函数，这些函数内部 lock+drop 不影响外层 forget 的 guard。
 
 ### 线程安全策略总结
 
@@ -526,27 +534,87 @@ pub extern "C" fn msVmUnlock(vm: *mut MsVM) {
 | 多线程多 VM | 每个 VM 有独立 Mutex，不同 VM 实例可并行 |
 | 原子多步操作 | `msVmLock`/`msVmUnlock` 包裹多个 API 调用 |
 
-### VmInner 中输出回调的使用
+### 输出回调与 VM print 集成方案（M7）
 
-VM 执行 `print()` 等输出时，检查 `stdout_cb` / `stderr_cb` 是否已设置：
+VM 的 `builtin_print`（`builtins.rs:223`）直接调用 Rust `print!`。需修改使其检查 C API 侧设置的回调：
 
-- 已设置：调用回调函数，传入数据和 userdata
-- 未设置：使用默认 `stdout`/`stderr`（`print!` / `eprint!`）
+**方案**：在 `VM` 结构体添加输出目标字段：
 
-此逻辑需要配合 VM 的 print 内置函数实现（`src/vm/builtins.rs` 中的 `print` 函数）。VM 需要提供一种机制让 builtins 获取当前输出目标——可通过在 VmInner 中增加 `output` 字段，或通过闭包注入。
+```rust
+// src/vm/mod.rs — VM 新增字段
+pub struct VM {
+    // ... 既有字段 ...
+    /// C API 输出重定向回调（task 66）。None = 使用默认 stdout/stderr。
+    pub stdout_writer: Option<*mut std::ffi::c_void>,
+    pub stderr_writer: Option<*mut std::ffi::c_void>,
+}
+```
+
+`builtin_print` 修改为检查 `vm.stdout_writer`：
+
+```rust
+fn builtin_print(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    // ... 构造输出字符串 output ...
+    match vm.stdout_writer {
+        Some(cb_ptr) => {
+            // 调用 C 回调 WriteCallback.fn_ptr(output.as_ptr(), output.len(), userdata)
+            // SAFETY: cb_ptr 指向 WriteCallback，由 msSetStdout 设置。
+            let cb = unsafe { &*(cb_ptr as *const WriteCallback) };
+            if let Some(fn_ptr) = cb.fn_ptr {
+                fn_ptr(output.as_ptr() as *const i8, output.len(), cb.userdata);
+            }
+        }
+        None => print!("{}", output),  // 默认输出
+    }
+    Ok(Object::Nil)
+}
+```
+
+> **跨模块引用**：`WriteCallback` 定义在 `src/capi/vm.rs`。`src/vm/builtins.rs` 引用 `capi::vm::WriteCallback` 需 `#[cfg(feature = "capi")]` 守卫。非 capi 构建时 `stdout_writer` 字段为 None，使用默认 `print!`。
+>
+> **R3 注意**：`lock().unwrap()` 在 Mutex poison 后 panic。所有 `ms*` 函数改用 `lock().unwrap_or_else(|e| e.into_inner())` 忽略 poison（或记录日志后继续），防止 C 侧线程级联崩溃。
 
 ### 与 65-capi-infrastructure 的关系
 
 任务 65 提供 C API 基础设施：
 - `src/capi/mod.rs` 模块结构
-- `src/capi/types.rs` 中 MsValue、MsStatus、MsType 等基础类型定义
-- `include/mslang/types.h` C 头文件生成框架
+- `include/mslang/types.h` C 头文件（手写）
 - Cargo.toml 中 `crate-type = ["cdylib", "rlib"]` 配置
 
 本任务在 65 的基础上：
-- 新增 `src/capi/vm.rs`
-- 在 `include/mslang/` 中新增 `vm.h` 头文件
-- 使用 65 定义的 MsValue、MsStatus 等类型
+- **新增** `src/capi/types.rs` — Rust 侧 MsValue/MsStatus/MsType 定义
+- **新增** `src/capi/vm.rs` — VM 生命周期 C API
+- **修改** `src/vm/mod.rs` — 添加 `globals()`/`globals_mut()` 访问器 + `stdout_writer`/`stderr_writer` 字段
+- **修改** `src/vm/builtins.rs` — `builtin_print` 支持输出回调
+- **修改** `Cargo.toml` — 追加 `parking_lot` 依赖
+- vm.h 由 cbindgen 从 `src/capi/vm.rs` 的 `#[no_mangle] pub extern "C"` 函数自动生成
+
+### Cargo.toml 变更（L5）
+
+在现有 Cargo.toml `[dependencies]` 段追加：
+
+```toml
+[dependencies]
+# ... 既有 clap、thiserror ...
+parking_lot = "0.12"
+```
+
+### msValueFree（V2 — MsValue 内存释放）
+
+> **V2**：msEval/msGetGlobal 返回 `Box::into_raw` 分配的 MsValue。C 侧无释放路径导致内存泄漏。task 74 的 GC root 注册可统一管理，但 MVP 阶段需提供手动释放：
+
+```rust
+/// 释放 C 侧持有的 MsValue。NULL 安全。
+/// 注意：此函数仅释放 Box<MsValue> 包装，不释放 inner Object 引用的堆对象
+/// （由 GC 管理，task 74 接入 GC root 后自动回收）。
+#[no_mangle]
+pub extern "C" fn msValueFree(val: *mut MsValue) {
+    if val.is_null() { return; }
+    unsafe { let _ = Box::from_raw(val); }
+}
+```
+
+> **R1 GC 前瞻**：MsValue.inner 中的 `Object::Ref(*mut MsObjHeader)` 指针可能被 GC 移动（Minor GC 半空间复制）或回收（Major GC）。task 74 实现 `msRoot`/`msUnroot` 后，C 侧应经 root 注册保护跨 GC 的 MsValue。MVP 阶段 GC 未接入日常分配（VM 日常 alloc_* 不受 GC 管理），实际安全。
 
 ## 验证标准
 
@@ -565,7 +633,10 @@ VM 执行 `print()` 等输出时，检查 `stdout_cb` / `stderr_cb` 是否已设
 13. `msEval` 返回表达式的求值结果
 14. `msEval` 对非法表达式返回 NULL
 15. `msVmLock` / `msVmUnlock` 配合使用可保证多步操作原子性
-16. 多线程并发调用同一 VM 的 API 不崩溃
+16. 多线程并发调用同一 VM 的 API 不崩溃（ReentrantMutex 可重入）
+17. `msValueFree` 释放 C 侧持有的 MsValue 不崩溃；`msValueFree(NULL)` 安全处理
+18. VM `globals()`/`globals_mut()` 访问器从 capi 模块可访问（M2）
+19. `src/capi/types.rs` 中 MsStatus/MsValue/MsType 定义正确（cbindgen 可生成对应 C 类型）
 
 ## 测试用例
 
@@ -690,7 +761,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let captured_ptr = Arc::into_raw(captured) as *mut std::ffi::c_void;
+        // V4: 保持 Arc 类型一致，经 raw pointer 传递并在回调中恢复。
+        let captured_ptr = Arc::into_raw(captured);
 
         extern "C" fn write_cb(
             data: *const i8,
@@ -707,7 +779,7 @@ mod tests {
 
         let vm = msVmNew();
         unsafe {
-            msSetStdout(vm, Some(write_cb), captured_ptr);
+            msSetStdout(vm, Some(write_cb), captured_ptr as *mut std::ffi::c_void);
         }
 
         let source = std::ffi::CString::new("print(\"hello\")").unwrap();
@@ -716,7 +788,8 @@ mod tests {
             msExecString(vm, source.as_ptr(), filename.as_ptr());
         }
 
-        let captured = unsafe { Arc::from_raw(captured_ptr as *const Mutex<Vec<u8>>) };
+        // V4: from_raw 类型与 into_raw 一致（Arc<Mutex<Vec<u8>>>）
+        let captured = unsafe { Arc::from_raw(captured_ptr) };
         let data = captured.lock().unwrap();
         let output = String::from_utf8_lossy(&data);
         assert!(output.contains("hello"));
@@ -769,7 +842,7 @@ mod tests {
 `tests/c/test_vm.c`：
 
 ```c
-#include <mslang/vm.h>
+#include <mslang/mslang.h>
 #include <assert.h>
 #include <string.h>
 
