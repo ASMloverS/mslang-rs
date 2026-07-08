@@ -11,3 +11,12 @@ thiserror = "1"
 [[bin]]
 name = "ms"
 path = "src/main.rs"
+
+[features]
+capi = []
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+cbindgen = "0.26"

@@ -8,3 +8,6 @@ pub mod repl;
 pub mod vm;
 
 pub mod error;
+
+#[cfg(feature = "capi")]
+pub mod capi;
