@@ -7,7 +7,7 @@ pub mod stdlib;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::module::{self, ModuleResolver};
-use crate::vm::builtins::{read_native_function, to_iterator};
+use crate::vm::builtins::{alloc_native_function, read_native_function, NativeFunction, to_iterator};
 use crate::vm::object::{
     alloc_bound_method, alloc_class, alloc_closure, alloc_dict, alloc_exception,
     alloc_exception_class, alloc_function, alloc_generator, alloc_instance, alloc_iterator,
@@ -2653,6 +2653,33 @@ impl VM {
                                 None => {
                                     return Err(format!(
                                         "AttributeError: FileHandle has no attribute '{}'",
+                                        attr
+                                    ));
+                                }
+                            }
+                        }
+                        // task 50：String 方法分派（length/upper/.../slice 等 12 个）。
+                        // 返回 BoundMethod（receiver=String + method=native），后续 CALL
+                        // BOUND_METHOD→FUNCTION 自动注入 receiver 为 args[0]。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 =>
+                        {
+                            match stdlib::lookup_string_method(&attr) {
+                                Some(func) => {
+                                    let method_obj = alloc_native_function(NativeFunction {
+                                        name: attr.clone(),
+                                        func,
+                                    });
+                                    // SAFETY: alloc_native_function 恒返回 Ref。
+                                    let method_ptr = match method_obj {
+                                        Object::Ref(p) => p,
+                                        _ => unreachable!("alloc_native_function must return Ref"),
+                                    };
+                                    self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "AttributeError: 'string' has no attribute '{}'",
                                         attr
                                     ));
                                 }
