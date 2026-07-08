@@ -943,6 +943,26 @@ impl VM {
         self.pop()
     }
 
+    /// task 51：调用任意 callable Object（CLOSURE/FUNCTION/BOUND_METHOD）并返回结果。
+    /// 供 List.map/filter/reduce 等原生方法调用用户回调。
+    /// 压栈 callee + args，call_value 后 run_loop 至返回，弹出结果。
+    pub fn call_function(
+        &mut self,
+        callee: &Object,
+        args: &[Object],
+    ) -> Result<Object, String> {
+        self.push(callee.clone())?;
+        for arg in args {
+            self.push(arg.clone())?;
+        }
+        let caller_depth = self.call_stack.len();
+        self.call_value(args.len())?;
+        if self.call_stack.len() > caller_depth {
+            self.run_loop(Some(caller_depth))?;
+        }
+        self.pop()
+    }
+
     /// task 43 §8：若 obj 是 Instance 且其类（沿继承链）定义了 `method_name`，
     /// 调用 obj.method(args...) 并返回 Ok(Some(result))；否则返回 Ok(None)，
     /// 由调用方决定 fallback（内置运算）或报错。
@@ -2505,17 +2525,29 @@ impl VM {
                         continue;
                     }
                     match &obj {
-                        // [task 38 临时] Dict 属性访问：等价于 dict[attr]，键不存在返回 nil。
-                        // Phase 5 task 41/43 由 Instance 接管，本分支删除。
-                        // 注：Object 对 STRING Ref 按内容哈希/相等（object.rs Hash/Eq），
-                        // 故 alloc_string(&attr) 与源码字面量键按内容匹配。
-                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
-                            let key = alloc_string(&attr);
-                            let val = unsafe { read_dict(*ptr) }
-                                .get(&key)
-                                .cloned()
-                                .unwrap_or(Object::Nil);
-                            self.push(val)?;
+                        // task 51：Dict 方法分派（length/keys/.../merge 等 9 个），
+                        // 先查方法名；若非已知方法则回退到键访问（d.key 等价 d["key"]）。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 =>
+                        {
+                            if let Some(func) = stdlib::lookup_dict_method(&attr) {
+                                let method_obj = alloc_native_function(NativeFunction {
+                                    name: attr.clone(),
+                                    func,
+                                });
+                                let method_ptr = match method_obj {
+                                    Object::Ref(p) => p,
+                                    _ => unreachable!(),
+                                };
+                                self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                            } else {
+                                let key = alloc_string(&attr);
+                                let val = unsafe { read_dict(*ptr) }
+                                    .get(&key)
+                                    .cloned()
+                                    .unwrap_or(Object::Nil);
+                                self.push(val)?;
+                            }
                         }
                         Object::Ref(ptr)
                             if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 =>
@@ -2680,6 +2712,54 @@ impl VM {
                                 None => {
                                     return Err(format!(
                                         "AttributeError: 'string' has no attribute '{}'",
+                                        attr
+                                    ));
+                                }
+                            }
+                        }
+                        // task 51：List 方法分派（length/push/.../reduce 等 14 个）。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 =>
+                        {
+                            match stdlib::lookup_list_method(&attr) {
+                                Some(func) => {
+                                    let method_obj = alloc_native_function(NativeFunction {
+                                        name: attr.clone(),
+                                        func,
+                                    });
+                                    let method_ptr = match method_obj {
+                                        Object::Ref(p) => p,
+                                        _ => unreachable!(),
+                                    };
+                                    self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "AttributeError: 'list' has no attribute '{}'",
+                                        attr
+                                    ));
+                                }
+                            }
+                        }
+                        // task 51：Set 方法分派（length/add/.../difference 等 7 个）。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 =>
+                        {
+                            match stdlib::lookup_set_method(&attr) {
+                                Some(func) => {
+                                    let method_obj = alloc_native_function(NativeFunction {
+                                        name: attr.clone(),
+                                        func,
+                                    });
+                                    let method_ptr = match method_obj {
+                                        Object::Ref(p) => p,
+                                        _ => unreachable!(),
+                                    };
+                                    self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "AttributeError: 'set' has no attribute '{}'",
                                         attr
                                     ));
                                 }

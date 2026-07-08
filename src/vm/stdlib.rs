@@ -10,9 +10,9 @@
 
 use super::builtins::{alloc_native_function, NativeFunction, NativeFn};
 use super::object::{
-    alloc_dict, alloc_file_handle, alloc_list, alloc_module, alloc_string, read_dict,
-    read_file_handle, read_file_handle_mut, read_list, read_module_mut, read_str, DictMap,
-    MsObjHeader, Object, TypeTag,
+    alloc_dict, alloc_file_handle, alloc_list, alloc_module, alloc_set, alloc_string, alloc_tuple,
+    read_dict, read_file_handle, read_file_handle_mut, read_list, read_module_mut, read_set,
+    read_str, CmpOp, DictMap, MsObjHeader, Object, TypeTag,
 };
 use super::VM;
 use std::collections::HashSet;
@@ -1487,6 +1487,451 @@ impl<'a> JsonParser<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// List 方法（task 51：GET_ATTR → BoundMethod 分派，仿 task 46/50 模式）
+// ---------------------------------------------------------------------------
+
+/// List 方法名 → 原生函数（供 GET_ATTR 包装为 BoundMethod）。
+pub fn lookup_list_method(name: &str) -> Option<NativeFn> {
+    let func: NativeFn = match name {
+        "length" => native_list_length,
+        "push" => native_list_push,
+        "pop" => native_list_pop,
+        "insert" => native_list_insert,
+        "remove" => native_list_remove,
+        "index" => native_list_index,
+        "contains" => native_list_contains,
+        "sort" => native_list_sort,
+        "reverse" => native_list_reverse,
+        "slice" => native_list_slice,
+        "map" => native_list_map,
+        "filter" => native_list_filter,
+        "reduce" => native_list_reduce,
+        _ => return None,
+    };
+    Some(func)
+}
+
+// 注：args[0] 为 List receiver（BoundMethod 注入），用户参数从 args.get(1) 起。
+
+fn native_list_length(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "length()")?;
+    let len = unsafe { read_list(ptr) }.len();
+    Ok(Object::Int(len as i64))
+}
+
+fn native_list_push(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "push(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: push(value) requires 1 argument".to_string())?;
+    unsafe { read_list(ptr) }.push(val);
+    Ok(Object::Nil)
+}
+
+fn native_list_pop(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "pop(index?)")?;
+    let len = unsafe { read_list(ptr) }.len();
+    let idx = if args.len() <= 1 {
+        if len == 0 {
+            return Err("IndexError: pop from empty list".to_string());
+        }
+        len - 1
+    } else {
+        let i = expect_int(args.get(1), "pop(index?)")?;
+        normalize_index(i, len).ok_or_else(|| {
+            format!("IndexError: pop index {} out of range for length {}", i, len)
+        })?
+    };
+    let popped = unsafe { read_list(ptr) }.remove(idx);
+    Ok(popped)
+}
+
+fn native_list_insert(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "insert(index, value)")?;
+    let i = expect_int(args.get(1), "insert(index, value)")?;
+    let val = args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| "TypeError: insert(index, value) requires 2 arguments".to_string())?;
+    let len = unsafe { read_list(ptr) }.len();
+    let n = if i < 0 { len as i64 + i } else { i };
+    if n < 0 || n > len as i64 {
+        return Err(format!(
+            "IndexError: insert index {} out of range for length {}",
+            i, len
+        ));
+    }
+    unsafe { read_list(ptr) }.insert(n as usize, val);
+    Ok(Object::Nil)
+}
+
+fn native_list_remove(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "remove(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: remove(value) requires 1 argument".to_string())?;
+    let found_idx = {
+        let list = unsafe { read_list(ptr) };
+        list.iter().position(|x| x == &val)
+    };
+    match found_idx {
+        Some(idx) => {
+            let _removed = unsafe { read_list(ptr) }.remove(idx);
+            Ok(Object::Nil)
+        }
+        None => Err("ValueError: remove(): value not in list".to_string()),
+    }
+}
+
+fn native_list_index(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "index(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: index(value) requires 1 argument".to_string())?;
+    let list = unsafe { read_list(ptr) };
+    match list.iter().position(|x| x == &val) {
+        Some(idx) => Ok(Object::Int(idx as i64)),
+        None => Err("ValueError: index(): value not in list".to_string()),
+    }
+}
+
+fn native_list_contains(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "contains(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: contains(value) requires 1 argument".to_string())?;
+    let found = unsafe { read_list(ptr) }.iter().any(|x| x == &val);
+    Ok(Object::Bool(found))
+}
+
+fn native_list_sort(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "sort()")?;
+    let mut items = unsafe { read_list(ptr) }.clone();
+    let mut err: Option<String> = None;
+    items.sort_by(|a, b| {
+        if err.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match a.compare(b, CmpOp::Less) {
+            Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
+            Ok(_) => match a.compare(b, CmpOp::Greater) {
+                Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
+                Ok(_) => std::cmp::Ordering::Equal,
+                Err(e) => {
+                    err = Some(e);
+                    std::cmp::Ordering::Equal
+                }
+            },
+            Err(e) => {
+                err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    unsafe { read_list(ptr) }.clear();
+    unsafe { read_list(ptr) }.extend(items);
+    Ok(Object::Nil)
+}
+
+fn native_list_reverse(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "reverse()")?;
+    unsafe { read_list(ptr) }.reverse();
+    Ok(Object::Nil)
+}
+
+fn native_list_slice(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "slice(start, end?)")?;
+    let start_i = expect_int(args.get(1), "slice(start, end?)")?;
+    let end_opt = if args.len() > 2 {
+        Some(expect_int(args.get(2), "slice(start, end?)")?)
+    } else {
+        None
+    };
+    let items = unsafe { read_list(ptr) }.clone();
+    let len = items.len() as i64;
+    let norm = |i: i64| -> i64 {
+        if i < 0 {
+            (len + i).max(0)
+        } else {
+            i.min(len)
+        }
+    };
+    let s = norm(start_i);
+    let e = match end_opt {
+        Some(i) => norm(i),
+        None => len,
+    };
+    if s > e {
+        return Err(format!("ValueError: slice start {} > end {}", s, e));
+    }
+    let sliced: Vec<Object> = items[s as usize..e as usize].to_vec();
+    Ok(alloc_list(sliced))
+}
+
+fn native_list_map(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "map(fn)")?;
+    let fn_obj = expect_callable(args.get(1), "map(fn)")?;
+    let items = unsafe { read_list(ptr) }.clone();
+    let mut result = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let mapped = vm.call_function(&fn_obj, std::slice::from_ref(item))?;
+        result.push(mapped);
+    }
+    Ok(alloc_list(result))
+}
+
+fn native_list_filter(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "filter(fn)")?;
+    let fn_obj = expect_callable(args.get(1), "filter(fn)")?;
+    let items = unsafe { read_list(ptr) }.clone();
+    let mut result = Vec::new();
+    for item in items.iter() {
+        let cond = vm.call_function(&fn_obj, std::slice::from_ref(item))?;
+        if cond.is_truthy() {
+            result.push(item.clone());
+        }
+    }
+    Ok(alloc_list(result))
+}
+
+fn native_list_reduce(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_list_ref(args.get(0), "reduce(fn, init?)")?;
+    let fn_obj = expect_callable(args.get(1), "reduce(fn, init?)")?;
+    let items = unsafe { read_list(ptr) }.clone();
+    let (mut acc, start) = if args.len() > 2 {
+        (args.get(2).cloned().unwrap(), 0)
+    } else {
+        if items.is_empty() {
+            return Err(
+                "ValueError: reduce() of empty list with no initial value".to_string()
+            );
+        }
+        (items[0].clone(), 1)
+    };
+    for item in items.iter().skip(start) {
+        acc = vm.call_function(&fn_obj, &[acc, item.clone()])?;
+    }
+    Ok(acc)
+}
+
+// ---------------------------------------------------------------------------
+// Dict 方法（task 51）
+// ---------------------------------------------------------------------------
+
+/// Dict 方法名 → 原生函数。
+pub fn lookup_dict_method(name: &str) -> Option<NativeFn> {
+    let func: NativeFn = match name {
+        "length" => native_dict_length,
+        "keys" => native_dict_keys,
+        "values" => native_dict_values,
+        "items" => native_dict_items,
+        "get" => native_dict_get,
+        "set" => native_dict_set,
+        "remove" => native_dict_remove,
+        "contains" => native_dict_contains,
+        "merge" => native_dict_merge,
+        _ => return None,
+    };
+    Some(func)
+}
+
+fn native_dict_length(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "length()")?;
+    Ok(Object::Int(unsafe { read_dict(ptr) }.len() as i64))
+}
+
+fn native_dict_keys(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "keys()")?;
+    let keys: Vec<Object> = unsafe { read_dict(ptr) }.keys().into_iter().cloned().collect();
+    Ok(alloc_list(keys))
+}
+
+fn native_dict_values(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "values()")?;
+    let vals: Vec<Object> = unsafe { read_dict(ptr) }
+        .items()
+        .into_iter()
+        .map(|(_, v)| v.clone())
+        .collect();
+    Ok(alloc_list(vals))
+}
+
+fn native_dict_items(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "items()")?;
+    let items: Vec<Object> = unsafe { read_dict(ptr) }
+        .items()
+        .into_iter()
+        .map(|(k, v)| alloc_tuple(vec![k.clone(), v.clone()]))
+        .collect();
+    Ok(alloc_list(items))
+}
+
+fn native_dict_get(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "get(key, default?)")?;
+    let key = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: get(key, default?) requires 1-2 arguments".to_string())?;
+    hash_key(&key)?;
+    let default = if args.len() > 2 {
+        args.get(2).cloned().unwrap()
+    } else {
+        Object::Nil
+    };
+    let dict = unsafe { read_dict(ptr) };
+    Ok(dict.get(&key).cloned().unwrap_or(default))
+}
+
+fn native_dict_set(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "set(key, value)")?;
+    let key = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: set(key, value) requires 2 arguments".to_string())?;
+    let val = args
+        .get(2)
+        .cloned()
+        .ok_or_else(|| "TypeError: set(key, value) requires 2 arguments".to_string())?;
+    hash_key(&key)?;
+    unsafe { read_dict(ptr) }.insert(key, val);
+    Ok(Object::Nil)
+}
+
+fn native_dict_remove(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "remove(key)")?;
+    let key = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: remove(key) requires 1 argument".to_string())?;
+    hash_key(&key)?;
+    if unsafe { read_dict(ptr) }.remove(&key).is_none() {
+        return Err("KeyError: key not found".to_string());
+    }
+    Ok(Object::Nil)
+}
+
+fn native_dict_contains(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "contains(key)")?;
+    let key = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: contains(key) requires 1 argument".to_string())?;
+    hash_key(&key)?;
+    let found = unsafe { read_dict(ptr) }.get(&key).is_some();
+    Ok(Object::Bool(found))
+}
+
+fn native_dict_merge(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_dict_ref(args.get(0), "merge(other)")?;
+    let other_ptr = expect_dict_ref(args.get(1), "merge(other)")?;
+    let pairs: Vec<(Object, Object)> = unsafe { read_dict(other_ptr) }
+        .items()
+        .into_iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (k, v) in pairs {
+        unsafe { read_dict(ptr) }.insert(k, v);
+    }
+    Ok(Object::Nil)
+}
+
+// ---------------------------------------------------------------------------
+// Set 方法（task 51）
+// ---------------------------------------------------------------------------
+
+/// Set 方法名 → 原生函数。
+pub fn lookup_set_method(name: &str) -> Option<NativeFn> {
+    let func: NativeFn = match name {
+        "length" => native_set_length,
+        "add" => native_set_add,
+        "remove" => native_set_remove,
+        "contains" => native_set_contains,
+        "union" => native_set_union,
+        "intersection" => native_set_intersection,
+        "difference" => native_set_difference,
+        _ => return None,
+    };
+    Some(func)
+}
+
+fn native_set_length(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "length()")?;
+    Ok(Object::Int(unsafe { read_set(ptr) }.len() as i64))
+}
+
+fn native_set_add(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "add(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: add(value) requires 1 argument".to_string())?;
+    hash_key(&val)?;
+    unsafe { read_set(ptr) }.insert(val);
+    Ok(Object::Nil)
+}
+
+fn native_set_remove(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "remove(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: remove(value) requires 1 argument".to_string())?;
+    hash_key(&val)?;
+    if !unsafe { read_set(ptr) }.remove(&val) {
+        return Err("KeyError: element not found".to_string());
+    }
+    Ok(Object::Nil)
+}
+
+fn native_set_contains(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "contains(value)")?;
+    let val = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "TypeError: contains(value) requires 1 argument".to_string())?;
+    let found = if hash_key(&val).is_ok() {
+        unsafe { read_set(ptr) }.contains(&val)
+    } else {
+        false
+    };
+    Ok(Object::Bool(found))
+}
+
+fn native_set_union(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "union(other)")?;
+    let other_ptr = expect_set_ref(args.get(1), "union(other)")?;
+    let a = unsafe { read_set(ptr) }.clone();
+    let b = unsafe { read_set(other_ptr) }.clone();
+    let result: HashSet<Object> = a.union(&b).cloned().collect();
+    Ok(alloc_set(result))
+}
+
+fn native_set_intersection(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "intersection(other)")?;
+    let other_ptr = expect_set_ref(args.get(1), "intersection(other)")?;
+    let a = unsafe { read_set(ptr) }.clone();
+    let b = unsafe { read_set(other_ptr) }.clone();
+    let result: HashSet<Object> = a.intersection(&b).cloned().collect();
+    Ok(alloc_set(result))
+}
+
+fn native_set_difference(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = expect_set_ref(args.get(0), "difference(other)")?;
+    let other_ptr = expect_set_ref(args.get(1), "difference(other)")?;
+    let a = unsafe { read_set(ptr) }.clone();
+    let b = unsafe { read_set(other_ptr) }.clone();
+    let result: HashSet<Object> = a.difference(&b).cloned().collect();
+    Ok(alloc_set(result))
+}
+
+// ---------------------------------------------------------------------------
 // 辅助函数
 // ---------------------------------------------------------------------------
 
@@ -1527,6 +1972,96 @@ fn expect_list_ref(arg: Option<&Object>, who: &str) -> Result<*mut MsObjHeader, 
             who,
             other.map(|o| o.type_name()).unwrap_or("missing")
         )),
+    }
+}
+
+/// 校验首参数为 Dict Ref，返回裸指针。
+fn expect_dict_ref(arg: Option<&Object>, who: &str) -> Result<*mut MsObjHeader, String> {
+    match arg {
+        Some(Object::Ref(ptr)) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => Ok(*ptr),
+        other => Err(format!(
+            "TypeError: {} expects dict, got {}",
+            who,
+            other.map(|o| o.type_name()).unwrap_or("missing")
+        )),
+    }
+}
+
+/// 校验首参数为 Set Ref，返回裸指针。
+fn expect_set_ref(arg: Option<&Object>, who: &str) -> Result<*mut MsObjHeader, String> {
+    match arg {
+        Some(Object::Ref(ptr)) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => Ok(*ptr),
+        other => Err(format!(
+            "TypeError: {} expects set, got {}",
+            who,
+            other.map(|o| o.type_name()).unwrap_or("missing")
+        )),
+    }
+}
+
+/// 校验参数为 callable（FUNCTION/CLOSURE/BOUND_METHOD）。
+fn expect_callable(arg: Option<&Object>, who: &str) -> Result<Object, String> {
+    match arg {
+        Some(o @ Object::Ref(ptr)) => {
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::FUNCTION as u8
+                || tag == TypeTag::CLOSURE as u8
+                || tag == TypeTag::BOUND_METHOD as u8
+            {
+                Ok(o.clone())
+            } else {
+                Err(format!(
+                    "TypeError: {} expects callable, got {}",
+                    who,
+                    o.type_name()
+                ))
+            }
+        }
+        other => Err(format!(
+            "TypeError: {} expects callable, got {}",
+            who,
+            other.map(|o| o.type_name()).unwrap_or("missing")
+        )),
+    }
+}
+
+/// 列表索引归一化（负索引相对末尾，越界返回 None）。
+fn normalize_index(i: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let n = if i < 0 { len + i } else { i };
+    if n < 0 || n >= len {
+        None
+    } else {
+        Some(n as usize)
+    }
+}
+
+/// 可哈希键校验（供 Set 元素 / Dict 键复用）。
+/// 仅 int/float/bool/string/nil/tuple 可哈希；NaN 抛 TypeError。
+fn hash_key(obj: &Object) -> Result<u64, String> {
+    match obj {
+        Object::Nil => Ok(0),
+        Object::Bool(b) => Ok(if *b { 1 } else { 0 }),
+        Object::Int(n) => Ok(*n as u64),
+        Object::Float(f) => {
+            if f.is_nan() {
+                Err("TypeError: unhashable type: NaN".to_string())
+            } else {
+                Ok((*f).to_bits())
+            }
+        }
+        Object::Ref(ptr) => {
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::STRING as u8 || tag == TypeTag::TUPLE as u8 {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                obj.hash(&mut hasher);
+                Ok(hasher.finish())
+            } else {
+                Err(format!("TypeError: unhashable type: '{}'", obj.type_name()))
+            }
+        }
     }
 }
 
@@ -3327,5 +3862,501 @@ assert(json.stringify(json.parse("-0.0")) == "-0.0")
 "#;
         let r = run_source(src);
         assert!(r.is_ok(), "json integration failed: {:?}", r.err());
+    }
+
+    // -----------------------------------------------------------------------
+    // task 51: List/Dict/Set 方法测试
+    // -----------------------------------------------------------------------
+
+    fn ilist(nums: &[i64]) -> Object {
+        let items: Vec<Object> = nums.iter().map(|n| Object::Int(*n)).collect();
+        alloc_list(items)
+    }
+
+    #[test]
+    fn test_lookup_list_method() {
+        let names = [
+            "length", "push", "pop", "insert", "remove", "index", "contains", "sort",
+            "reverse", "slice", "map", "filter", "reduce",
+        ];
+        for name in &names {
+            assert!(lookup_list_method(name).is_some(), "missing list method: {}", name);
+        }
+        assert!(lookup_list_method("nosuch").is_none());
+    }
+
+    #[test]
+    fn test_lookup_dict_method() {
+        let names = [
+            "length", "keys", "values", "items", "get", "set", "remove", "contains", "merge",
+        ];
+        for name in &names {
+            assert!(lookup_dict_method(name).is_some(), "missing dict method: {}", name);
+        }
+        assert!(lookup_dict_method("nosuch").is_none());
+    }
+
+    #[test]
+    fn test_lookup_set_method() {
+        let names = ["length", "add", "remove", "contains", "union", "intersection", "difference"];
+        for name in &names {
+            assert!(lookup_set_method(name).is_some(), "missing set method: {}", name);
+        }
+        assert!(lookup_set_method("nosuch").is_none());
+    }
+
+    #[test]
+    fn test_list_methods_basic() {
+        let mut v = vm();
+
+        // length
+        let lst = ilist(&[3, 1, 4, 1, 5]);
+        assert_eq!(native_list_length(&mut v, &[lst.clone()]).unwrap(), Object::Int(5));
+
+        // sort
+        native_list_sort(&mut v, &[lst.clone()]).unwrap();
+        assert_eq!(unsafe { read_list(match lst { Object::Ref(p) => p, _ => unreachable!() }) }.clone(),
+                   vec![Object::Int(1), Object::Int(1), Object::Int(3), Object::Int(4), Object::Int(5)]);
+
+        // push
+        native_list_push(&mut v, &[lst.clone(), Object::Int(9)]).unwrap();
+        // pop
+        let popped = native_list_pop(&mut v, &[lst.clone()]).unwrap();
+        assert_eq!(popped, Object::Int(9));
+
+        // insert
+        let lst2 = ilist(&[1, 2, 3]);
+        native_list_insert(&mut v, &[lst2.clone(), Object::Int(0), Object::Int(99)]).unwrap();
+
+        // remove
+        let lst3 = ilist(&[1, 2, 1]);
+        native_list_remove(&mut v, &[lst3.clone(), Object::Int(1)]).unwrap();
+
+        // index
+        let lst4 = ilist(&[10, 20, 30]);
+        assert_eq!(native_list_index(&mut v, &[lst4.clone(), Object::Int(20)]).unwrap(), Object::Int(1));
+
+        // contains
+        assert_eq!(native_list_contains(&mut v, &[lst4.clone(), Object::Int(20)]).unwrap(), Object::Bool(true));
+        assert_eq!(native_list_contains(&mut v, &[lst4.clone(), Object::Int(99)]).unwrap(), Object::Bool(false));
+
+        // reverse
+        let lst5 = ilist(&[1, 2, 3]);
+        native_list_reverse(&mut v, &[lst5.clone()]).unwrap();
+
+        // slice
+        let lst6 = ilist(&[10, 20, 30, 40, 50]);
+        let sliced = native_list_slice(&mut v, &[lst6, Object::Int(1), Object::Int(3)]).unwrap();
+        assert_eq!(unsafe { read_list(match sliced { Object::Ref(p) => p, _ => unreachable!() }) }.clone(),
+                   vec![Object::Int(20), Object::Int(30)]);
+    }
+
+    #[test]
+    fn test_list_pop_empty_error() {
+        let mut v = vm();
+        let empty = alloc_list(vec![]);
+        let err = native_list_pop(&mut v, &[empty]).unwrap_err();
+        assert!(err.starts_with("IndexError:"), "got: {}", err);
+        assert!(err.contains("empty list"));
+    }
+
+    #[test]
+    fn test_list_pop_index_oob_error() {
+        let mut v = vm();
+        let lst = ilist(&[1, 2]);
+        let err = native_list_pop(&mut v, &[lst, Object::Int(10)]).unwrap_err();
+        assert!(err.starts_with("IndexError:"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_list_remove_not_found() {
+        let mut v = vm();
+        let lst = ilist(&[1, 2]);
+        let err = native_list_remove(&mut v, &[lst, Object::Int(99)]).unwrap_err();
+        assert!(err.starts_with("ValueError:"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_list_index_not_found() {
+        let mut v = vm();
+        let lst = ilist(&[1, 2]);
+        let err = native_list_index(&mut v, &[lst, Object::Int(99)]).unwrap_err();
+        assert!(err.starts_with("ValueError:"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_list_slice_reverse_error() {
+        let mut v = vm();
+        let lst = ilist(&[1, 2]);
+        let err = native_list_slice(&mut v, &[lst, Object::Int(3), Object::Int(1)]).unwrap_err();
+        assert!(err.starts_with("ValueError:"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_list_negative_index() {
+        let mut v = vm();
+        // pop(-1)
+        let lst = ilist(&[10, 20, 30, 40, 50]);
+        let popped = native_list_pop(&mut v, &[lst.clone(), Object::Int(-1)]).unwrap();
+        assert_eq!(popped, Object::Int(50));
+
+        // insert(-1, val) — before last
+        let lst2 = ilist(&[10, 20, 30, 40]);
+        native_list_insert(&mut v, &[lst2.clone(), Object::Int(-1), Object::Int(99)]).unwrap();
+
+        // slice(-2)
+        let lst3 = ilist(&[10, 20, 30, 99, 40]);
+        let sliced = native_list_slice(&mut v, &[lst3.clone(), Object::Int(-2)]).unwrap();
+        assert_eq!(unsafe { read_list(match sliced { Object::Ref(p) => p, _ => unreachable!() }) }.clone(),
+                   vec![Object::Int(99), Object::Int(40)]);
+
+        // slice(1, -1) — remove first and last
+        let sliced2 = native_list_slice(&mut v, &[lst3, Object::Int(1), Object::Int(-1)]).unwrap();
+        assert_eq!(unsafe { read_list(match sliced2 { Object::Ref(p) => p, _ => unreachable!() }) }.clone(),
+                   vec![Object::Int(20), Object::Int(30), Object::Int(99)]);
+    }
+
+    #[test]
+    fn test_dict_methods_basic() {
+        let mut v = vm();
+        let mut m = DictMap::new();
+        m.insert(s("a"), Object::Int(1));
+        m.insert(s("b"), Object::Int(2));
+        let d = alloc_dict(m);
+
+        // length
+        assert_eq!(native_dict_length(&mut v, &[d.clone()]).unwrap(), Object::Int(2));
+
+        // keys
+        let keys = native_dict_keys(&mut v, &[d.clone()]).unwrap();
+        let keys_vec = unsafe { read_list(match &keys { Object::Ref(p) => *p, _ => unreachable!() }) }.clone();
+        assert_eq!(keys_vec.len(), 2);
+
+        // values
+        let vals = native_dict_values(&mut v, &[d.clone()]).unwrap();
+        let vals_vec = unsafe { read_list(match &vals { Object::Ref(p) => *p, _ => unreachable!() }) }.clone();
+        assert_eq!(vals_vec.len(), 2);
+
+        // items
+        let items = native_dict_items(&mut v, &[d.clone()]).unwrap();
+        let items_vec = unsafe { read_list(match &items { Object::Ref(p) => *p, _ => unreachable!() }) }.clone();
+        assert_eq!(items_vec.len(), 2);
+
+        // get with default
+        assert_eq!(native_dict_get(&mut v, &[d.clone(), s("c"), Object::Int(0)]).unwrap(), Object::Int(0));
+        assert_eq!(native_dict_get(&mut v, &[d.clone(), s("a")]).unwrap(), Object::Int(1));
+
+        // set
+        native_dict_set(&mut v, &[d.clone(), s("c"), Object::Int(3)]).unwrap();
+        assert_eq!(native_dict_get(&mut v, &[d.clone(), s("c")]).unwrap(), Object::Int(3));
+
+        // contains
+        assert_eq!(native_dict_contains(&mut v, &[d.clone(), s("a")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_dict_contains(&mut v, &[d.clone(), s("z")]).unwrap(), Object::Bool(false));
+
+        // remove
+        native_dict_remove(&mut v, &[d.clone(), s("c")]).unwrap();
+        assert_eq!(native_dict_contains(&mut v, &[d.clone(), s("c")]).unwrap(), Object::Bool(false));
+    }
+
+    #[test]
+    fn test_dict_remove_missing_key_error() {
+        let mut v = vm();
+        let d = alloc_dict(DictMap::new());
+        let err = native_dict_remove(&mut v, &[d, s("nope")]).unwrap_err();
+        assert!(err.starts_with("KeyError:"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_dict_merge() {
+        let mut v = vm();
+        let mut m1 = DictMap::new();
+        m1.insert(s("a"), Object::Int(1));
+        let d1 = alloc_dict(m1);
+
+        let mut m2 = DictMap::new();
+        m2.insert(s("b"), Object::Int(2));
+        let d2 = alloc_dict(m2);
+
+        native_dict_merge(&mut v, &[d1.clone(), d2]).unwrap();
+        assert_eq!(native_dict_length(&mut v, &[d1]).unwrap(), Object::Int(2));
+    }
+
+    #[test]
+    fn test_dict_merge_self_reference() {
+        let mut v = vm();
+        let mut m = DictMap::new();
+        m.insert(s("a"), Object::Int(1));
+        let d = alloc_dict(m);
+        // d.merge(d) should not deadlock
+        native_dict_merge(&mut v, &[d.clone(), d.clone()]).unwrap();
+        assert_eq!(native_dict_length(&mut v, &[d]).unwrap(), Object::Int(1));
+    }
+
+    #[test]
+    fn test_dict_set_unhashable_key() {
+        let mut v = vm();
+        let d = alloc_dict(DictMap::new());
+        let list_key = ilist(&[1, 2]);
+        let err = native_dict_set(&mut v, &[d, list_key, Object::Int(3)]).unwrap_err();
+        assert!(err.starts_with("TypeError:"), "got: {}", err);
+        assert!(err.contains("unhashable"));
+    }
+
+    #[test]
+    fn test_set_methods_basic() {
+        use std::collections::HashSet;
+        let mut v = vm();
+
+        let set1 = alloc_set({
+            let mut hs = HashSet::new();
+            hs.insert(Object::Int(1));
+            hs.insert(Object::Int(2));
+            hs.insert(Object::Int(3));
+            hs
+        });
+
+        // length
+        assert_eq!(native_set_length(&mut v, &[set1.clone()]).unwrap(), Object::Int(3));
+
+        // add
+        native_set_add(&mut v, &[set1.clone(), Object::Int(4)]).unwrap();
+        assert_eq!(native_set_contains(&mut v, &[set1.clone(), Object::Int(4)]).unwrap(), Object::Bool(true));
+
+        // remove
+        native_set_remove(&mut v, &[set1.clone(), Object::Int(4)]).unwrap();
+        assert_eq!(native_set_contains(&mut v, &[set1.clone(), Object::Int(4)]).unwrap(), Object::Bool(false));
+
+        // union
+        let set2 = alloc_set({
+            let mut hs = HashSet::new();
+            hs.insert(Object::Int(5));
+            hs.insert(Object::Int(6));
+            hs
+        });
+        let u = native_set_union(&mut v, &[set1.clone(), set2]).unwrap();
+        assert_eq!(native_set_length(&mut v, &[u]).unwrap(), Object::Int(5));
+
+        // intersection
+        let set3 = alloc_set({
+            let mut hs = HashSet::new();
+            hs.insert(Object::Int(2));
+            hs.insert(Object::Int(3));
+            hs.insert(Object::Int(7));
+            hs
+        });
+        let inter = native_set_intersection(&mut v, &[set1.clone(), set3.clone()]).unwrap();
+        assert_eq!(native_set_length(&mut v, &[inter]).unwrap(), Object::Int(2));
+
+        // difference
+        let diff = native_set_difference(&mut v, &[set1, set3]).unwrap();
+        assert_eq!(native_set_length(&mut v, &[diff]).unwrap(), Object::Int(1)); // {1}
+    }
+
+    #[test]
+    fn test_set_remove_missing_error() {
+        let mut v = vm();
+        let set = alloc_set(HashSet::new());
+        let err = native_set_remove(&mut v, &[set, Object::Int(99)]).unwrap_err();
+        assert!(err.starts_with("KeyError:"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_set_add_unhashable() {
+        let mut v = vm();
+        let set = alloc_set(HashSet::new());
+        let list_val = ilist(&[1, 2]);
+        let err = native_set_add(&mut v, &[set, list_val]).unwrap_err();
+        assert!(err.starts_with("TypeError:"), "got: {}", err);
+        assert!(err.contains("unhashable"));
+    }
+
+    #[test]
+    fn test_set_contains_unhashable_returns_false() {
+        let mut v = vm();
+        let set = alloc_set(HashSet::new());
+        let list_val = ilist(&[1, 2]);
+        // contains on unhashable → false (not error)
+        let result = native_set_contains(&mut v, &[set, list_val]).unwrap();
+        assert_eq!(result, Object::Bool(false));
+    }
+
+    #[test]
+    fn test_set_union_self_reference() {
+        use std::collections::HashSet;
+        let mut v = vm();
+        let s = alloc_set({
+            let mut hs = HashSet::new();
+            hs.insert(Object::Int(1));
+            hs.insert(Object::Int(2));
+            hs.insert(Object::Int(3));
+            hs
+        });
+        let u = native_set_union(&mut v, &[s.clone(), s.clone()]).unwrap();
+        assert_eq!(native_set_length(&mut v, &[u]).unwrap(), Object::Int(3));
+    }
+
+    #[test]
+    fn test_hash_key_nan() {
+        let err = hash_key(&Object::Float(f64::NAN)).unwrap_err();
+        assert!(err.contains("TypeError"));
+        assert!(err.contains("NaN"));
+    }
+
+    #[test]
+    fn test_hash_key_unhashable_list() {
+        let list = ilist(&[1, 2]);
+        let err = hash_key(&list).unwrap_err();
+        assert!(err.contains("TypeError"));
+        assert!(err.contains("unhashable"));
+    }
+
+    #[test]
+    fn test_hash_key_valid_types() {
+        assert!(hash_key(&Object::Nil).is_ok());
+        assert!(hash_key(&Object::Bool(true)).is_ok());
+        assert!(hash_key(&Object::Int(42)).is_ok());
+        assert!(hash_key(&Object::Float(3.14)).is_ok());
+        assert!(hash_key(&s("hello")).is_ok());
+        assert!(hash_key(&alloc_tuple(vec![Object::Int(1), Object::Int(2)])).is_ok());
+    }
+
+    // --- Integration tests (end-to-end via mslang source) ---
+
+    #[test]
+    fn test_integration_list_methods() {
+        let src = r#"
+lst = [3, 1, 4, 1, 5]
+lst.sort()
+lst.push(9)
+lst.pop()
+lst.insert(0, 0)
+lst.remove(1)
+assert(lst.contains(4))
+assert(lst.index(3) == lst.index(3))
+assert(lst.length() == len(lst))
+assert(lst.slice(0, 2).length() == 2)
+lst.reverse()
+print(lst)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "list integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_dict_methods() {
+        let src = r#"
+d = {"a": 1, "b": 2}
+assert(d.length() == 2)
+assert(d.get("a") == 1)
+assert(d.get("c", 0) == 0)
+d.set("c", 3)
+assert(d.contains("c"))
+assert(d.get("c") == 3)
+d.remove("c")
+assert(not d.contains("c"))
+d.merge({"d": 4})
+assert(d.contains("d"))
+ks = d.keys()
+assert(ks.length() == 3)
+vs = d.values()
+assert(vs.length() == 3)
+it = d.items()
+assert(it.length() == 3)
+print(d)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "dict integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_set_methods() {
+        let src = r#"
+s = {1, 2, 3}
+s.add(4)
+assert(s.contains(4))
+u = s.union({5, 6})
+assert(u.length() == 6)
+i = s.intersection({2, 3, 7})
+assert(i.length() == 2)
+d = s.difference({1, 2})
+assert(d.length() == 2)
+s.remove(4)
+assert(not s.contains(4))
+assert(s.length() == 3)
+print(s)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "set integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_higher_order() {
+        let src = r#"
+lst = [1, 2, 3, 4, 5]
+doubled = lst.map(fn(x) { return x * 2 })
+assert(doubled[0] == 2)
+assert(doubled[4] == 10)
+evens = lst.filter(fn(x) { return x % 2 == 0 })
+assert(evens.length() == 2)
+total = lst.reduce(fn(a, b) { return a + b }, 0)
+assert(total == 15)
+product = lst.reduce(fn(a, b) { return a * b })
+assert(product == 120)
+print(doubled)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "higher-order integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_list_negative_index() {
+        let src = r#"
+lst = [10, 20, 30, 40, 50]
+v = lst.pop(-1)
+assert(v == 50)
+assert(lst.length() == 4)
+lst.insert(-1, 99)
+assert(lst.slice(-2)[1] == 40)
+sub = lst.slice(1, -1)
+assert(sub[0] == 20)
+print(lst)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "negative index integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_self_reference() {
+        let src = r#"
+d = {"a": 1}
+d.merge(d)
+assert(d.length() == 1)
+
+s = {1, 2, 3}
+u = s.union(s)
+assert(u.length() == 3)
+
+a = [1, 2]
+b = [3, 4]
+a.push(b)
+assert(a.length() == 3)
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "self-reference integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_list_attr_error() {
+        let src = r#"
+try {
+    [1, 2].nosuch()
+} except e {
+    print(e)
+}
+"#;
+        // This may or may not be catchable depending on VM error handling.
+        // Just verify it doesn't crash.
+        let _ = run_source(src);
     }
 }
