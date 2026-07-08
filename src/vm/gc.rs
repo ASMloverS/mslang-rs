@@ -812,6 +812,15 @@ pub struct MsHeap {
     pub next_minor_gc: usize,
     pub next_major_gc: usize,
     pub promotion_age: u8,
+    /// task 60：GC 统计字段。
+    pub minor_count: u64,
+    pub major_count: u64,
+    pub total_pause_ns: u64,
+    pub last_pause_ns: u64,
+    pub bytes_freed: u64,
+    pub gc_enabled: bool,
+    /// 用户经 gc.set_gc_threads 设置的偏好值（MVP STW 单线程，不生效；Phase 7.5 用）。
+    pub gc_threads_setting: u32,
 }
 
 impl MsHeap {
@@ -826,6 +835,13 @@ impl MsHeap {
             next_minor_gc: INITIAL_MINOR_THRESHOLD,
             next_major_gc: INITIAL_MAJOR_THRESHOLD,
             promotion_age: DEFAULT_PROMOTION_AGE,
+            minor_count: 0,
+            major_count: 0,
+            total_pause_ns: 0,
+            last_pause_ns: 0,
+            bytes_freed: 0,
+            gc_enabled: true,
+            gc_threads_setting: 1,
         }
     }
 
@@ -837,6 +853,37 @@ impl MsHeap {
     /// 是否到达 major 触发阈值。
     pub fn should_collect_major(&self) -> bool {
         self.bytes_allocated >= self.next_major_gc
+    }
+
+    // ---- task 60：堆大小统计访问器 ----
+
+    /// Young 代存活对象总字节数（遍历 header.size）。
+    pub fn young_size(&self) -> usize {
+        self.young_objects
+            .iter()
+            .map(|p| unsafe { (**p).size as usize })
+            .sum()
+    }
+
+    /// Old 代存活对象总字节数。
+    pub fn old_size(&self) -> usize {
+        self.old_objects
+            .iter()
+            .map(|p| unsafe { (**p).size as usize })
+            .sum()
+    }
+
+    /// LES 代存活对象总字节数（header.size 置 0，取侧表 los_sizes）。
+    pub fn los_size(&self) -> usize {
+        self.los_objects
+            .iter()
+            .map(|p| self.los_sizes.get(p).copied().unwrap_or(0))
+            .sum()
+    }
+
+    /// 全部存活对象总字节数（young + old + los）。
+    pub fn live_size(&self) -> usize {
+        self.young_size() + self.old_size() + self.los_size()
     }
 
     /// 登记一个 Young 对象（由 gc_alloc_* 调用）。
@@ -960,6 +1007,9 @@ struct Copier<'a> {
     new_young: Vec<*mut MsObjHeader>,
     worklist: Vec<*mut MsObjHeader>,
     promotion_age: u8,
+    /// task 60：from-space 指针集合。forward_slot 仅转发此集合内的 Young 对象，
+    /// 避免 GC 误复制经 alloc_*（非 GC 堆）分配的对象（gc_meta=0 但非 GC 托管）。
+    old_young_set: HashSet<*mut MsObjHeader>,
 }
 
 impl<'a> Copier<'a> {
@@ -997,12 +1047,12 @@ impl<'a> Copier<'a> {
         np
     }
 
-    /// 转发一个 Object 槽：若为 Ref 指向 Young 存活对象，改写为新指针。
+    /// 转发一个 Object 槽：若为 Ref 指向 from-space（old_young_set）的 Young 存活对象，
+    /// 改写为新指针。非 GC 托管对象（经 alloc_* 分配，gc_meta=0 但不在 from-space）不转发。
     fn forward_slot(&mut self, slot: &mut Object) {
         if let Object::Ref(r) = slot {
-            // 仅转发 Young 对象；Old/LES 对象在 minor GC 中不动。
-            let gen = unsafe { (**r).generation() };
-            if gen == Generation::Young {
+            // 仅转发 from-space 内的 Young 对象；Old/LES/非托管对象不动。
+            if self.old_young_set.contains(r) {
                 let np = self.copy(*r);
                 *slot = Object::Ref(np);
             }
@@ -1019,14 +1069,19 @@ pub fn minor_gc(
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
 ) {
+    // task 60：GC 计时（入口快照，出口累加 pause_ns）。
+    let t0 = std::time::Instant::now();
     let promotion_age = heap.promotion_age;
     let old_young = std::mem::take(&mut heap.young_objects);
+    // task 60：构建 from-space 指针集合，供 forward_slot 快速判定哪些对象是 GC 托管的。
+    let old_young_set: HashSet<*mut MsObjHeader> = old_young.iter().copied().collect();
     let mut c = Copier {
         heap,
         map: HashMap::new(),
         new_young: Vec::new(),
         worklist: Vec::new(),
         promotion_age,
+        old_young_set,
     };
 
     // 根集转发（&mut 槽）。
@@ -1066,10 +1121,20 @@ pub fn minor_gc(
         let tag = unsafe { (*old).type_tag };
         let size = unsafe { (*old).size as usize };
         c.heap.bytes_allocated = c.heap.bytes_allocated.saturating_sub(size);
+        // task 60：非存活对象（未转发）计入 bytes_freed。
+        if !c.map.contains_key(&old) {
+            c.heap.bytes_freed += size as u64;
+        }
         (type_descriptor(tag).free)(old);
     }
 
     c.heap.young_objects = c.new_young;
+
+    // task 60：统计计数（计时 + minor_count）。
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    c.heap.total_pause_ns += elapsed;
+    c.heap.last_pause_ns = elapsed;
+    c.heap.minor_count += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,10 +1150,29 @@ pub fn major_gc(
     defer_stack: &[DeferEntry],
     frames: &[CallFrame],
 ) {
+    // task 60：GC 计时。
+    let t0 = std::time::Instant::now();
     let mut gray: Vec<*mut MsObjHeader> = Vec::new();
 
-    // mark：把 White 对象标 Gray 并入栈。
-    fn mark(obj: *mut MsObjHeader, gray: &mut Vec<*mut MsObjHeader>) {
+    // GC 托管对象集合：仅 old_objects + los_objects 中的对象需要标记/追踪。
+    // VM 经 alloc_* 分配的对象（MsList/MsDict 等）不在 GC 堆中，布局与 Gc* 不同
+    // （data_ptr 间接 vs 内联），trace 函数仅适配 Gc* 布局，故跳过以避免类型混淆。
+    let gc_managed: HashSet<*mut MsObjHeader> = heap
+        .old_objects
+        .iter()
+        .chain(heap.los_objects.iter())
+        .copied()
+        .collect();
+
+    // mark：把 White 的 GC 托管对象标 Gray 并入栈。非托管对象（alloc_* 分配）跳过。
+    fn mark(
+        obj: *mut MsObjHeader,
+        gray: &mut Vec<*mut MsObjHeader>,
+        gc_managed: &HashSet<*mut MsObjHeader>,
+    ) {
+        if !gc_managed.contains(&obj) {
+            return;
+        }
         let h = unsafe { &mut *obj };
         if h.color() == Color::White {
             h.set_color(Color::Gray);
@@ -1098,32 +1182,32 @@ pub fn major_gc(
 
     for v in stack.iter() {
         if let Object::Ref(r) = v {
-            mark(*r, &mut gray);
+            mark(*r, &mut gray, &gc_managed);
         }
     }
     for v in globals.values() {
         if let Object::Ref(r) = v {
-            mark(*r, &mut gray);
+            mark(*r, &mut gray, &gc_managed);
         }
     }
     // [task 28] frames.closure / open_upvalues
     // [task 36/45/65/53] defer_stack / module_cache / c_roots / 协程
     for entry in defer_stack {
         if let Object::Ref(r) = &entry.call_tuple {
-            mark(*r, &mut gray);
+            mark(*r, &mut gray, &gc_managed);
         }
     }
     // [task 37/38] CallFrame.current_exc 作根标记（同 minor_gc 的根集扩展）。
     for frame in frames {
         if let Some(Object::Ref(r)) = &frame.current_exc {
-            mark(*r, &mut gray);
+            mark(*r, &mut gray, &gc_managed);
         }
     }
 
     while let Some(obj) = gray.pop() {
         let tag = unsafe { (*obj).type_tag };
         let desc = type_descriptor(tag);
-        (desc.trace)(obj, &mut |child| mark(child, &mut gray));
+        (desc.trace)(obj, &mut |child| mark(child, &mut gray, &gc_managed));
         unsafe {
             (*obj).set_color(Color::Black);
         }
@@ -1142,6 +1226,7 @@ pub fn major_gc(
         } else {
             let size = h.size as usize;
             heap.bytes_allocated = heap.bytes_allocated.saturating_sub(size);
+            heap.bytes_freed += size as u64; // task 60
             let tag = h.type_tag;
             (type_descriptor(tag).free)(obj);
             false
@@ -1161,6 +1246,7 @@ pub fn major_gc(
         } else {
             let size = heap.los_sizes.remove(&obj).unwrap_or(0);
             heap.bytes_allocated = heap.bytes_allocated.saturating_sub(size);
+            heap.bytes_freed += size as u64; // task 60
             if size > 0 {
                 unsafe {
                     let layout = std::alloc::Layout::from_size_align_unchecked(size, 8);
@@ -1172,6 +1258,12 @@ pub fn major_gc(
     });
 
     heap.next_major_gc = (heap.bytes_allocated as f64 * MAJOR_GC_RATIO) as usize;
+
+    // task 60：统计计数（计时 + major_count）。
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    heap.total_pause_ns += elapsed;
+    heap.last_pause_ns = elapsed;
+    heap.major_count += 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1297,10 @@ pub fn maybe_gc(
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
 ) {
+    // task 60：gc_enabled guard — 禁用时自动 GC 为 no-op（手动 gc.collect() 不受此限）。
+    if !heap.gc_enabled {
+        return;
+    }
     let mut ran = false;
     if heap.should_collect_major() {
         minor_gc(heap, stack, globals, defer_stack, frames);
@@ -1687,5 +1783,102 @@ mod tests {
             Object::Ref(r) => assert_eq!(*r, cls_ptr),
             _ => unreachable!(),
         }
+    }
+
+    // ---- task 60：GC 统计字段追踪测试 ----
+
+    #[test]
+    fn test_minor_gc_increments_stats() {
+        let mut heap = MsHeap::new();
+        let _dead = gc_alloc_string(&mut heap, "unreachable");
+        let mut stack = Vec::new();
+        let mut globals = HashMap::new();
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        assert_eq!(heap.minor_count, 1);
+        assert_eq!(heap.major_count, 0);
+        assert!(heap.last_pause_ns < u64::MAX); // 被写入
+        assert!(heap.total_pause_ns >= heap.last_pause_ns);
+    }
+
+    #[test]
+    fn test_major_gc_increments_stats() {
+        let mut heap = MsHeap::new();
+        heap.promotion_age = 1;
+        let live = gc_alloc_string(&mut heap, "temp");
+        let mut stack = vec![live];
+        let mut globals = HashMap::new();
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        stack.clear();
+        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        assert_eq!(heap.major_count, 1);
+        assert!(heap.bytes_freed > 0);
+    }
+
+    #[test]
+    fn test_maybe_gc_respects_disabled() {
+        let mut heap = MsHeap::new();
+        heap.gc_enabled = false;
+        heap.next_minor_gc = 0; // 强制触发条件
+        heap.next_major_gc = 0;
+        let mut stack = Vec::new();
+        let mut globals = HashMap::new();
+        let mut defer_stack: Vec<DeferEntry> = Vec::new();
+        maybe_gc(
+            &mut heap,
+            &mut stack,
+            &mut globals,
+            &mut defer_stack,
+            &mut [],
+        );
+        // disabled → no GC ran。
+        assert_eq!(heap.minor_count, 0);
+        assert_eq!(heap.major_count, 0);
+    }
+
+    #[test]
+    fn test_maybe_gc_runs_when_enabled() {
+        let mut heap = MsHeap::new();
+        heap.gc_enabled = true;
+        heap.next_minor_gc = 0;
+        heap.next_major_gc = 0;
+        let live = gc_alloc_list(&mut heap, vec![Object::Int(1)]);
+        let mut stack = vec![live];
+        let mut globals = HashMap::new();
+        let mut defer_stack: Vec<DeferEntry> = Vec::new();
+        maybe_gc(
+            &mut heap,
+            &mut stack,
+            &mut globals,
+            &mut defer_stack,
+            &mut [],
+        );
+        assert!(heap.minor_count >= 1);
+        assert!(heap.major_count >= 1);
+    }
+
+    #[test]
+    fn test_heap_size_accessors() {
+        let mut heap = MsHeap::new();
+        // 空堆 → 全 0。
+        assert_eq!(heap.young_size(), 0);
+        assert_eq!(heap.old_size(), 0);
+        assert_eq!(heap.los_size(), 0);
+        assert_eq!(heap.live_size(), 0);
+
+        // 分配 Young 对象 → young_size > 0。
+        let _ = gc_alloc_string(&mut heap, "hello");
+        assert!(heap.young_size() > 0);
+        assert_eq!(heap.live_size(), heap.young_size());
+
+        // LES 分配 → los_size > 0。
+        heap.alloc_los(LARGE_OBJ_THRESHOLD + 8, TypeTag::STRING);
+        assert!(heap.los_size() > 0);
+    }
+
+    #[test]
+    fn test_gc_threads_setting_default() {
+        let heap = MsHeap::new();
+        assert_eq!(heap.gc_threads_setting, 1);
+        assert!(heap.gc_enabled);
     }
 }

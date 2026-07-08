@@ -222,6 +222,24 @@ impl VM {
         vm.native_arities.insert("parse".to_string(), 1);
         vm.native_arities.insert("stringify".to_string(), 1);
 
+        // task 60：注册原生 gc 模块 + 模块函数 arity。
+        let gc_ptr = stdlib::register_gc_module();
+        vm.module_resolver
+            .native_modules
+            .insert("gc".to_string(), gc_ptr);
+        vm.native_arities.insert("collect".to_string(), 0);
+        vm.native_arities.insert("collect_minor".to_string(), 0);
+        vm.native_arities.insert("enable".to_string(), 0);
+        vm.native_arities.insert("disable".to_string(), 0);
+        vm.native_arities.insert("is_enabled".to_string(), 0);
+        vm.native_arities.insert("set_threshold".to_string(), 2);
+        vm.native_arities.insert("set_promotion_age".to_string(), 1);
+        vm.native_arities.insert("set_gc_threads".to_string(), 1);
+        vm.native_arities.insert("stats".to_string(), 0);
+        vm.native_arities.insert("count".to_string(), 0);
+        vm.native_arities.insert("mem_alloc".to_string(), 0);
+        vm.native_arities.insert("mem_live".to_string(), 0);
+
         vm
     }
 
@@ -245,6 +263,39 @@ impl VM {
         self.call_stack
             .push(CallFrame::new(closure_ptr, 0, self.defer_stack.len()));
         self.run()
+    }
+
+    // ---- task 60：GC 便捷方法（供 gc stdlib native 函数调用） ----
+
+    /// Full GC = minor + major + finalizers（参照 gc::maybe_gc 的 Full 路径）。
+    pub fn gc_full(&mut self) {
+        gc::minor_gc(
+            &mut self.heap,
+            &mut self.stack,
+            &mut self.globals,
+            &mut self.defer_stack,
+            &mut self.call_stack,
+        );
+        gc::major_gc(
+            &mut self.heap,
+            &self.stack,
+            &self.globals,
+            &self.defer_stack,
+            &self.call_stack,
+        );
+        gc::run_finalizers(&mut self.heap);
+    }
+
+    /// 仅 Minor GC + finalizers。
+    pub fn gc_minor_only(&mut self) {
+        gc::minor_gc(
+            &mut self.heap,
+            &mut self.stack,
+            &mut self.globals,
+            &mut self.defer_stack,
+            &mut self.call_stack,
+        );
+        gc::run_finalizers(&mut self.heap);
     }
 }
 
