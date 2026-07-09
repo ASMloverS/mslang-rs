@@ -138,6 +138,12 @@ pub struct VM {
     /// GC 标记阶段作为额外根集参与扫描（14-gc.md:616）。
     #[cfg(feature = "capi")]
     pub(crate) c_roots: std::collections::HashSet<*mut MsObjHeader>,
+    /// task 68：C API 错误标志占位（Task 71 完成后由 msThrowTypeError 取代）。
+    #[cfg(feature = "capi")]
+    pub(crate) has_error: bool,
+    /// task 68：C API 错误消息占位（Task 71 完成后由 msThrowTypeError 取代）。
+    #[cfg(feature = "capi")]
+    pub(crate) error_message: String,
 }
 
 impl VM {
@@ -165,6 +171,10 @@ impl VM {
             stderr_writer: None,
             #[cfg(feature = "capi")]
             c_roots: std::collections::HashSet::new(),
+            #[cfg(feature = "capi")]
+            has_error: false,
+            #[cfg(feature = "capi")]
+            error_message: String::new(),
         };
         vm.register_builtins();
         vm.init_object_class();
