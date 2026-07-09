@@ -225,7 +225,26 @@ fn builtin_print(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     for a in args {
         output.push(object_to_string(vm, a)?);
     }
-    println!("{}", output.join(" "));
+    let line = format!("{}\n", output.join(" "));
+
+    #[cfg(feature = "capi")]
+    {
+        if let Some(cb_ptr) = vm.stdout_writer {
+            if !cb_ptr.is_null() {
+                // SAFETY: cb_ptr 指向 capi::vm::WriteCallback（由 msSetStdout 设置），
+                // MsVM 经 Box 分配地址稳定，回调在 VM 锁保护下访问。
+                let cb = unsafe {
+                    &*(cb_ptr as *const crate::capi::vm::WriteCallback)
+                };
+                if let Some(fn_ptr) = cb.fn_ptr {
+                    fn_ptr(line.as_ptr() as *const i8, line.len(), cb.userdata);
+                }
+                return Ok(Object::Nil);
+            }
+        }
+    }
+
+    print!("{}", line);
     Ok(Object::Nil)
 }
 

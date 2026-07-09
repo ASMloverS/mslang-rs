@@ -128,6 +128,12 @@ pub struct VM {
     /// task 45：基线全局快照（内置函数 + 异常类），供 execute_module 隔离时复用，
     /// 使模块代码可访问 print/type/except 等而不泄漏调用方用户定义。
     baseline_globals: HashMap<String, Object>,
+    /// task 66：C API 输出重定向回调（None = 使用默认 stdout/stderr）。
+    /// 指向 capi::vm::WriteCallback（经 msSetStdout/msSetStderr 设置）。
+    #[cfg(feature = "capi")]
+    pub stdout_writer: Option<*mut std::ffi::c_void>,
+    #[cfg(feature = "capi")]
+    pub stderr_writer: Option<*mut std::ffi::c_void>,
 }
 
 impl VM {
@@ -149,6 +155,10 @@ impl VM {
             object_class: std::ptr::null_mut(),
             module_resolver: ModuleResolver::new(),
             baseline_globals: HashMap::new(),
+            #[cfg(feature = "capi")]
+            stdout_writer: None,
+            #[cfg(feature = "capi")]
+            stderr_writer: None,
         };
         vm.register_builtins();
         vm.init_object_class();
@@ -296,6 +306,18 @@ impl VM {
             &mut self.call_stack,
         );
         gc::run_finalizers(&mut self.heap);
+    }
+
+    // ---- task 66：C API 访问器 ----
+
+    /// 全局变量表只读引用（供 capi::vm 的 msGetGlobal 使用）。
+    pub fn globals(&self) -> &HashMap<String, Object> {
+        &self.globals
+    }
+
+    /// 全局变量表可变引用（供 capi::vm 的 msSetGlobal/msDelGlobal 使用）。
+    pub fn globals_mut(&mut self) -> &mut HashMap<String, Object> {
+        &mut self.globals
     }
 }
 

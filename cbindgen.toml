@@ -9,9 +9,14 @@ include_version = true
 "feature = capi" = "MS_CAPI_ENABLED"
 
 [export]
-include = [
+# task 66: MsStatus/MsType/MsValue/MsVM are defined in the hand-written
+# types.h. Excluding them here prevents cbindgen from re-generating
+# conflicting definitions in the per-module headers.
+exclude = [
     "MsStatus",
     "MsType",
+    "MsValue",
+    "MsVM",
     "MsGcType",
     "MsFutureState",
 ]

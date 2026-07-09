@@ -95,7 +95,7 @@
 | # | 任务 | 状态 |
 |---|---|---|
 | 65 | [C API 基础设施（cbindgen + 手写类型头文件 + 构建集成）](65-capi-infrastructure.md) | ✅ |
-| 66 | [C API — VM 生命周期与配置](66-capi-vm.md) | ⬜ |
+| 66 | [C API — VM 生命周期与配置](66-capi-vm.md) | ✅ |
 | 67 | [C API — 值创建与类型判断](67-capi-value-creation.md) | ⬜ |
 | 68 | [C API — 值转换、比较与通用操作](68-capi-value-convert.md) | ⬜ |
 | 69 | [C API — 集合操作（List/Dict/Tuple/Set + 迭代器）](69-capi-collections.md) | ⬜ |

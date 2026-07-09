@@ -1,4 +1,6 @@
 #[cfg(feature = "capi")]
+pub mod types;
+#[cfg(feature = "capi")]
 pub mod vm;
 #[cfg(feature = "capi")]
 pub mod value;

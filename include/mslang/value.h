@@ -30,4 +30,78 @@
  */
 #define DEFAULT_PROMOTION_AGE 2
 
+struct Option_MsWriteFnRaw;
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 与 C 侧 `MsWriteFn` 对应：可为 NULL 的函数指针。
+ */
+typedef struct Option_MsWriteFnRaw MsWriteFn;
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsVM *msVmNew(void);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msVmFree(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msAddModulePath(MsVM *vm, const int8_t *path);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msSetArgs(MsVM *vm, int32_t argc, const int8_t *const *argv);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msSetStdout(MsVM *vm, MsWriteFn fn_ptr, void *userdata);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msSetStderr(MsVM *vm, MsWriteFn fn_ptr, void *userdata);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msExecFile(MsVM *vm, const int8_t *path);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msExecString(MsVM *vm, const int8_t *source, const int8_t *filename);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msEval(MsVM *vm, const int8_t *expr);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msGetGlobal(MsVM *vm, const int8_t *name);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msSetGlobal(MsVM *vm, const int8_t *name, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msDelGlobal(MsVM *vm, const int8_t *name);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msVmLock(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msVmUnlock(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 释放 C 侧持有的 MsValue。NULL 安全。
+ * 注意：仅释放 Box<MsValue> 包装，不释放 inner Object 引用的堆对象（由 GC 管理）。
+ */
+MS_API
+void msValueFree(MsValue *val);
+#endif
+
 #endif /* MSLANG_GENERATED_H */
