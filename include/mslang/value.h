@@ -39,6 +39,109 @@ struct Option_MsWriteFnRaw;
 typedef struct Option_MsWriteFnRaw MsWriteFn;
 #endif
 
+/**
+ * 创建 Nil 值。每次调用返回新 Box（内联值，无需 GC 管理）。
+ */
+MS_API MsValue *msNil(void);
+
+/**
+ * 创建 Bool 值。val != 0 → true，val == 0 → false。
+ */
+MS_API MsValue *msBoolVal(int val);
+
+/**
+ * 创建 Int 值（不依赖 VM）。
+ */
+MS_API MsValue *msInt(int64_t val);
+
+/**
+ * 创建 Float 值（不依赖 VM）。
+ */
+MS_API MsValue *msFloat(double val);
+
+/**
+ * 从 C 空终止字符串创建 String 值。等价于 msStringn(vm, str, strlen(str))。
+ * str 为 NULL 时创建空字符串。
+ */
+MS_API MsValue *msString(MsVM *vm, const char *str);
+
+/**
+ * 从指定长度的字节创建 String 值（可包含 `\0`）。
+ * str 为 NULL 或 len == 0 时创建空字符串。
+ */
+MS_API MsValue *msStringn(MsVM *vm, const char *str, uintptr_t len);
+
+/**
+ * 创建空 List。
+ */
+MS_API MsValue *msListNew(MsVM *vm);
+
+/**
+ * 创建空 Dict。
+ */
+MS_API MsValue *msDictNew(MsVM *vm);
+
+/**
+ * 创建空 Set。
+ */
+MS_API MsValue *msSetNew(MsVM *vm);
+
+/**
+ * 从数组创建 List。NULL 元素被跳过。
+ */
+MS_API MsValue *msListFrom(MsVM *vm, MsValue *const *items, int count);
+
+/**
+ * 从数组创建 Tuple。NULL 元素被跳过。
+ */
+MS_API MsValue *msTupleFrom(MsVM *vm, MsValue *const *items, int count);
+
+/**
+ * 从扁平 key-value 数组创建 Dict。count 为键值对数量（数组长度 = count * 2）。
+ * NULL key 或 value 对应的键值对被跳过。
+ */
+MS_API MsValue *msDictFrom(MsVM *vm, MsValue *const *pairs, int count);
+
+/**
+ * 返回值类型的 MsType 枚举。NULL 安全（返回 Nil）。
+ */
+MS_API MsType msTypeof(MsValue *val);
+
+MS_API int msIsNil(MsValue *val);
+
+MS_API int msIsBool(MsValue *val);
+
+MS_API int msIsInt(MsValue *val);
+
+MS_API int msIsFloat(MsValue *val);
+
+MS_API int msIsNumber(MsValue *val);
+
+MS_API int msIsString(MsValue *val);
+
+MS_API int msIsList(MsValue *val);
+
+MS_API int msIsDict(MsValue *val);
+
+MS_API int msIsTuple(MsValue *val);
+
+MS_API int msIsSet(MsValue *val);
+
+/**
+ * msIsFunction 对 FUNCTION 和 CLOSURE 均返回 MS_TRUE。
+ */
+MS_API int msIsFunction(MsValue *val);
+
+MS_API int msIsClass(MsValue *val);
+
+MS_API int msIsInstance(MsValue *val);
+
+MS_API int msIsGenerator(MsValue *val);
+
+MS_API int msIsFuture(MsValue *val);
+
+MS_API int msIsChannel(MsValue *val);
+
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 MS_API MsVM *msVmNew(void);
 #endif
@@ -102,6 +205,183 @@ MS_API void msVmUnlock(MsVM *vm);
  */
 MS_API
 void msValueFree(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建 Nil 值。每次调用返回新 Box（内联值，无需 GC 管理）。
+ */
+MS_API MsValue *msNil(void);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建 Bool 值。val != 0 → true，val == 0 → false。
+ */
+MS_API MsValue *msBoolVal(int val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建 Int 值（不依赖 VM）。
+ */
+MS_API MsValue *msInt(int64_t val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建 Float 值（不依赖 VM）。
+ */
+MS_API MsValue *msFloat(double val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从 C 空终止字符串创建 String 值。等价于 msStringn(vm, str, strlen(str))。
+ * str 为 NULL 时创建空字符串。
+ */
+MS_API MsValue *msString(MsVM *vm, const char *str);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从指定长度的字节创建 String 值（可包含 `\0`）。
+ * str 为 NULL 或 len == 0 时创建空字符串。
+ */
+MS_API MsValue *msStringn(MsVM *vm, const char *str, uintptr_t len);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建空 List。
+ */
+MS_API MsValue *msListNew(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建空 Dict。
+ */
+MS_API MsValue *msDictNew(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建空 Set。
+ */
+MS_API MsValue *msSetNew(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从数组创建 List。NULL 元素被跳过。
+ */
+MS_API MsValue *msListFrom(MsVM *vm, MsValue *const *items, int count);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从数组创建 Tuple。NULL 元素被跳过。
+ */
+MS_API MsValue *msTupleFrom(MsVM *vm, MsValue *const *items, int count);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从扁平 key-value 数组创建 Dict。count 为键值对数量（数组长度 = count * 2）。
+ * NULL key 或 value 对应的键值对被跳过。
+ */
+MS_API MsValue *msDictFrom(MsVM *vm, MsValue *const *pairs, int count);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回值类型的 MsType 枚举。NULL 安全（返回 Nil）。
+ */
+MS_API MsType msTypeof(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsNil(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsBool(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsInt(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsFloat(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsNumber(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsString(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsList(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsDict(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsTuple(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsSet(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * msIsFunction 对 FUNCTION 和 CLOSURE 均返回 MS_TRUE。
+ */
+MS_API int msIsFunction(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsClass(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsInstance(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsGenerator(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsFuture(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsChannel(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 将对象注册为 GC 根，返回 `val` 本身。注册后 GC 不会回收此对象。
+ * 仅对 Ref 类型（堆对象）有效。内联值为安全 no-op。NULL 安全。
+ */
+MS_API MsValue *msRoot(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 注销 GC 根。注销后对象可能被 GC 回收。
+ * 仅对 Ref 类型（堆对象）有效。内联值为安全 no-op。NULL 安全。
+ */
+MS_API void msUnroot(MsVM *vm, MsValue *val);
 #endif
 
 #endif /* MSLANG_GENERATED_H */

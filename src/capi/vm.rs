@@ -34,8 +34,8 @@ unsafe impl Send for WriteCallback {}
 unsafe impl Sync for WriteCallback {}
 
 /// VM 内部状态，被 ReentrantMutex 保护。
-struct VmInner {
-    vm: crate::vm::VM,
+pub(crate) struct VmInner {
+    pub(crate) vm: crate::vm::VM,
     #[allow(dead_code)]
     module_paths: Vec<String>,
     #[allow(dead_code)]
@@ -62,7 +62,7 @@ pub struct MsVM {
 /// 调用 `guard.get()` 可获取 `*mut VmInner`。
 ///
 /// 'static 生命周期安全：MsVM 经 Box 分配地址稳定（不移动），原始指针有效。
-fn lock_vm(
+pub(crate) fn lock_vm(
     vm: *mut MsVM,
 ) -> parking_lot::ReentrantMutexGuard<'static, UnsafeCell<VmInner>> {
     // SAFETY: MsVM 经 Box 分配，地址稳定。

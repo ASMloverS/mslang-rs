@@ -134,6 +134,10 @@ pub struct VM {
     pub stdout_writer: Option<*mut std::ffi::c_void>,
     #[cfg(feature = "capi")]
     pub stderr_writer: Option<*mut std::ffi::c_void>,
+    /// task 67：C 侧注册的 GC 根集合。msRoot/msUnroot 增删。
+    /// GC 标记阶段作为额外根集参与扫描（14-gc.md:616）。
+    #[cfg(feature = "capi")]
+    pub(crate) c_roots: std::collections::HashSet<*mut MsObjHeader>,
 }
 
 impl VM {
@@ -159,6 +163,8 @@ impl VM {
             stdout_writer: None,
             #[cfg(feature = "capi")]
             stderr_writer: None,
+            #[cfg(feature = "capi")]
+            c_roots: std::collections::HashSet::new(),
         };
         vm.register_builtins();
         vm.init_object_class();
@@ -318,6 +324,14 @@ impl VM {
     /// 全局变量表可变引用（供 capi::vm 的 msSetGlobal/msDelGlobal 使用）。
     pub fn globals_mut(&mut self) -> &mut HashMap<String, Object> {
         &mut self.globals
+    }
+
+    /// task 67：C root 注册表可变引用（供 capi::gc 的 msRoot/msUnroot 使用）。
+    #[cfg(feature = "capi")]
+    pub(crate) fn c_roots_mut(
+        &mut self,
+    ) -> &mut std::collections::HashSet<*mut MsObjHeader> {
+        &mut self.c_roots
     }
 }
 

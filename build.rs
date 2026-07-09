@@ -1,6 +1,11 @@
 fn main() {
     #[cfg(feature = "capi")]
     {
+        // Compile C va_list shim (msStringFmt implemented in C).
+        cc::Build::new()
+            .file("src/capi/vsnprintf_shim.c")
+            .compile("mslang_capi_shim");
+
         let crate_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let config = cbindgen::Config::from_file("cbindgen.toml")
             .expect("Unable to read cbindgen.toml");
