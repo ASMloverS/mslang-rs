@@ -283,7 +283,7 @@ MS_API int msIsTuple(MsValue* val);
 MS_API int msIsSet(MsValue* val);
 MS_API int msIsFunction(MsValue* val);
 MS_API int msIsClass(MsValue* val);
-MS_API int msIsInstance(MsValue* val);
+MS_API int msIsInstanceType(MsValue* val);
 MS_API int msIsGenerator(MsValue* val);
 MS_API int msIsFuture(MsValue* val);
 MS_API int msIsChannel(MsValue* val);
@@ -515,6 +515,12 @@ MS_API MsStatus msThrowIoError(MsVM* vm, const char* fmt, ...);
 
 所有 `msThrow*` 函数始终返回 `MS_ERROR`，可直接 `return`。
 
+> **注意**：`MsCFunction` 回调返回 `MsValue*` 而非 `MsStatus`。在 `MsCFunction` 内部抛出异常时，不能直接 `return msThrow*(...)`（类型不匹配），应使用两行模式：
+> ```c
+> msThrowValueError(vm, "bad arg");
+> return NULL;
+> ```
+
 ### try/catch 模式
 
 ```c
@@ -745,39 +751,45 @@ int main(void) {
 
 static MsValue* fileRead(MsVM* vm, MsValue* const* args, int nargs) {
   if (nargs < 1 || !msIsString(args[0])) {
-    return msThrowTypeError(vm, "string", "other");
+    msThrowTypeError(vm, "string", "other");
+    return NULL;
   }
   const char* path = msToString(vm, args[0]);
 
   FILE* f = fopen(path, "rb");
   if (!f) {
-    return msThrowIoError(vm, "cannot open: %s", path);
+    msThrowIoError(vm, "cannot open: %s", path);
+    return NULL;
   }
 
   fseek(f, 0, SEEK_END);
   long size = ftell(f);
+  if (size < 0) { fclose(f); msThrowIoError(vm, "ftell failed"); return NULL; }
   fseek(f, 0, SEEK_SET);
 
-  char* buf = malloc(size + 1);
-  fread(buf, 1, size, f);
-  buf[size] = '\0';
+  char* buf = malloc((size_t)size + 1);
+  if (!buf) { fclose(f); msThrowIoError(vm, "out of memory"); return NULL; }
+  size_t actual = fread(buf, 1, (size_t)size, f);
+  buf[actual] = '\0';
   fclose(f);
 
-  MsValue* result = msStringn(vm, buf, size);
+  MsValue* result = msStringn(vm, buf, actual);
   free(buf);
   return result;
 }
 
 static MsValue* fileWrite(MsVM* vm, MsValue* const* args, int nargs) {
   if (nargs < 2 || !msIsString(args[0]) || !msIsString(args[1])) {
-    return msThrowTypeError(vm, "string, string", "other");
+    msThrowTypeError(vm, "string, string", "other");
+    return NULL;
   }
   const char* path = msToString(vm, args[0]);
   const char* data = msToString(vm, args[1]);
 
   FILE* f = fopen(path, "wb");
   if (!f) {
-    return msThrowIoError(vm, "cannot open: %s", path);
+    msThrowIoError(vm, "cannot open: %s", path);
+    return NULL;
   }
   fputs(data, f);
   fclose(f);

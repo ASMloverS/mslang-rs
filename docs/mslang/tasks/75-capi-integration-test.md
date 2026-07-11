@@ -293,6 +293,41 @@ void test_eval_expression(void) {
     TEST_END();
 }
 
+void test_set_args(void) {
+    TEST_BEGIN("set args");
+
+    MsVM* vm = msVmNew();
+    const char* argv[] = { "mslang", "arg1", "arg2" };
+    msSetArgs(vm, 3, argv);
+    msVmFree(vm);
+
+    TEST_END();
+}
+
+void test_set_stderr(void) {
+    TEST_BEGIN("stderr redirect");
+
+    MsVM* vm = msVmNew();
+    msSetStderr(vm, write_capture, NULL);
+    captured_reset();
+    msExecString(vm, "printerr(\"warn\")", "test.ms");
+    msVmFree(vm);
+
+    TEST_END();
+}
+
+void test_vm_lock_unlock(void) {
+    TEST_BEGIN("vm lock/unlock");
+
+    MsVM* vm = msVmNew();
+    msVmLock(vm);
+    msExecString(vm, "x = 1", "test.ms");
+    msVmUnlock(vm);
+    msVmFree(vm);
+
+    TEST_END();
+}
+
 int main(void) {
     fprintf(stdout, "test_embed_basic:\n");
     test_vm_new_free();
@@ -303,6 +338,9 @@ int main(void) {
     test_two_vms_independent();
     test_module_path();
     test_eval_expression();
+    test_set_args();
+    test_set_stderr();
+    test_vm_lock_unlock();
     TEST_SUMMARY();
     return TEST_RETURN();
 }
@@ -568,6 +606,81 @@ void test_string_fmt(void) {
     TEST_END();
 }
 
+void test_tofloat(void) {
+    TEST_BEGIN("toFloat");
+
+    MsVM* vm = msVmNew();
+    MsValue* f = msFloat(3.14);
+    TEST_ASSERT_EQ(3.14, msToFloat(vm, f), "float toFloat");
+
+    MsValue* i = msInt(42);
+    TEST_ASSERT_EQ(42.0, msToFloat(vm, i), "int toFloat");
+
+    msVmFree(vm);
+    TEST_END();
+}
+
+void test_convert_all(void) {
+    TEST_BEGIN("convert float/bool/list");
+
+    MsVM* vm = msVmNew();
+
+    MsValue* i = msInt(1);
+    MsValue* f = msConvertFloat(vm, i);
+    TEST_ASSERT_NOT_NULL(f, "int to float");
+    TEST_ASSERT(msIsFloat(f), "result is float");
+
+    MsValue* b = msConvertBool(vm, i);
+    TEST_ASSERT_NOT_NULL(b, "int to bool");
+
+    MsValue* s = msString(vm, "abc");
+    MsValue* lst = msConvertList(vm, s);
+    TEST_ASSERT_NOT_NULL(lst, "string to list");
+    TEST_ASSERT(msIsList(lst), "result is list");
+
+    msVmFree(vm);
+    TEST_END();
+}
+
+void test_string_data(void) {
+    TEST_BEGIN("stringData");
+
+    MsVM* vm = msVmNew();
+    MsValue* s = msString(vm, "hello");
+    const char* data = msStringData(vm, s);
+    TEST_ASSERT_NOT_NULL(data, "data non-NULL");
+    TEST_ASSERT_STR_EQ("hello", data, "data content");
+
+    msVmFree(vm);
+    TEST_END();
+}
+
+void test_attr_access(void) {
+    TEST_BEGIN("getAttr/setAttr");
+
+    MsVM* vm = msVmNew();
+    msExecString(vm,
+        "class Box {\n"
+        "  fn __init__(self) { self.val = 99 }\n"
+        "}\n",
+        "test.ms");
+
+    MsValue* cls = msGetClass(vm, "Box");
+    MsValue* inst = msInstanceNew(vm, cls, NULL, 0);
+
+    MsValue* got = msGetAttr(vm, inst, "val");
+    TEST_ASSERT_NOT_NULL(got, "getAttr val");
+    TEST_ASSERT_EQ(99, msToInt(vm, got), "val == 99");
+
+    MsValue* nv = msInt(77);
+    TEST_ASSERT_EQ(MS_OK, msSetAttr(vm, inst, "val2", nv), "setAttr val2");
+    MsValue* got2 = msGetAttr(vm, inst, "val2");
+    TEST_ASSERT_EQ(77, msToInt(vm, got2), "val2 == 77");
+
+    msVmFree(vm);
+    TEST_END();
+}
+
 int main(void) {
     fprintf(stdout, "test_embed_values:\n");
     test_create_primitives();
@@ -584,6 +697,10 @@ int main(void) {
     test_to_string_copy();
     test_is_identity();
     test_string_fmt();
+    test_tofloat();
+    test_convert_all();
+    test_string_data();
+    test_attr_access();
     TEST_SUMMARY();
     return TEST_RETURN();
 }
@@ -1229,6 +1346,7 @@ void test_throw_and_fetch(void) {
     TEST_ASSERT_STR_EQ("ValueError", msErrTypeName(vm, err), "type name");
     TEST_ASSERT_STR_EQ("bad value", msErrMessage(vm, err), "message");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1258,6 +1376,7 @@ void test_throw_type_error(void) {
     TEST_ASSERT(strstr(msg, "string") != NULL, "msg contains expected");
     TEST_ASSERT(strstr(msg, "int") != NULL, "msg contains actual");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1270,6 +1389,7 @@ void test_throw_index_error(void) {
     MsValue* err = msErrFetch(vm);
     TEST_ASSERT_STR_EQ("IndexError", msErrTypeName(vm, err), "type");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1286,6 +1406,7 @@ void test_throw_key_error(void) {
     const char* msg = msErrMessage(vm, err);
     TEST_ASSERT(strstr(msg, "missing") != NULL, "msg contains key");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1298,6 +1419,7 @@ void test_throw_io_error(void) {
     MsValue* err = msErrFetch(vm);
     TEST_ASSERT_STR_EQ("IOError", msErrTypeName(vm, err), "type");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1310,6 +1432,7 @@ void test_throw_runtime_error(void) {
     MsValue* err = msErrFetch(vm);
     TEST_ASSERT_STR_EQ("RuntimeError", msErrTypeName(vm, err), "type");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1327,6 +1450,8 @@ void test_throw_value(void) {
     MsValue* rethrown = msErrFetch(vm);
     TEST_ASSERT_STR_EQ("ValueError", msErrTypeName(vm, rethrown), "rethrown type");
 
+    msUnroot(vm, rethrown);
+    msUnroot(vm, original);
     msVmFree(vm);
     TEST_END();
 }
@@ -1386,6 +1511,7 @@ void test_err_traceback(void) {
     const char* tb = msErrTraceback(vm, err);
     TEST_ASSERT_NOT_NULL(tb, "traceback non-NULL");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1399,6 +1525,7 @@ void test_err_cause_none(void) {
     MsValue* cause = msErrCause(vm, err);
     TEST_ASSERT_NULL(cause, "no cause");
 
+    msUnroot(vm, err);
     msVmFree(vm);
     TEST_END();
 }
@@ -1419,11 +1546,45 @@ void test_throw_in_callback(void) {
 
     MsVM* vm = msVmNew();
 
-    MsValue* result = msThrowValueError(vm, "from callback");
-    TEST_ASSERT_NULL(result, "throw returns NULL-like");
+    MsStatus s = msThrowValueError(vm, "from callback");
+    TEST_ASSERT_EQ(MS_ERROR, s, "throw returns MS_ERROR");
     TEST_ASSERT_EQ(MS_TRUE, msErrOccurred(vm), "error set");
     msErrClear(vm);
 
+    msVmFree(vm);
+    TEST_END();
+}
+
+void test_throw_generic(void) {
+    TEST_BEGIN("throw generic");
+
+    MsVM* vm = msVmNew();
+    MsStatus s = msThrow(vm, "CustomError", "custom message %d", 42);
+    TEST_ASSERT_EQ(MS_ERROR, s, "throw returns MS_ERROR");
+
+    MsValue* err = msErrFetch(vm);
+    TEST_ASSERT_STR_EQ("CustomError", msErrTypeName(vm, err), "type name");
+
+    msUnroot(vm, err);
+    msVmFree(vm);
+    TEST_END();
+}
+
+void test_throw_rethrow(void) {
+    TEST_BEGIN("throw rethrow");
+
+    MsVM* vm = msVmNew();
+    msThrowValueError(vm, "first");
+    MsValue* first = msErrFetch(vm);
+
+    msThrowValue(vm, first);
+    MsStatus s = msThrowRethrow(vm);
+    TEST_ASSERT_EQ(MS_ERROR, s, "rethrow returns MS_ERROR");
+    TEST_ASSERT_EQ(MS_TRUE, msErrOccurred(vm), "error present after rethrow");
+
+    MsValue* err = msErrFetch(vm);
+    msUnroot(vm, err);
+    msUnroot(vm, first);
     msVmFree(vm);
     TEST_END();
 }
@@ -1445,6 +1606,8 @@ int main(void) {
     test_err_cause_none();
     test_exec_syntax_error_catch();
     test_throw_in_callback();
+    test_throw_generic();
+    test_throw_rethrow();
     TEST_SUMMARY();
     return TEST_RETURN();
 }
@@ -1477,7 +1640,7 @@ void test_get_class_and_instance(void) {
     MsValue* args[] = { msString(vm, "Dog") };
     MsValue* inst = msInstanceNew(vm, cls, args, 1);
     TEST_ASSERT_NOT_NULL(inst, "instance created");
-    TEST_ASSERT(msIsInstance(inst), "is instance");
+    TEST_ASSERT(msIsInstanceType(inst), "is instance");
     TEST_ASSERT_EQ(MS_TRUE, msIsInstance(vm, inst, cls), "inst is Animal");
 
     MsValue* name = msInstanceGet(vm, inst, "name");
@@ -1574,7 +1737,7 @@ void test_inheritance_isinstance(void) {
 }
 
 static MsValue* c_greet(MsVM* vm, MsValue* const* args, int nargs) {
-    if (nargs < 1) return msThrowValueError(vm, "need self");
+    if (nargs < 1) { msThrowValueError(vm, "need self"); return NULL; }
     msInstanceSet(vm, args[0], "greeted", msBoolVal(1));
     return msStringFmt(vm, "Hello from C");
 }
@@ -1832,6 +1995,9 @@ void test_finalizer(void) {
 
     finalizer_called = 0;
     msDelGlobal(vm, "obj");
+    /* Note: relies on MS_GC_FULL synchronously collecting unreachable objects.
+       If the GC is incremental, increase the collect count or loop until
+       finalizer_called is set. */
     msGcCollect(vm, MS_GC_FULL);
     msGcCollect(vm, MS_GC_FULL);
 
@@ -1902,39 +2068,45 @@ int main(void) {
 
 static MsValue* fileio_read(MsVM* vm, MsValue* const* args, int nargs) {
     if (nargs < 1 || !msIsString(args[0])) {
-        return msThrowTypeError(vm, "string", "other");
+        msThrowTypeError(vm, "string", "other");
+        return NULL;
     }
     const char* path = msToString(vm, args[0]);
 
     FILE* f = fopen(path, "rb");
     if (!f) {
-        return msThrowIoError(vm, "cannot open: %s", path);
+        msThrowIoError(vm, "cannot open: %s", path);
+        return NULL;
     }
 
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
+    if (size < 0) { fclose(f); msThrowIoError(vm, "ftell failed"); return NULL; }
     fseek(f, 0, SEEK_SET);
 
-    char* buf = malloc(size + 1);
-    fread(buf, 1, size, f);
-    buf[size] = '\0';
+    char* buf = malloc((size_t)size + 1);
+    if (!buf) { fclose(f); msThrowIoError(vm, "out of memory"); return NULL; }
+    size_t actual = fread(buf, 1, (size_t)size, f);
+    buf[actual] = '\0';
     fclose(f);
 
-    MsValue* result = msStringn(vm, buf, size);
+    MsValue* result = msStringn(vm, buf, actual);
     free(buf);
     return result;
 }
 
 static MsValue* fileio_write(MsVM* vm, MsValue* const* args, int nargs) {
     if (nargs < 2 || !msIsString(args[0]) || !msIsString(args[1])) {
-        return msThrowTypeError(vm, "string, string", "other");
+        msThrowTypeError(vm, "string, string", "other");
+        return NULL;
     }
     const char* path = msToString(vm, args[0]);
     const char* data = msToString(vm, args[1]);
 
     FILE* f = fopen(path, "wb");
     if (!f) {
-        return msThrowIoError(vm, "cannot open for write: %s", path);
+        msThrowIoError(vm, "cannot open for write: %s", path);
+        return NULL;
     }
     fputs(data, f);
     fclose(f);
@@ -1943,7 +2115,8 @@ static MsValue* fileio_write(MsVM* vm, MsValue* const* args, int nargs) {
 
 static MsValue* fileio_exists(MsVM* vm, MsValue* const* args, int nargs) {
     if (nargs < 1 || !msIsString(args[0])) {
-        return msThrowTypeError(vm, "string", "other");
+        msThrowTypeError(vm, "string", "other");
+        return NULL;
     }
     const char* path = msToString(vm, args[0]);
     FILE* f = fopen(path, "rb");
@@ -1954,34 +2127,10 @@ static MsValue* fileio_exists(MsVM* vm, MsValue* const* args, int nargs) {
     return msBoolVal(0);
 }
 
-static MsValue* mathlib_add(MsVM* vm, MsValue* const* args, int nargs) {
-    if (nargs < 2) {
-        return msThrowValueError(vm, "need 2 args");
-    }
-    int64_t a = msToInt(vm, args[0]);
-    int64_t b = msToInt(vm, args[1]);
-    return msInt(a + b);
-}
-
-static MsValue* mathlib_mul(MsVM* vm, MsValue* const* args, int nargs) {
-    if (nargs < 2) {
-        return msThrowValueError(vm, "need 2 args");
-    }
-    int64_t a = msToInt(vm, args[0]);
-    int64_t b = msToInt(vm, args[1]);
-    return msInt(a * b);
-}
-
 static const MsFuncDef fileio_methods[] = {
     {"read",   fileio_read},
     {"write",  fileio_write},
     {"exists", fileio_exists},
-    {NULL, NULL}
-};
-
-static const MsFuncDef mathlib_methods[] = {
-    {"add", mathlib_add},
-    {"mul", mathlib_mul},
     {NULL, NULL}
 };
 
@@ -2001,16 +2150,20 @@ MS_MODULE_INIT const MsModuleDef* msModuleInit(MsVM* vm) {
 
 ```ms
 import fileio
+import os
 
 fn test_fileio() {
-    fileio.write("/tmp/mslang_test.txt", "hello from mslang")
-    content = fileio.read("/tmp/mslang_test.txt")
+    tmpdir = os.tmpdir()
+    testfile = tmpdir + "/mslang_test.txt"
+
+    fileio.write(testfile, "hello from mslang")
+    content = fileio.read(testfile)
     assert content == "hello from mslang", "read/write roundtrip"
 
-    exists = fileio.exists("/tmp/mslang_test.txt")
+    exists = fileio.exists(testfile)
     assert exists == true, "file exists"
 
-    not_exists = fileio.exists("/tmp/nonexistent_mslang_file.txt")
+    not_exists = fileio.exists(tmpdir + "/nonexistent_mslang_file.txt")
     assert not_exists == false, "nonexistent file"
 }
 
@@ -2059,6 +2212,7 @@ void test_fibonacci_embed(void) {
     if (s != MS_OK) {
         MsValue* err = msErrFetch(vm);
         fprintf(stderr, "  error: %s\n", msErrMessage(vm, err));
+        msUnroot(vm, err);
         msVmFree(vm);
         TEST_END();
         return;
@@ -2167,6 +2321,7 @@ void test_error_handling_workflow(void) {
     MsValue* err = msErrFetch(vm);
     TEST_ASSERT_NOT_NULL(err, "err non-NULL");
     TEST_ASSERT_STR_EQ("ValueError", msErrTypeName(vm, err), "type");
+    msUnroot(vm, err);
 
     msExecString(vm, "fn safe() { return 42 }", "test.ms");
     MsValue* fn = msGetGlobal(vm, "safe");
@@ -2233,7 +2388,7 @@ void test_class_interaction_workflow(void) {
 
     MsValue* args[] = { msString(vm, "circle") };
     MsValue* inst = msInstanceNew(vm, shape_cls, args, 1);
-    TEST_ASSERT(msIsInstance(inst), "is instance");
+    TEST_ASSERT(msIsInstanceType(inst), "is instance");
 
     MsValue* name_attr = msInstanceGet(vm, inst, "name");
     TEST_ASSERT_STR_EQ("circle", msToString(vm, name_attr), "name attr");
@@ -2274,6 +2429,67 @@ void test_module_registration(void) {
     MsValue* v = msGetGlobal(vm, "v");
     TEST_ASSERT_NOT_NULL(v, "module const accessible");
     TEST_ASSERT_STR_EQ("1.0", msToString(vm, v), "module const value");
+
+    msVmFree(vm);
+    TEST_END();
+}
+
+static MsValue* lifecycle_double(MsVM* vm, MsValue* const* args, int nargs) {
+    if (nargs < 1) { msThrowValueError(vm, "need 1 arg"); return NULL; }
+    return msInt(msToInt(vm, args[0]) * 2);
+}
+
+void test_static_module_registration(void) {
+    TEST_BEGIN("static module registration (msRegisterModule)");
+
+    MsVM* vm = msVmNew();
+
+    static const MsFuncDef dbl_funcs[] = {
+        {"double", lifecycle_double},
+        {NULL, NULL}
+    };
+    static const MsModuleDef dbl_def = {
+        .name = "dbl",
+        .methods = dbl_funcs,
+        .consts = NULL,
+    };
+
+    MsStatus s = msRegisterModule(vm, &dbl_def);
+    TEST_ASSERT_EQ(MS_OK, s, "register static module");
+
+    msExecString(vm,
+        "import dbl\n"
+        "r = dbl.double(21)\n",
+        "test.ms");
+
+    MsValue* r = msGetGlobal(vm, "r");
+    TEST_ASSERT_NOT_NULL(r, "result non-NULL");
+    TEST_ASSERT_EQ(42, msToInt(vm, r), "dbl.double(21) == 42");
+
+    msVmFree(vm);
+    TEST_END();
+}
+
+void test_module_add_func(void) {
+    TEST_BEGIN("module addFunc");
+
+    MsVM* vm = msVmNew();
+    MsValue* mod = msModuleNew(vm, "ops");
+
+    MsStatus s = msModuleAddFunc(vm, mod, "triple", lifecycle_double);
+    TEST_ASSERT_EQ(MS_OK, s, "addFunc");
+
+    msModuleAddConst(vm, mod, "BASE", msInt(10));
+    msRegisterModuleValue(vm, mod);
+
+    msExecString(vm,
+        "import ops\n"
+        "v = ops.triple(14)\n",
+        "test.ms");
+
+    MsValue* v = msGetGlobal(vm, "v");
+    TEST_ASSERT_NOT_NULL(v, "triple result");
+    TEST_ASSERT_EQ(28, msToInt(vm, v), "ops.triple(14) == 28");
 
     msVmFree(vm);
     TEST_END();
@@ -2346,6 +2562,8 @@ int main(void) {
     test_gc_interaction_workflow();
     test_class_interaction_workflow();
     test_module_registration();
+    test_static_module_registration();
+    test_module_add_func();
     test_output_capture_full();
     test_script_calls_c_function();
     test_thread_safety_two_vms();
@@ -2400,7 +2618,7 @@ set(TEST_SOURCES
 
 foreach(test_name ${TEST_SOURCES})
     add_executable(${test_name} ${test_name}.c)
-    target_include_directories(${test_name} PRIVATE ${MSLANG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
+    target_include_directories(${test_name} PRIVATE ${MSLANG_INCLUDE_DIR}/mslang ${MSLANG_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(${test_name} mslang_capi)
     if(UNIX)
         target_link_libraries(${test_name} m dl pthread)
@@ -2409,7 +2627,7 @@ foreach(test_name ${TEST_SOURCES})
 endforeach()
 
 add_library(test_extension SHARED test_extension.c)
-target_include_directories(test_extension PRIVATE ${MSLANG_INCLUDE_DIR})
+target_include_directories(test_extension PRIVATE ${MSLANG_INCLUDE_DIR}/mslang ${MSLANG_INCLUDE_DIR})
 target_link_libraries(test_extension mslang_capi)
 set_target_properties(test_extension PROPERTIES
     OUTPUT_NAME "fileio"
@@ -2472,7 +2690,7 @@ jobs:
 
       - name: Run extension test
         run: |
-          cargo run --features capi -- test_import_extension.ms
+          cargo run --features capi -- --module-path tests/capi/build tests/capi/test_import_extension.ms
 ```
 
 ## 验证标准
@@ -2482,7 +2700,7 @@ jobs:
 3. **嵌入示例验证**：`test_fibonacci_embed` 输出 `fibonacci(10) = 55`，与 13-capi.md § 完整嵌入示例 一致
 4. **扩展模块验证**：`test_extension.c` 编译为 `fileio.dll`/`fileio.so`，`test_import_extension.ms` 执行成功
 5. **内存安全**：ASan/MSan 运行无泄漏、无越界（Linux）
-6. **线程安全**：`test_thread_safety_two_vms` 两个 VM 实例在独立线程中并发使用（可选扩展为多线程测试）
+6. **线程安全**：`test_thread_safety_two_vms` 验证两个 VM 实例状态隔离（当前为单线程冒烟测试；可选扩展为多线程测试，在不同线程中并发操作不同 VM 实例）
 7. **CI 集成**：GitHub Actions 三平台 C API 测试步骤通过
 
 ## 测试用例
@@ -2540,7 +2758,7 @@ ctest --output-on-failure
 
 # 5. 扩展模块测试
 cmake --build . --target test_extension
-cargo run --features capi -- ../test_import_extension.ms
+cargo run --features capi -- --module-path . ../test_import_extension.ms
 
 # 6. 内存检查（Linux）
 valgrind --leak-check=full ./test_full_lifecycle
