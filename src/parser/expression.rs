@@ -51,6 +51,18 @@ impl Parser {
             }
         }
 
+        // task 54：channel 发送 `ch <- value`（赋值级，右结合）。
+        // 仅在 `<-` 出现在完整表达式之后（二元位置）时匹配为 send；
+        // 前缀 `<-ch`（receive）由 parse_unary 在表达式起始处匹配。
+        if self.check(&TokenKind::LeftArrow) {
+            self.advance();
+            let value = self.parse_assignment()?;
+            return Ok(Expr::ChannelSend {
+                channel: Box::new(expr),
+                value: Box::new(value),
+            });
+        }
+
         // `:=` 短声明为语句级构造（03-syntax.md:48 short_var），由 task 13
         // parse_expr_or_assignment 在语句层检测 ColonEqual 并产出 Stmt::ShortVarDecl；
         // 此处不消费 :=，否则会使 task 13 的 := 分支成为死代码。

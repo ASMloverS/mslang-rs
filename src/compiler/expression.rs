@@ -129,6 +129,13 @@ impl Compiler {
                 Ok(())
             }
             Expr::Go { .. } => Err("go compilation not yet implemented (task 55)".to_string()),
+            // task 54：channel 发送 `ch <- value` → value + channel + SEND
+            Expr::ChannelSend { channel, value } => {
+                self.compile_expression(value, line)?;
+                self.compile_expression(channel, line)?;
+                self.emit_byte(OpCode::Send as u8, line);
+                Ok(())
+            }
         }
     }
 }
@@ -411,6 +418,12 @@ impl Compiler {
     }
 
     fn compile_call(&mut self, callee: &Expr, args: &[Expr], line: usize) -> Result<(), String> {
+        // task 54：channel(n) 编译为 CHANNEL <n>（内联操作数，1 字节 0-255）。
+        if let Expr::Identifier(name) = callee {
+            if name == "channel" {
+                return self.compile_channel_call(args, line);
+            }
+        }
         self.compile_expression(callee, line)?;
         for arg in args {
             self.compile_expression(arg, line)?;
@@ -419,6 +432,33 @@ impl Compiler {
             .map_err(|_| format!("too many arguments (max 255, got {})", args.len()))?;
         self.emit_byte(OpCode::Call as u8, line);
         self.emit_byte(argc, line);
+        Ok(())
+    }
+
+    /// task 54：编译 `channel(n)`。操作数为单字节无符号整数（0-255）。
+    /// - `channel()` → CHANNEL 0（无缓冲）
+    /// - `channel(n)` → CHANNEL <n>（n 须为整数字面量）
+    /// - n > 255 → 编译错误
+    fn compile_channel_call(&mut self, args: &[Expr], line: usize) -> Result<(), String> {
+        let buffer_size: u8 = match args.len() {
+            0 => 0,
+            1 => match &args[0] {
+                Expr::Literal(Literal::Int(n)) => {
+                    if *n < 0 || *n > 255 {
+                        return Err("'channel' buffer size exceeds 255".to_string());
+                    }
+                    *n as u8
+                }
+                _ => {
+                    return Err(
+                        "'channel' buffer size must be an integer literal (0-255)".to_string()
+                    )
+                }
+            },
+            _ => return Err("'channel' expects 0 or 1 argument".to_string()),
+        };
+        self.emit_byte(OpCode::Channel as u8, line);
+        self.emit_byte(buffer_size, line);
         Ok(())
     }
 

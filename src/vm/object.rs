@@ -1308,6 +1308,8 @@ impl Object {
                     "module"
                 } else if tag == TypeTag::FILE_HANDLE as u8 {
                     "file"
+                } else if tag == TypeTag::CHANNEL as u8 {
+                    "channel"
                 } else {
                     "object"
                 }

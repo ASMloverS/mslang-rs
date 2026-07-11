@@ -789,6 +789,68 @@ static PLACEHOLDER_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<MsObjHeader>(),
 };
 
+// task 54：CHANNEL。Box 分配（alloc_channel），当前未接入 GC 堆，故 copy/forward/free
+// 为占位 noop。trace 遍历 buffer + 等待协程的值栈/待发送值/帧闭包（14-gc.md § 根集扩展）。
+fn trace_channel(obj: *mut MsObjHeader, cb: &mut dyn FnMut(*mut MsObjHeader)) {
+    use crate::async_runtime::channel::read_channel;
+    // SAFETY: obj 由 alloc_channel 分配，type_tag = CHANNEL。
+    let ch = unsafe { read_channel(obj) };
+
+    // 1. 缓冲区中的 Object::Ref。
+    if let Ok(buffer) = ch.buffer.try_borrow() {
+        for item in buffer.iter() {
+            if let Object::Ref(r) = item {
+                cb(*r);
+            }
+        }
+    }
+
+    // 辅助：遍历一个协程的 GC 根（值栈 + 各帧闭包/current_exc）。
+    let trace_coro = |coro: &crate::vm::Coroutine, cb: &mut dyn FnMut(*mut MsObjHeader)| {
+        for item in coro.stack.iter() {
+            if let Object::Ref(r) = item {
+                cb(*r);
+            }
+        }
+        for frame in coro.call_stack.iter() {
+            if !frame.closure.is_null() {
+                cb(frame.closure);
+            }
+            if let Some(Object::Ref(r)) = &frame.current_exc {
+                cb(*r);
+            }
+        }
+    };
+
+    // 2. 等待发送者：value + 协程值栈/帧闭包。
+    if let Ok(senders) = ch.waiting_senders.try_borrow() {
+        for sender in senders.iter() {
+            if let Object::Ref(r) = &sender.value {
+                cb(*r);
+            }
+            trace_coro(&sender.coroutine, cb);
+        }
+    }
+
+    // 3. 等待接收者：协程值栈/帧闭包。
+    if let Ok(receivers) = ch.waiting_receivers.try_borrow() {
+        for receiver in receivers.iter() {
+            trace_coro(&receiver.coroutine, cb);
+        }
+    }
+}
+
+static CHANNEL_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::CHANNEL,
+    name: "channel",
+    trace: trace_channel,
+    copy_for_gc: copy_placeholder,
+    forward_fields: forward_noop,
+    free: free_placeholder,
+    finalize: None,
+    size_base: std::mem::size_of::<crate::async_runtime::channel::MsChannel>(),
+};
+
 /// 类型描述表查找：为每个 TypeTag 返回对应的 TypeDescriptor。
 /// 参照 14-gc.md — 所有 TypeTag 必须覆盖。当前仅 STRING/LIST/DICT/TUPLE/SET
 /// 由 GC 托管；FUNCTION..EXCEPTION_CLASS(6..=19) 与 LARGE_OBJECT(0xFF) 以占位 noop
@@ -811,6 +873,8 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::FILE_HANDLE as u8 => &FILE_HANDLE_DESC,
         // task 70：NATIVE_C_FUNCTION（Box 分配，未接入 GC 堆）→ 占位 noop。
         t if t == TypeTag::NATIVE_C_FUNCTION as u8 => &NATIVE_C_FUNCTION_DESC,
+        // task 54：CHANNEL（Box 分配，未接入 GC 堆）→ 真实 trace，其余占位。
+        t if t == TypeTag::CHANNEL as u8 => &CHANNEL_DESC,
         // 合法但当前未托管 TypeTag（6..=19 除 MODULE，与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。

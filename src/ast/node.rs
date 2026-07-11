@@ -288,6 +288,11 @@ pub enum Expr {
     Go {
         expr: Box<Expr>,
     },
+    /// task 54：channel 发送 `ch <- value`。
+    ChannelSend {
+        channel: Box<Expr>,
+        value: Box<Expr>,
+    },
     Grouping {
         expr: Box<Expr>,
     },
@@ -339,6 +344,7 @@ impl std::fmt::Display for Expr {
             },
             Expr::YieldFrom { iterable } => write!(f, "yield from {}", iterable),
             Expr::Go { expr } => write!(f, "go {}", expr),
+            Expr::ChannelSend { channel, value } => write!(f, "({} <- {})", channel, value),
             Expr::Grouping { expr } => write!(f, "({})", expr),
             Expr::Slice {
                 object,

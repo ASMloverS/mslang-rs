@@ -7,6 +7,7 @@ pub mod stdlib;
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::module::{self, ModuleResolver};
+use crate::async_runtime::channel::{read_channel, ChannelState, WaitingReceiver, WaitingSender};
 use crate::vm::builtins::{alloc_native_function, read_native_function, NativeFunction, to_iterator};
 use crate::vm::object::{
     alloc_bound_method, alloc_class, alloc_closure, alloc_dict, alloc_exception,
@@ -99,6 +100,20 @@ impl Default for EventLoop {
     }
 }
 
+/// task 54：channel 暂停信号。SEND/RECEIVE 阻塞时设置，event_loop_run 据此
+/// 将协程快照存入 channel 的等待列表（参照 yield_future 的 await 模式）。
+enum ChannelYield {
+    /// SEND 阻塞：协程及其待发送值存入 channel.waiting_senders。
+    Send {
+        channel: *mut MsObjHeader,
+        value: Object,
+    },
+    /// RECEIVE 阻塞：协程存入 channel.waiting_receivers。
+    Recv {
+        channel: *mut MsObjHeader,
+    },
+}
+
 /// 内置异常层级（父类链）。父类一律为 Error。Phase 5 升级为正式 Class 后此表废弃。
 /// 参照 [37-try-except-finally](../docs/mslang/tasks/37-try-except-finally.md) §5。
 const EXCEPTION_PARENTS: &[(&str, &str)] = &[
@@ -172,6 +187,9 @@ pub struct VM {
     /// task 53：AWAIT Pending 时设置的 yield 信号。run_loop 退出后 EventLoop 检查此字段：
     /// Some(fp) → 协程因 await 暂停；None → 协程正常完成。
     yield_future: Option<*mut MsObjHeader>,
+    /// task 54：SEND/RECEIVE 阻塞时设置的 yield 信号。event_loop_run 检查此字段：
+    /// Some(cy) → 协程因 channel 操作暂停，快照存入对应 channel 等待列表。
+    yield_channel: Option<ChannelYield>,
     /// task 53：协程未捕获异常的 Object 快照。drive_unwind 在 call_stack 空时格式化错误
     /// 前存储此值，供 EventLoop 据此 reject Future。
     last_uncaught_exception: Option<Object>,
@@ -227,6 +245,7 @@ impl VM {
             heap: gc::MsHeap::new(),
             event_loop: EventLoop::new(),
             yield_future: None,
+            yield_channel: None,
             last_uncaught_exception: None,
             object_class: std::ptr::null_mut(),
             module_resolver: ModuleResolver::new(),
@@ -420,6 +439,7 @@ impl VM {
             self.restore_coroutine_state(coro);
 
             self.yield_future = None;
+            self.yield_channel = None;
             self.last_uncaught_exception = None;
             let result = self.run_loop(None);
 
@@ -430,6 +450,23 @@ impl VM {
                     coroutine: coro,
                     waiting_on: fp,
                 });
+            } else if let Some(cy) = self.yield_channel.take() {
+                // task 54：协程因 channel SEND/RECEIVE 阻塞——快照存入 channel 等待列表
+                let coro = self.take_coroutine_state(coro_future);
+                match cy {
+                    ChannelYield::Send { channel, value } => {
+                        let ch = unsafe { read_channel(channel) };
+                        ch.waiting_senders
+                            .borrow_mut()
+                            .push_back(WaitingSender { coroutine: coro, value });
+                    }
+                    ChannelYield::Recv { channel } => {
+                        let ch = unsafe { read_channel(channel) };
+                        ch.waiting_receivers
+                            .borrow_mut()
+                            .push_back(WaitingReceiver { coroutine: coro });
+                    }
+                }
             } else {
                 // 协程完成或出错
                 match result {
@@ -633,6 +670,66 @@ fn require_int(obj: &Object) -> Result<i64, String> {
             other.type_name()
         )),
     }
+}
+
+/// task 54：校验 Object 为 CHANNEL 引用，返回其裸指针。
+fn expect_channel(obj: &Object) -> Result<*mut MsObjHeader, String> {
+    match obj {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CHANNEL as u8 => Ok(*ptr),
+        other => Err(format!(
+            "TypeError: expected a channel, got '{}'",
+            other.type_name()
+        )),
+    }
+}
+
+/// task 54：ch.close() — 关闭 channel（幂等）。
+/// 唤醒所有等待的接收者（给剩余缓冲区数据或 nil）与发送者（恢复后重试 SEND → 报错）。
+fn channel_close(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = match args.first() {
+        Some(o) => expect_channel(o)?,
+        None => return Err("TypeError: close() expects a channel".to_string()),
+    };
+    let ch = unsafe { read_channel(ptr) };
+    // 幂等：无论当前状态，置为 Closed。
+    *ch.state.borrow_mut() = ChannelState::Closed;
+
+    // 唤醒所有等待的接收者：依次给予剩余缓冲区数据，缓冲区空后给 nil。
+    let receivers: Vec<WaitingReceiver> = ch.waiting_receivers.borrow_mut().drain(..).collect();
+    for recv in receivers {
+        let mut coro = recv.coroutine;
+        let val = ch.buffer.borrow_mut().pop_front().unwrap_or(Object::Nil);
+        coro.stack.push(val);
+        vm.event_loop.ready_queue.push_back(coro);
+    }
+
+    // 唤醒所有等待的发送者：将 channel 与待发送值压回栈，回退 ip 使 SEND 重新执行
+    // → 检测 is_closed → 抛出 "send on closed channel"。
+    let senders: Vec<WaitingSender> = ch.waiting_senders.borrow_mut().drain(..).collect();
+    for sender in senders {
+        let mut coro = sender.coroutine;
+        // 栈布局 [value, channel]（channel 在顶），使重执行的 SEND 正确弹出。
+        coro.stack.push(sender.value);
+        coro.stack.push(Object::Ref(ptr));
+        if let Some(frame) = coro.call_stack.last_mut() {
+            if frame.ip > 0 {
+                frame.ip -= 1; // SEND 无操作数，回退 1 字节重执行
+            }
+        }
+        vm.event_loop.ready_queue.push_back(coro);
+    }
+
+    Ok(Object::Nil)
+}
+
+/// task 54：ch.closed() — 返回 channel 是否已关闭。
+fn channel_closed(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let ptr = match args.first() {
+        Some(o) => expect_channel(o)?,
+        None => return Err("TypeError: closed() expects a channel".to_string()),
+    };
+    let ch = unsafe { read_channel(ptr) };
+    Ok(Object::Bool(ch.is_closed()))
 }
 
 /// list/tuple/string 整数索引归一化：负索引加 len；越界抛 IndexError。
@@ -2260,7 +2357,10 @@ impl VM {
                     let iterable = self.pop()?;
                     let is_gen = matches!(&iterable,
                         Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8);
-                    if is_gen {
+                    // task 54：channel 是自身的迭代器。
+                    let is_channel = matches!(&iterable,
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CHANNEL as u8);
+                    if is_gen || is_channel {
                         self.push(iterable)?;
                     } else {
                         let iter_state =
@@ -2301,20 +2401,66 @@ impl VM {
                             }
                         }
                     } else {
-                        let next_val: Option<Object> = {
-                            match &mut self.stack[location] {
-                                Object::Ref(ptr)
-                                    if unsafe { (**ptr).type_tag } == TypeTag::ITERATOR as u8 =>
-                                {
-                                    unsafe { read_iterator(*ptr) }.state.next()
-                                }
-                                _ => return Err("RuntimeError: not an iterator".to_string()),
+                        // task 54：channel 迭代（for val in ch）。
+                        let chan_ptr = match &self.stack[location] {
+                            Object::Ref(ptr)
+                                if unsafe { (**ptr).type_tag } == TypeTag::CHANNEL as u8 =>
+                            {
+                                Some(*ptr)
                             }
+                            _ => None,
                         };
-                        match next_val {
-                            Some(v) => self.push(v)?,
-                            None => {
+                        if let Some(cp) = chan_ptr {
+                            let ch = unsafe { read_channel(cp) };
+                            // 1. 缓冲区有数据：取出，压栈供循环体消费。
+                            let from_buffer = { ch.buffer.borrow_mut().pop_front() };
+                            if let Some(val) = from_buffer {
+                                // 腾出空位：唤醒等待发送者将其值移入缓冲区。
+                                let woken = { ch.waiting_senders.borrow_mut().pop_front() };
+                                if let Some(sender) = woken {
+                                    let mut buffer = ch.buffer.borrow_mut();
+                                    buffer.push_back(sender.value);
+                                    drop(buffer);
+                                    let mut coro = sender.coroutine;
+                                    coro.stack.push(Object::Nil);
+                                    self.event_loop.ready_queue.push_back(coro);
+                                }
+                                self.push(val)?;
+                            } else if ch.is_closed() {
+                                // 2. 已关闭且缓冲区空：结束迭代。
                                 self.call_stack.last_mut().unwrap().ip += offset;
+                            } else {
+                                // 3. 缓冲区空、未关闭：尝试 rendezvous（无缓冲 channel）。
+                                let woken = { ch.waiting_senders.borrow_mut().pop_front() };
+                                if let Some(sender) = woken {
+                                    self.push(sender.value)?;
+                                    let mut coro = sender.coroutine;
+                                    coro.stack.push(Object::Nil);
+                                    self.event_loop.ready_queue.push_back(coro);
+                                } else {
+                                    // 4. 无数据可取：暂停。channel 留在 slot 中。
+                                    //    ip 已越过 FOR_ITER；被唤醒时发送者已将值压入栈。
+                                    self.yield_channel = Some(ChannelYield::Recv { channel: cp });
+                                    return Ok(Object::Nil);
+                                }
+                            }
+                        } else {
+                            let next_val: Option<Object> = {
+                                match &mut self.stack[location] {
+                                    Object::Ref(ptr)
+                                        if unsafe { (**ptr).type_tag }
+                                            == TypeTag::ITERATOR as u8 =>
+                                    {
+                                        unsafe { read_iterator(*ptr) }.state.next()
+                                    }
+                                    _ => return Err("RuntimeError: not an iterator".to_string()),
+                                }
+                            };
+                            match next_val {
+                                Some(v) => self.push(v)?,
+                                None => {
+                                    self.call_stack.last_mut().unwrap().ip += offset;
+                                }
                             }
                         }
                     }
@@ -3204,6 +3350,35 @@ impl VM {
                                 }
                             }
                         }
+                        // task 54：Channel 方法分派（close/closed/__iter__/__next__）。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::CHANNEL as u8 =>
+                        {
+                            let func: Option<builtins::NativeFn> = match attr.as_str() {
+                                "close" => Some(channel_close),
+                                "closed" => Some(channel_closed),
+                                _ => None,
+                            };
+                            if let Some(f) = func {
+                                let method_obj = alloc_native_function(NativeFunction {
+                                    name: attr.clone(),
+                                    func: f,
+                                });
+                                let method_ptr = match method_obj {
+                                    Object::Ref(p) => p,
+                                    _ => unreachable!(),
+                                };
+                                self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                            } else if attr == "__iter__" {
+                                // channel 是自身的迭代器。
+                                self.push(obj.clone())?;
+                            } else {
+                                return Err(format!(
+                                    "AttributeError: 'channel' has no attribute '{}'",
+                                    attr
+                                ));
+                            }
+                        }
                         _ => {
                             return Err(format!(
                                 "AttributeError: '{}' has no attribute '{}'",
@@ -3464,6 +3639,111 @@ impl VM {
                             return Ok(Object::Nil);
                         }
                     }
+                }
+
+                // CHANNEL（task 54）：buffer_size(1) → 创建 channel，压栈。
+                OpCode::Channel => {
+                    let buffer_size = self.read_byte()? as usize;
+                    self.push(crate::async_runtime::channel::alloc_channel(buffer_size))?;
+                }
+
+                // SEND（task 54）：channel 发送（ch <- value）。
+                // 编译端栈布局：先 value 后 channel，故 [value, channel]，channel 在栈顶。
+                // 完成后压入 Nil 作为表达式结果（语句级 POP 会丢弃）。
+                OpCode::Send => {
+                    let channel_obj = self.pop()?;
+                    let value = self.pop()?;
+                    let channel_ptr = expect_channel(&channel_obj)?;
+                    let ch = unsafe { read_channel(channel_ptr) };
+
+                    if ch.is_closed() {
+                        let exc = alloc_exception(
+                            "RuntimeError",
+                            alloc_string("send on closed channel"),
+                            alloc_string(""),
+                            Object::Nil,
+                        );
+                        self.throw(exc)?;
+                        continue;
+                    }
+
+                    // 1. 有等待的接收者：直接将值交付（rendezvous）。
+                    if let Some(receiver) = { ch.waiting_receivers.borrow_mut().pop_front() } {
+                        // value 在此 move；该分支随后压 Nil + continue。
+                        let mut coro = receiver.coroutine;
+                        coro.stack.push(value);
+                        self.event_loop.ready_queue.push_back(coro);
+                        self.push(Object::Nil)?;
+                        continue;
+                    }
+
+                    // 2. 有缓冲：缓冲区未满时入队。
+                    if ch.capacity > 0 {
+                        let has_space = ch.buffer.borrow().len() < ch.capacity;
+                        if has_space {
+                            // value 在此 move；随后压 Nil + continue。
+                            ch.buffer.borrow_mut().push_back(value);
+                            self.push(Object::Nil)?;
+                            continue;
+                        }
+                    }
+
+                    // 3. 无接收者且（无缓冲 或 缓冲区满）→ 暂停。
+                    //    value 未经上述分支消费，仍有效。恢复时由接收者压入 Nil 结果。
+                    self.yield_channel = Some(ChannelYield::Send {
+                        channel: channel_ptr,
+                        value,
+                    });
+                    return Ok(Object::Nil);
+                }
+
+                // RECEIVE（task 54）：channel 接收（<-ch）。
+                // 编译端栈布局：[channel]（channel 在栈顶）。
+                OpCode::Receive => {
+                    let channel_obj = self.pop()?;
+                    let channel_ptr = expect_channel(&channel_obj)?;
+                    let ch = unsafe { read_channel(channel_ptr) };
+
+                    // 1. 先尝试从缓冲区取值。
+                    let from_buffer = { ch.buffer.borrow_mut().pop_front() }; // guard 释放
+                    if let Some(val) = from_buffer {
+                        self.push(val)?;
+                        // 缓冲区腾出空位：若有等待发送者，将其值移入缓冲区并唤醒。
+                        let woken_sender = { ch.waiting_senders.borrow_mut().pop_front() };
+                        if let Some(sender) = woken_sender {
+                            let mut buffer = ch.buffer.borrow_mut();
+                            buffer.push_back(sender.value);
+                            drop(buffer); // guard 释放后再操作 EventLoop
+                            // 发送者的 SEND 已完成，压入 Nil 作为其表达式结果。
+                            let mut coro = sender.coroutine;
+                            coro.stack.push(Object::Nil);
+                            self.event_loop.ready_queue.push_back(coro);
+                        }
+                        continue;
+                    }
+
+                    // 2. 缓冲区空：检查等待发送者（rendezvous — 无缓冲 channel 的核心路径）。
+                    let woken_sender = { ch.waiting_senders.borrow_mut().pop_front() };
+                    if let Some(sender) = woken_sender {
+                        // 直接取发送者的值，唤醒发送者（其 SEND 已完成，压 Nil 结果）。
+                        self.push(sender.value)?;
+                        let mut coro = sender.coroutine;
+                        coro.stack.push(Object::Nil);
+                        self.event_loop.ready_queue.push_back(coro);
+                        continue;
+                    }
+
+                    // 3. 无数据、无等待发送者。若已关闭 → 返回 nil。
+                    if ch.is_closed() {
+                        self.push(Object::Nil)?;
+                        continue;
+                    }
+
+                    // 4. 阻塞：暂停当前协程。channel 已从栈弹出，存入 ChannelYield::Recv。
+                    self.yield_channel = Some(ChannelYield::Recv {
+                        channel: channel_ptr,
+                    });
+                    return Ok(Object::Nil);
                 }
 
                 _ => {
@@ -10005,5 +10285,171 @@ assert(make() == 111)
         "#,
         );
         assert!(chunk.is_err(), "expected compile error");
+    }
+
+    // -----------------------------------------------------------------------
+    // task 54：Channel 通信测试
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_channel_buffered() {
+        // 标准 1：有缓冲 channel 正确发送和接收。
+        let result = compile_and_run(
+            r#"
+            ch = channel(3)
+            ch <- 1
+            ch <- 2
+            ch <- 3
+            assert(<-ch == 1)
+            assert(<-ch == 2)
+            assert(<-ch == 3)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_unbuffered() {
+        // 标准 2/10：无缓冲 channel 同步交接（需独立协程发送）。
+        let result = compile_and_run(
+            r#"
+            async fn sender(ch) {
+                ch <- 42
+            }
+            ch = channel()
+            f = sender(ch)
+            val = <-ch
+            assert(val == 42)
+            await f
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_close_and_iterate() {
+        // 标准 5/9：关闭后接收剩余数据；for..in 遍历直到关闭；空 channel 接收返回 nil。
+        let result = compile_and_run(
+            r#"
+            ch = channel(5)
+            ch <- "a"
+            ch <- "b"
+            ch <- "c"
+            ch.close()
+            assert(ch.closed() == true)
+            var collected = ""
+            for item in ch {
+                collected = collected + item
+            }
+            assert(collected == "abc")
+            assert((<-ch) == nil)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_send_closed_error() {
+        // 标准 6：向已关闭 channel 发送抛出错误（可被 try/except 捕获）。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            ch.close()
+            try {
+                ch <- 42
+                assert(false)
+            } except {
+                assert(true)
+            }
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_close_idempotent() {
+        // 标准 7：close() 幂等——重复调用不报错。
+        let result = compile_and_run(
+            r#"
+            ch = channel(2)
+            ch <- 1
+            ch.close()
+            ch.close()
+            ch.close()
+            assert(ch.closed() == true)
+            assert((<-ch) == 1)
+            assert((<-ch) == nil)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_close_wakes_sender() {
+        // 标准 8：关闭 channel 时唤醒阻塞的发送者，使其收到 "send on closed channel" 错误。
+        let result = compile_and_run(
+            r#"
+            async fn blocked_sender(ch) {
+                ch <- "data"
+            }
+            ch = channel(1)
+            ch <- "first"
+            f = blocked_sender(ch)
+            ch.close()
+            var caught = false
+            try {
+                await f
+            } except {
+                caught = true
+            }
+            assert(caught)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_recv_closed_empty() {
+        // 标准 5：从已关闭的空 channel 接收返回 nil。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            ch.close()
+            assert((<-ch) == nil)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_channel_buffer_size_validation() {
+        // 编译期：buffer_size 超过 255 → 编译错误。
+        let chunk = compile_result("ch = channel(256)");
+        assert!(chunk.is_err(), "expected compile error for buffer size > 255");
+    }
+
+    #[test]
+    fn test_channel_unbuffered_interleave() {
+        // 标准 3/4/10：多协程通过无缓冲 channel 通信，验证阻塞与调度。
+        let result = compile_and_run(
+            r#"
+            async fn producer(ch) {
+                ch <- 10
+                ch <- 20
+            }
+            async fn consumer(ch) {
+                var a = <-ch
+                var b = <-ch
+                return a + b
+            }
+            ch = channel()
+            pf = producer(ch)
+            cf = consumer(ch)
+            result = await cf
+            await pf
+            assert(result == 30)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
     }
 }
