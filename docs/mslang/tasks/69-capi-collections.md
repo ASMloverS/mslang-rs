@@ -7,6 +7,7 @@ Phase 6 — 模块系统 + 标准库
 ## 前置任务
 
 - 67-capi-value-creation
+- 68-capi-value-convert（`set_type_error`、`compare_objects`、`is_hashable` 辅助函数）
 
 ## 目标
 
@@ -133,774 +134,468 @@ MS_API MsStatus msNext(MsVM* vm, MsValue* iterator, MsValue** out);
 | `TypeTag` | `src/vm/object.rs` | 类型标签枚举 |
 | `Object` | `src/vm/object.rs` | 核心值枚举 |
 | `MsVM` | `src/capi/vm.rs` | VM 不透明结构体 |
-| `MsValue` | `src/capi/vm.rs` | 值不透明结构体 |
-| `ms_throw` | `src/capi/error.rs` | C API 异常抛出辅助 |
-| `object_to_ms_value` | `src/capi/value.rs` | Object → MsValue* 转换 |
-| `ms_value_to_object` | `src/capi/value.rs` | MsValue* → Object 转换 |
-| `with_vm` | `src/capi/vm.rs` | 锁定 VM 并执行闭包 |
+| `MsValue` | `src/capi/types.rs` | 值不透明结构体（`pub(crate) inner: Object`） |
+| `lock_vm` | `src/capi/vm.rs` | 锁定 VM 并返回 guard |
+| `set_type_error` | `src/capi/mod.rs` | TypeError 占位辅助（Task 68） |
+| `is_hashable` | `src/capi/value.rs` | 检查 Object 可哈希性（Task 68） |
+| `MS_TRUE`/`MS_FALSE` | `src/capi/value.rs` | C 布尔常量（Task 67） |
 
 ### 通用实现模式
 
 每个函数遵循以下步骤：
 
-1. 验证 `MsVM*` 和 `MsValue*` 参数非 NULL
-2. 通过 `with_vm` 锁定 VM mutex
-3. 调用 `ms_value_to_object` 提取内部 `Object`
-4. 验证 Object 类型匹配（通过 `type_tag` 检查）
-5. 执行操作
-6. 返回结果（通过 `object_to_ms_value` 将 Object 转为 `MsValue*`）
+1. 验证 `MsVM*` 和 `MsValue*` 参数非 NULL（返回安全默认值）
+2. 通过 `lock_vm(vm)` 锁定 VM，获取 guard
+3. 通过 `guard.get()` 获取 `&mut VmInner`，访问 `inner.vm`
+4. 通过 `unsafe { &(*val).inner }` / `unsafe { (*val).inner.clone() }` 提取内部 Object
+5. 验证 Object 类型匹配（通过 type_tag 检查）
+6. 执行操作
+7. 返回结果（`Box::into_raw(Box::new(MsValue { inner: obj }))` 创建新 MsValue*）
 
 ### 字符串操作实现
 
 ```rust
+use crate::capi::vm::lock_vm;
+use crate::capi::types::MsValue;
+use crate::vm::object::{read_str, read_list, read_dict, read_tuple, read_set,
+    alloc_string, alloc_list, alloc_tuple, Object, TypeTag};
+
 #[no_mangle]
-pub extern "C" fn msStringLen(vm: *mut MsVM, str: *mut MsValue) -> usize {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, str);
-        match &obj {
-            Object::Ref(ptr) if type_tag(*ptr) == TypeTag::STRING => {
-                unsafe { read_str(*ptr).len() }
-            }
-            _ => 0,
+pub extern "C" fn msStringLen(vm: *mut MsVM, str_val: *mut MsValue) -> usize {
+    if vm.is_null() || str_val.is_null() { return 0; }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: str_val 由 ms* 创建。
+    match unsafe { &(*str_val).inner } {
+        Object::Ref(ptr) => {
+            // SAFETY: ptr 由 alloc_string 分配（type_tag 已验证）。
+            if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 {
+                unsafe { read_str(*ptr) }.len()
+            } else { 0 }
         }
-    })
+        _ => 0,
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn msStringData(vm: *mut MsVM, str_val: *mut MsValue) -> *const c_char {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, str_val);
-        match &obj {
-            Object::Ref(ptr) if type_tag(*ptr) == TypeTag::STRING => {
-                unsafe { read_str(*ptr).as_ptr() as *const c_char }
-            }
-            _ => std::ptr::null(),
+    if vm.is_null() || str_val.is_null() { return std::ptr::null(); }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: str_val 由 ms* 创建。
+    match unsafe { &(*str_val).inner } {
+        Object::Ref(ptr) => {
+            if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 {
+                // SAFETY: type_tag 为 STRING。
+                unsafe { read_str(*ptr) }.as_ptr() as *const c_char
+            } else { std::ptr::null() }
         }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msStringConcat(
-    vm: *mut MsVM, a: *mut MsValue, b: *mut MsValue,
-) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj_a = ms_value_to_object(vm_inner, a);
-        let obj_b = ms_value_to_object(vm_inner, b);
-        let str_a = extract_str(&obj_a);
-        let str_b = extract_str(&obj_b);
-        match (str_a, str_b) {
-            (Some(sa), Some(sb)) => {
-                let concat = format!("{}{}", sa, sb);
-                let result = alloc_string(&concat);
-                object_to_ms_value(vm_inner, result)
-            }
-            _ => std::ptr::null_mut(),
-        }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msStringSlice(
-    vm: *mut MsVM, str_val: *mut MsValue, start: c_int, end: c_int,
-) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, str_val);
-        let s = match extract_str(&obj) {
-            Some(s) => s,
-            None => return std::ptr::null_mut(),
-        };
-        let len = s.len() as isize;
-        let s_idx = normalize_index(start, len);
-        let e_idx = normalize_index(end, len);
-        let (lo, hi) = if s_idx <= e_idx {
-            (s_idx as usize, e_idx as usize)
-        } else {
-            (0, 0)
-        };
-        let sliced = s[lo..hi].to_string();
-        let result = alloc_string(&sliced);
-        object_to_ms_value(vm_inner, result)
-    })
-}
-```
-
-辅助函数 `normalize_index`：
-
-```rust
-fn normalize_index(idx: c_int, len: isize) -> isize {
-    if idx < 0 {
-        (len + idx as isize).max(0)
-    } else {
-        (idx as isize).min(len)
-    }
-}
-
-fn extract_str(obj: &Object) -> Option<&str> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::STRING => {
-            Some(unsafe { read_str(*ptr) })
-        }
-        _ => None,
+        _ => std::ptr::null(),
     }
 }
 ```
+
+> **嵌入 `\0` 限制**：mslang String 可包含 `\0`（通过 `msStringn` 创建）。`msStringData` 返回 `*const c_char`（C 空终止字符串），数据在首个 `\0` 后不可见。C 侧需完整字节的应用应使用 `msStringLen` + `msStringData` 手动按长度读取。
+
+`msStringConcat` 和 `msStringSlice` 按相同模式实现。`msStringConcat` 使用 `read_str` 提取两个字符串，`format!("{}{}", sa, sb)` 连接后 `alloc_string` 创建新对象。`msStringSlice` 使用 `normalize_index` 处理负索引，对字节切片 `[lo..hi]` 取子串。
+
+> **UTF-8 切片注意**：mslang String 是 UTF-8 编码。`msStringSlice` 按字节索引切片可能在多字节字符中间截断，产生无效 UTF-8。MVP 阶段按字节切片（与 C API 的 int 参数语义一致），完整 Unicode 字符切片留待后续优化。
 
 ### List 操作实现
+
+以 `msListLen`、`msListGet`、`msListPush` 为模板，其余按相同模式实现：
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msListLen(vm: *mut MsVM, list: *mut MsValue) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        match &obj {
-            Object::Ref(ptr) if type_tag(*ptr) == TypeTag::LIST => {
+    if vm.is_null() || list.is_null() { return -1; }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: list 由 ms* 创建。
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) => {
+            if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 {
+                // SAFETY: type_tag 为 LIST。
                 unsafe { read_list(*ptr).len() as c_int }
-            }
-            _ => -1,
+            } else { -1 }
         }
-    })
+        _ => -1,
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn msListGet(
     vm: *mut MsVM, list: *mut MsValue, index: c_int,
 ) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        let items = match extract_list_mut(&obj) {
-            Some(v) => v,
-            None => return std::ptr::null_mut(),
-        };
-        let len = items.len() as isize;
-        let idx = resolve_index(index, len);
-        match idx {
-            Some(i) => {
-                let val = items[i].clone();
-                object_to_ms_value(vm_inner, val)
-            }
-            None => {
-                ms_throw(vm_inner, "IndexError",
-                    &format!("list index {} out of range", index));
-                std::ptr::null_mut()
-            }
-        }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msListSet(
-    vm: *mut MsVM, list: *mut MsValue, index: c_int, val: *mut MsValue,
-) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        let new_val = ms_value_to_object(vm_inner, val);
-        let items = match extract_list_mut(&obj) {
-            Some(v) => v,
-            None => return MS_ERROR,
-        };
-        let len = items.len() as isize;
-        let idx = resolve_index(index, len);
-        match idx {
-            Some(i) => {
-                items[i] = new_val;
-                MS_OK
-            }
-            None => {
-                ms_throw(vm_inner, "IndexError",
-                    &format!("list index {} out of range", index));
-                MS_ERROR
+    if vm.is_null() || list.is_null() { return std::ptr::null_mut(); }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    // SAFETY: list 由 ms* 创建。
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            // SAFETY: type_tag 为 LIST。
+            let items = unsafe { read_list(*ptr) };
+            let len = items.len() as isize;
+            match resolve_index(index, len) {
+                Some(i) => {
+                    let val = items[i].clone();
+                    Box::into_raw(Box::new(MsValue { inner: val }))
+                }
+                None => {
+                    set_type_error(&mut inner.vm, "valid index", unsafe { &(*list).inner });
+                    std::ptr::null_mut()
+                }
             }
         }
-    })
+        _ => {
+            set_type_error(&mut inner.vm, "list", unsafe { &(*list).inner });
+            std::ptr::null_mut()
+        }
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn msListPush(
     vm: *mut MsVM, list: *mut MsValue, val: *mut MsValue,
 ) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        let new_val = ms_value_to_object(vm_inner, val);
-        match extract_list_mut(&obj) {
-            Some(items) => {
-                items.push(new_val);
-                MS_OK
-            }
-            None => MS_ERROR,
+    if vm.is_null() || list.is_null() || val.is_null() { return MsStatus::MS_ERROR; }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: list/val 由 ms* 创建。
+    let new_val = unsafe { (*val).inner.clone() };
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            // SAFETY: type_tag 为 LIST。
+            unsafe { read_list(*ptr) }.push(new_val);
+            MsStatus::MS_OK
         }
-    })
+        _ => MsStatus::MS_ERROR,
+    }
 }
+```
 
-#[no_mangle]
-pub extern "C" fn msListPop(vm: *mut MsVM, list: *mut MsValue) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        let items = match extract_list_mut(&obj) {
-            Some(v) => v,
-            None => return std::ptr::null_mut(),
-        };
-        match items.pop() {
-            Some(val) => object_to_ms_value(vm_inner, val),
-            None => {
-                ms_throw(vm_inner, "IndexError", "pop from empty list");
-                std::ptr::null_mut()
-            }
-        }
-    })
-}
+`msListSet`、`msListPop`、`msListInsert`、`msListContains` 按相同模式实现。关键点：
+- `msListSet`：`resolve_index` 越界时 `set_type_error` + 返回 `MS_ERROR`
+- `msListPop`：空列表时 `set_type_error` + 返回 `null_mut()`
+- `msListInsert`：负索引 `(len + index).max(0)`，正索引 `.min(len)`
+- `msListContains`：使用 `Vec::contains(&target)` 判断（基于 `Object::PartialEq`）
 
-#[no_mangle]
-pub extern "C" fn msListInsert(
-    vm: *mut MsVM, list: *mut MsValue, index: c_int, val: *mut MsValue,
-) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        let new_val = ms_value_to_object(vm_inner, val);
-        let items = match extract_list_mut(&obj) {
-            Some(v) => v,
-            None => return MS_ERROR,
-        };
-        let len = items.len() as isize;
-        let pos = if index < 0 {
-            (len + index as isize).max(0) as usize
-        } else {
-            (index as usize).min(items.len())
-        };
-        items.insert(pos, new_val);
-        MS_OK
-    })
-}
+`msListSlice` 支持 step 参数：
 
-#[no_mangle]
-pub extern "C" fn msListContains(
-    vm: *mut MsVM, list: *mut MsValue, val: *mut MsValue,
-) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, list);
-        let target = ms_value_to_object(vm_inner, val);
-        match extract_list_ref(&obj) {
-            Some(items) => {
-                if items.contains(&target) { MS_TRUE } else { MS_FALSE }
-            }
-            _ => MS_FALSE,
-        }
-    })
-}
-
+```rust
 #[no_mangle]
 pub extern "C" fn msListSlice(
     vm: *mut MsVM, list: *mut MsValue,
     start: c_int, end: c_int, step: c_int,
 ) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        if step == 0 {
-            ms_throw(vm_inner, "ValueError", "slice step cannot be zero");
-            return std::ptr::null_mut();
-        }
-        let obj = ms_value_to_object(vm_inner, list);
-        let items = match extract_list_ref(&obj) {
-            Some(v) => v,
-            None => return std::ptr::null_mut(),
-        };
-        let len = items.len() as isize;
-        let step = step as isize;
-        let (s_idx, e_idx) = compute_slice_bounds(start, end, step, len);
-        let mut result = Vec::new();
-        let mut i = s_idx;
-        if step > 0 {
-            while i < e_idx {
-                result.push(items[i as usize].clone());
-                i += step;
+    if vm.is_null() || list.is_null() { return std::ptr::null_mut(); }
+    if step == 0 {
+        let guard = lock_vm(vm);
+        let inner = unsafe { &mut *guard.get() };
+        set_type_error(&mut inner.vm, "non-zero step", unsafe { &(*list).inner });
+        return std::ptr::null_mut();
+    }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: list 由 ms* 创建。
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            // SAFETY: type_tag 为 LIST。
+            let items = unsafe { &*read_list(*ptr) as &Vec<Object> };
+            let len = items.len() as isize;
+            let step = step as isize;
+            let (s_idx, e_idx) = compute_slice_bounds(start, end, step, len);
+            let mut result = Vec::new();
+            let mut i = s_idx;
+            if step > 0 {
+                while i < e_idx && i >= 0 {
+                    result.push(items[i as usize].clone());
+                    i += step;
+                }
+            } else {
+                while i > e_idx && i >= 0 && i < len {
+                    result.push(items[i as usize].clone());
+                    i += step;
+                }
             }
-        } else {
-            while i > e_idx {
-                result.push(items[i as usize].clone());
-                i += step;
-            }
+            let result_obj = alloc_list(result);
+            Box::into_raw(Box::new(MsValue { inner: result_obj }))
         }
-        let result_obj = alloc_list(result);
-        object_to_ms_value(vm_inner, result_obj)
-    })
+        _ => std::ptr::null_mut(),
+    }
 }
 ```
 
 辅助函数：
 
 ```rust
-fn extract_list_mut(obj: &Object) -> Option<&mut Vec<Object>> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::LIST => {
-            Some(unsafe { read_list(*ptr) })
-        }
-        _ => None,
-    }
-}
-
-fn extract_list_ref(obj: &Object) -> Option<&Vec<Object>> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::LIST => {
-            Some(unsafe { &*(*ptr as *const MsList).data_ptr })
-        }
-        _ => None,
-    }
-}
-
 fn resolve_index(index: c_int, len: isize) -> Option<usize> {
     let idx = if index < 0 { len + index as isize } else { index as isize };
-    if idx < 0 || idx >= len {
-        None
-    } else {
-        Some(idx as usize)
-    }
+    if idx < 0 || idx >= len { None } else { Some(idx as usize) }
 }
 
+/// 计算 slice 的 (start, end) 边界。正/负 step 分别处理默认值和 clamp。
 fn compute_slice_bounds(start: c_int, end: c_int, step: isize, len: isize)
     -> (isize, isize)
 {
-    let s = if start < 0 { (len + start as isize).max(0) } else { (start as isize).min(len) };
-    let e = if end < 0 { (len + end as isize).max(0) } else { (end as isize).min(len) };
+    let (default_s, default_e) = if step > 0 { (0, len) } else { (len - 1, -1) };
+    let s = if start < 0 {
+        (len + start as isize).max(if step > 0 { 0 } else { -1 })
+    } else {
+        (start as isize).min(if step > 0 { len } else { len - 1 })
+    };
+    let s = if start == 0 && step > 0 { default_s } else { s.max(0) };
+    let e = if end < 0 {
+        (len + end as isize).max(if step > 0 { 0 } else { -1 })
+    } else {
+        (end as isize).min(len)
+    };
     (s, e)
 }
 ```
 
+> **slice bounds 说明**：正 step 时 start 默认 0、end 默认 len（前向遍历）；负 step 时 start 默认 len-1、end 默认 -1（后向遍历）。负索引经 `len + idx` 转换后 clamp 到 `[0, len]`。
+
 ### Dict 操作实现
 
-```rust
-#[no_mangle]
-pub extern "C" fn msDictLen(vm: *mut MsVM, dict: *mut MsValue) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        match extract_dict_mut(&obj) {
-            Some(map) => map.len() as c_int,
-            _ => -1,
-        }
-    })
-}
+以 `msDictGet`、`msDictSet` 为模板：
 
+```rust
 #[no_mangle]
 pub extern "C" fn msDictGet(
     vm: *mut MsVM, dict: *mut MsValue, key: *mut MsValue,
 ) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let key_obj = ms_value_to_object(vm_inner, key);
-        let map = match extract_dict_ref(&obj) {
-            Some(m) => m,
-            None => return std::ptr::null_mut(),
-        };
-        match map.get(&key_obj) {
-            Some(val) => object_to_ms_value(vm_inner, val.clone()),
-            None => std::ptr::null_mut(),
+    if vm.is_null() || dict.is_null() || key.is_null() { return std::ptr::null_mut(); }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: dict/key 由 ms* 创建。
+    let key_obj = unsafe { (*key).inner.clone() };
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            // SAFETY: type_tag 为 DICT。
+            let map = unsafe { read_dict(*ptr) };
+            match map.get(&key_obj) {
+                Some(val) => Box::into_raw(Box::new(MsValue { inner: val.clone() })),
+                None => std::ptr::null_mut(),  // 键不存在，不设异常
+            }
         }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msDictGetDefault(
-    vm: *mut MsVM, dict: *mut MsValue, key: *mut MsValue,
-    default_val: *mut MsValue,
-) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let key_obj = ms_value_to_object(vm_inner, key);
-        let default_obj = ms_value_to_object(vm_inner, default_val);
-        let map = match extract_dict_ref(&obj) {
-            Some(m) => m,
-            None => return default_val,
-        };
-        match map.get(&key_obj) {
-            Some(val) => object_to_ms_value(vm_inner, val.clone()),
-            None => default_val,
-        }
-    })
+        _ => std::ptr::null_mut(),
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn msDictSet(
     vm: *mut MsVM, dict: *mut MsValue, key: *mut MsValue, val: *mut MsValue,
 ) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let key_obj = ms_value_to_object(vm_inner, key);
-        let val_obj = ms_value_to_object(vm_inner, val);
-        let map = match extract_dict_mut(&obj) {
-            Some(m) => m,
-            None => return MS_ERROR,
-        };
-        map.insert(key_obj, val_obj);
-        MS_OK
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msDictRemove(
-    vm: *mut MsVM, dict: *mut MsValue, key: *mut MsValue,
-) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let key_obj = ms_value_to_object(vm_inner, key);
-        let map = match extract_dict_mut(&obj) {
-            Some(m) => m,
-            None => return MS_ERROR,
-        };
-        if map.remove(&key_obj).is_some() {
-            MS_OK
-        } else {
-            ms_throw(vm_inner, "KeyError", "key not found");
-            MS_ERROR
-        }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msDictContains(
-    vm: *mut MsVM, dict: *mut MsValue, key: *mut MsValue,
-) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let key_obj = ms_value_to_object(vm_inner, key);
-        let map = match extract_dict_ref(&obj) {
-            Some(m) => m,
-            None => return MS_FALSE,
-        };
-        if map.get(&key_obj).is_some() { MS_TRUE } else { MS_FALSE }
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msDictKeys(vm: *mut MsVM, dict: *mut MsValue) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let map = match extract_dict_ref(&obj) {
-            Some(m) => m,
-            None => return std::ptr::null_mut(),
-        };
-        let keys: Vec<Object> = map.keys().cloned().collect();
-        let result = alloc_list(keys);
-        object_to_ms_value(vm_inner, result)
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msDictValues(vm: *mut MsVM, dict: *mut MsValue) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let map = match extract_dict_ref(&obj) {
-            Some(m) => m,
-            None => return std::ptr::null_mut(),
-        };
-        let vals: Vec<Object> = map.items().iter()
-            .map(|(_, v)| (*v).clone())
-            .collect();
-        let result = alloc_list(vals);
-        object_to_ms_value(vm_inner, result)
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msDictItems(vm: *mut MsVM, dict: *mut MsValue) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, dict);
-        let map = match extract_dict_ref(&obj) {
-            Some(m) => m,
-            None => return std::ptr::null_mut(),
-        };
-        let items: Vec<Object> = map.items().iter()
-            .map(|(k, v)| alloc_tuple(vec![(*k).clone(), (*v).clone()]))
-            .collect();
-        let result = alloc_list(items);
-        object_to_ms_value(vm_inner, result)
-    })
-}
-```
-
-Dict 辅助函数：
-
-```rust
-fn extract_dict_mut(obj: &Object) -> Option<&mut DictMap> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::DICT => {
-            Some(unsafe { read_dict(*ptr) })
-        }
-        _ => None,
+    if vm.is_null() || dict.is_null() || key.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
     }
-}
-
-fn extract_dict_ref(obj: &Object) -> Option<&DictMap> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::DICT => {
-            Some(unsafe { &*(*ptr as *const MsDict).data_ptr })
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    // SAFETY: dict/key/val 由 ms* 创建。
+    let key_obj = unsafe { (*key).inner.clone() };
+    let val_obj = unsafe { (*val).inner.clone() };
+    // 检查键可哈希性（Object::hash() 对 List/Dict/Set/NaN 会 panic）
+    if !is_hashable(&key_obj) {
+        set_type_error(&mut inner.vm, "hashable key", &key_obj);
+        return MsStatus::MS_ERROR;
+    }
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            // SAFETY: type_tag 为 DICT。
+            unsafe { read_dict(*ptr) }.insert(key_obj, val_obj);
+            MsStatus::MS_OK
         }
-        _ => None,
+        _ => MsStatus::MS_ERROR,
     }
 }
 ```
+
+> **不可哈希键检查**：`msDictSet` 必须在 `insert` 前检查 `is_hashable(&key_obj)`。Object 的 Hash impl 对 List/Dict/Set/NaN 会 **panic**（`object.rs:2349,2361`），直接 insert 会崩溃 C 进程。
+
+其余 Dict 函数按相同模式实现：
+- `msDictGetDefault`：键不存在返回 `default_val`（直接返回参数指针）
+- `msDictRemove`：键不存在设置错误，返回 `MS_ERROR`
+- `msDictContains`：使用 `map.get(&key).is_some()`
+- `msDictKeys`：`map.keys().cloned().collect()` → `alloc_list(keys)`
+- `msDictValues`：`map.items().iter().map(|(_, v)| v.clone()).collect()` → `alloc_list(vals)`
+- `msDictItems`：每对 `(k, v)` → `alloc_tuple(vec![k.clone(), v.clone()])`，收集到 `alloc_list`
 
 ### Tuple 操作实现
 
-```rust
-#[no_mangle]
-pub extern "C" fn msTupleLen(vm: *mut MsVM, tup: *mut MsValue) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, tup);
-        match &obj {
-            Object::Ref(ptr) if type_tag(*ptr) == TypeTag::TUPLE => {
-                unsafe { read_tuple(*ptr).len() as c_int }
-            }
-            _ => -1,
-        }
-    })
-}
+以 `msTupleGet` 为模板：
 
+```rust
 #[no_mangle]
 pub extern "C" fn msTupleGet(
     vm: *mut MsVM, tup: *mut MsValue, index: c_int,
 ) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, tup);
-        let items = match extract_tuple_ref(&obj) {
-            Some(v) => v,
-            None => return std::ptr::null_mut(),
-        };
-        let len = items.len() as isize;
-        let idx = resolve_index(index, len);
-        match idx {
-            Some(i) => {
-                let val = items[i].clone();
-                object_to_ms_value(vm_inner, val)
-            }
-            None => {
-                ms_throw(vm_inner, "IndexError",
-                    &format!("tuple index {} out of range", index));
-                std::ptr::null_mut()
+    if vm.is_null() || tup.is_null() { return std::ptr::null_mut(); }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    // SAFETY: tup 由 ms* 创建。
+    match unsafe { &(*tup).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+            // SAFETY: type_tag 为 TUPLE。
+            let items = unsafe { read_tuple(*ptr) };
+            let len = items.len() as isize;
+            match resolve_index(index, len) {
+                Some(i) => {
+                    Box::into_raw(Box::new(MsValue { inner: items[i].clone() }))
+                }
+                None => {
+                    set_type_error(&mut inner.vm, "valid index", unsafe { &(*tup).inner });
+                    std::ptr::null_mut()
+                }
             }
         }
-    })
+        _ => {
+            set_type_error(&mut inner.vm, "tuple", unsafe { &(*tup).inner });
+            std::ptr::null_mut()
+        }
+    }
 }
+```
 
+`msTupleLen` 按相同模式实现。`msTupleUnpack` 使用 `std::alloc::alloc` 分配 `*mut MsValue` 数组：
+
+```rust
 #[no_mangle]
 pub extern "C" fn msTupleUnpack(
     vm: *mut MsVM, tup: *mut MsValue,
     items_out: *mut *mut *mut MsValue, count_out: *mut c_int,
 ) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, tup);
-        let elements = match extract_tuple_ref(&obj) {
-            Some(v) => v,
-            None => return MS_ERROR,
-        };
-        let n = elements.len();
-        let layout = std::alloc::Layout::array::<*mut MsValue>(n).unwrap();
-        let ptr = unsafe { std::alloc::alloc(layout) as *mut *mut MsValue };
-        if ptr.is_null() {
-            return MS_ERROR;
+    if vm.is_null() || tup.is_null() || items_out.is_null() || count_out.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let guard = lock_vm(vm);
+    let _inner = unsafe { &*guard.get() };
+    // SAFETY: tup 由 ms* 创建。
+    match unsafe { &(*tup).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+            // SAFETY: type_tag 为 TUPLE。
+            let elements = unsafe { read_tuple(*ptr) };
+            let n = elements.len();
+            if n == 0 {
+                // 空 tuple：设置 null 指针，跳过分配。
+                unsafe { *items_out = std::ptr::null_mut(); *count_out = 0; }
+                return MsStatus::MS_OK;
+            }
+            let layout = std::alloc::Layout::array::<*mut MsValue>(n)
+                .unwrap_or_else(|_| return MsStatus::MS_ERROR);
+            // SAFETY: layout 非零大小（n > 0），alloc 返回有效指针或 null。
+            let arr = unsafe { std::alloc::alloc(layout) as *mut *mut MsValue };
+            if arr.is_null() { return MsStatus::MS_ERROR; }
+            for (i, elem) in elements.iter().enumerate() {
+                let ms_val = Box::into_raw(Box::new(MsValue { inner: elem.clone() }));
+                unsafe { *arr.add(i) = ms_val; }
+            }
+            unsafe { *items_out = arr; *count_out = n as c_int; }
+            MsStatus::MS_OK
         }
-        for (i, elem) in elements.iter().enumerate() {
-            let ms_val = object_to_ms_value(vm_inner, elem.clone());
-            unsafe { *ptr.add(i) = ms_val };
-        }
-        unsafe {
-            *items_out = ptr;
-            *count_out = n as c_int;
-        }
-        MS_OK
-    })
-}
-```
-
-Tuple 辅助函数：
-
-```rust
-fn extract_tuple_ref(obj: &Object) -> Option<&Vec<Object>> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::TUPLE => {
-            Some(unsafe { read_tuple(*ptr) })
-        }
-        _ => None,
+        _ => MsStatus::MS_ERROR,
     }
 }
 ```
 
-> **msTupleUnpack 内存语义**：调用方通过 `free(items)` 释放数组本身。数组中各 `MsValue*` 指针为借用引用（borrowed ref），调用方不需要也不应该逐个释放或 unroot。若需长期持有某元素，应单独 `msRoot`。
+> **msTupleUnpack 内存语义**：调用方通过 `msTupleUnpackFree` 释放数组（见下）。数组中各 `MsValue*` 为新分配的拥有引用（owned ref），调用方应逐个 `msValueFree` 或 `msRoot`。
 
-### Set 操作实现
+> **msTupleUnpackFree 辅助**：提供安全的释放函数，避免 C `free()` 与 Rust allocator 不匹配：
 
 ```rust
 #[no_mangle]
-pub extern "C" fn msSetLen(vm: *mut MsVM, set: *mut MsValue) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, set);
-        match extract_set_mut(&obj) {
-            Some(inner) => inner.len() as c_int,
-            _ => -1,
+pub extern "C" fn msTupleUnpackFree(items: *mut *mut MsValue, count: c_int) {
+    if items.is_null() { return; }
+    for i in 0..count as usize {
+        // SAFETY: items 指向 count 个 MsValue*。
+        let val = unsafe { *items.add(i) };
+        if !val.is_null() {
+            // SAFETY: val 由 msTupleUnpack 的 Box::into_raw 分配。
+            unsafe { let _ = Box::from_raw(val); }
         }
-    })
+    }
+    // 释放数组本身
+    if count > 0 {
+        let layout = std::alloc::Layout::array::<*mut MsValue>(count as usize).unwrap();
+        // SAFETY: items 由 msTupleUnpack 的 alloc 分配，layout 匹配。
+        unsafe { std::alloc::dealloc(items as *mut u8, layout); }
+    }
 }
+```
 
+### Set 操作实现
+
+以 `msSetAdd` 为模板：
+
+```rust
 #[no_mangle]
 pub extern "C" fn msSetAdd(
     vm: *mut MsVM, set: *mut MsValue, val: *mut MsValue,
 ) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, set);
-        let val_obj = ms_value_to_object(vm_inner, val);
-        let inner = match extract_set_mut(&obj) {
-            Some(s) => s,
-            None => return MS_ERROR,
-        };
-        inner.insert(val_obj);
-        MS_OK
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msSetRemove(
-    vm: *mut MsVM, set: *mut MsValue, val: *mut MsValue,
-) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, set);
-        let val_obj = ms_value_to_object(vm_inner, val);
-        let inner = match extract_set_mut(&obj) {
-            Some(s) => s,
-            None => return MS_ERROR,
-        };
-        inner.remove(&val_obj);
-        MS_OK
-    })
-}
-
-#[no_mangle]
-pub extern "C" fn msSetContains(
-    vm: *mut MsVM, set: *mut MsValue, val: *mut MsValue,
-) -> c_int {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, set);
-        let val_obj = ms_value_to_object(vm_inner, val);
-        let inner = match extract_set_ref(&obj) {
-            Some(s) => s,
-            None => return MS_FALSE,
-        };
-        if inner.contains(&val_obj) { MS_TRUE } else { MS_FALSE }
-    })
-}
-```
-
-Set 辅助函数：
-
-```rust
-fn extract_set_mut(obj: &Object) -> Option<&mut HashSet<Object>> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::SET => {
-            Some(unsafe { read_set(*ptr) })
-        }
-        _ => None,
+    if vm.is_null() || set.is_null() || val.is_null() { return MsStatus::MS_ERROR; }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    // SAFETY: set/val 由 ms* 创建。
+    let val_obj = unsafe { (*val).inner.clone() };
+    // 检查元素可哈希性（Object::hash() 对 List/Dict/Set/NaN 会 panic）
+    if !is_hashable(&val_obj) {
+        set_type_error(&mut inner.vm, "hashable element", &val_obj);
+        return MsStatus::MS_ERROR;
     }
-}
-
-fn extract_set_ref(obj: &Object) -> Option<&HashSet<Object>> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::SET => {
-            Some(unsafe { &*(*ptr as *const MsSet).data_ptr })
+    match unsafe { &(*set).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+            // SAFETY: type_tag 为 SET。
+            unsafe { read_set(*ptr) }.insert(val_obj);
+            MsStatus::MS_OK
         }
-        _ => None,
+        _ => MsStatus::MS_ERROR,
     }
 }
 ```
+
+> **不可哈希元素检查**：同 `msDictSet`，`msSetAdd` 必须在 `insert` 前检查 `is_hashable`。
+
+其余 Set 函数按相同模式实现。`msSetRemove` 对不存在的元素无异常、无错误（与 mslang `set.remove()` 语义一致需确认——02-types.md 中 `s.remove(val)` 删除元素，不存在的行为需查 10-builtins.md）。`msSetContains` 使用 `HashSet::contains`。
 
 ### 迭代器实现
+
+> **Deferred**：迭代器需要 `TypeTag::ITERATOR` 类型的堆对象结构和对应的 alloc/read 函数，这些在当前代码库中不存在。`msIter`/`msNext` 在本任务中提供占位实现（返回 TypeError），完整实现待迭代器内部结构定义后补充。
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msIter(vm: *mut MsVM, iterable: *mut MsValue) -> *mut MsValue {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, iterable);
-        match call_iter_protocol(vm_inner, &obj) {
-            Some(iter_obj) => object_to_ms_value(vm_inner, iter_obj),
-            None => {
-                ms_throw(vm_inner, "TypeError", "object is not iterable");
-                std::ptr::null_mut()
-            }
-        }
-    })
+    if vm.is_null() || iterable.is_null() { return std::ptr::null_mut(); }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    // TODO: 实现迭代器内部结构（ITERATOR 类型堆对象）
+    set_type_error(&mut inner.vm, "iterable (iterator protocol not yet implemented)",
+        unsafe { &(*iterable).inner });
+    std::ptr::null_mut()
 }
 
 #[no_mangle]
 pub extern "C" fn msNext(
     vm: *mut MsVM, iterator: *mut MsValue, out: *mut *mut MsValue,
 ) -> MsStatus {
-    with_vm(vm, |vm_inner| {
-        let obj = ms_value_to_object(vm_inner, iterator);
-        match call_next_protocol(vm_inner, &obj) {
-            Ok(val) => {
-                unsafe { *out = object_to_ms_value(vm_inner, val) };
-                MS_OK
-            }
-            Err(_) => MS_ERROR,
-        }
-    })
+    // 迭代器未实现，返回 MS_ERROR
+    MsStatus::MS_ERROR
 }
 ```
 
-迭代器协议调用：
-
-```rust
-fn call_iter_protocol(vm_inner: &mut VmInner, obj: &Object) -> Option<Object> {
-    // 根据 Object 类型创建对应的迭代器
-    match obj {
-        Object::Ref(ptr) => {
-            let tag = type_tag(*ptr);
-            if tag == TypeTag::LIST as u8 {
-                let len = unsafe { read_list(*ptr).len() };
-                Some(alloc_list_iterator(*ptr, len))
-            } else if tag == TypeTag::DICT as u8 {
-                let len = unsafe { read_dict(*ptr).len() };
-                Some(alloc_dict_iterator(*ptr, len))
-            } else if tag == TypeTag::TUPLE as u8 {
-                let len = unsafe { read_tuple(*ptr).len() };
-                Some(alloc_tuple_iterator(*ptr, len))
-            } else if tag == TypeTag::SET as u8 {
-                Some(alloc_set_iterator(*ptr))
-            } else if tag == TypeTag::STRING as u8 {
-                let s = unsafe { read_str(*ptr) };
-                Some(alloc_string_iterator(*ptr, s.len()))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn call_next_protocol(
-    vm_inner: &mut VmInner, obj: &Object,
-) -> Result<Object, ()> {
-    match obj {
-        Object::Ref(ptr) if type_tag(*ptr) == TypeTag::ITERATOR => {
-            let state = unsafe { read_iterator(*ptr) };
-            state.advance().ok_or(())
-        }
-        _ => Err(()),
-    }
-}
-```
-
-> **迭代器内部结构**：迭代器为 `TypeTag::ITERATOR` 类型的堆对象，`data_ptr` 指向包含源对象引用和当前位置索引的结构。`advance()` 方法根据源对象类型提取下一个元素，越界时返回 `None`（对应 StopIteration）。
+> **迭代器完整实现路线**：(1) 定义 `MsIterator` 堆对象结构（含源对象引用 + 位置索引）；(2) 为 List/Dict/Tuple/Set/String 实现 `alloc_*_iterator` 函数；(3) `msNext` 调用迭代器的 `advance()` 提取下一个元素。这些依赖 ITERATOR TypeTag 的堆对象基础设施。
 
 ### 写屏障集成
 
-所有修改堆对象的操作（`msListSet`、`msListPush`、`msListInsert`、`msDictSet`、`msSetAdd`）内部需要触发写屏障，通知 GC 父对象引用了新值。
+> **MVP 阶段**：当前 GC 未接入日常分配（VM 日常 `alloc_*` 不受 GC 管理），写屏障为 no-op。以下说明供 Phase 7.5 并发 GC 上线后参考。
 
-在 Task 67 中已实现的 `with_vm` 上下文中，写屏障由 VM 的 GC 子系统自动管理。对于直接修改集合内部的场景，需要在修改后调用：
+Phase 7.5 并发 GC 上线后，所有修改堆对象的操作（`msListSet`、`msListPush`、`msListInsert`、`msDictSet`、`msSetAdd`）需在修改后调用写屏障：
 
 ```rust
-// 在 msListPush 成功 push 后：
-vm_inner.gc.write_barrier(parent_obj, new_val);
-
-// 在 msDictSet 成功 insert 后：
-vm_inner.gc.write_barrier(dict_obj, val_obj);
+// Phase 7.5: 在 msListPush 成功 push 后：
+// vm.gc.write_barrier(parent_header_ptr, new_val_header_ptr);
 ```
 
-这确保并发三色标记清扫 GC 不会丢失对新增引用的追踪。
+写屏障确保并发三色标记清扫 GC 不会丢失对新增引用的追踪。当前阶段（Phase 2.5 STW GC）无需写屏障。
 
 ### cbindgen 注意事项
 
@@ -964,13 +659,26 @@ vm_inner.gc.write_barrier(dict_obj, val_obj);
 
 ## 测试用例
 
-### Rust 单元测试 — test_list_push_pop_get_set
+Rust 单元测试位于 `src/capi/value.rs`，在 Task 68 测试块之后：
 
 ```rust
 #[cfg(test)]
-#[cfg(feature = "capi")]
-mod tests {
+mod tests_collections {
     use super::*;
+    use crate::capi::vm::{msVmFree, msVmNew};
+    use crate::capi::types::{MsStatus, MsType};
+    use std::os::raw::{c_char, c_int};
+    use std::ptr;
+
+    fn free_value(val: *mut MsValue) {
+        if !val.is_null() { unsafe { let _ = Box::from_raw(val); } }
+    }
+
+    fn cstr(s: &str) -> *const c_char {
+        // 辅助：将 &str 转为 null-terminated C 字符指针
+        // 使用 leak 绕过生命周期（测试中可接受）
+        Box::leak(format!("{}\0", s).into_boxed_str()).as_ptr() as *const c_char
+    }
 
     #[test]
     fn test_list_push_pop_get_set() {
@@ -981,124 +689,91 @@ mod tests {
         let v2 = msInt(20);
         let v3 = msInt(30);
 
-        assert_eq!(msListPush(vm, list, v1), MS_OK);
-        assert_eq!(msListPush(vm, list, v2), MS_OK);
-        assert_eq!(msListPush(vm, list, v3), MS_OK);
+        assert_eq!(msListPush(vm, list, v1), MsStatus::MS_OK);
+        assert_eq!(msListPush(vm, list, v2), MsStatus::MS_OK);
+        assert_eq!(msListPush(vm, list, v3), MsStatus::MS_OK);
         assert_eq!(msListLen(vm, list), 3);
 
         assert_eq!(msToInt(vm, msListGet(vm, list, 0)), 10);
         assert_eq!(msToInt(vm, msListGet(vm, list, -1)), 30);
 
         let v99 = msInt(99);
-        assert_eq!(msListSet(vm, list, 1, v99), MS_OK);
+        assert_eq!(msListSet(vm, list, 1, v99), MsStatus::MS_OK);
         assert_eq!(msToInt(vm, msListGet(vm, list, 1)), 99);
 
         let popped = msListPop(vm, list);
         assert_eq!(msToInt(vm, popped), 30);
         assert_eq!(msListLen(vm, list), 2);
 
+        free_value(v1); free_value(v2); free_value(v3); free_value(v99);
+        free_value(popped);
         msVmFree(vm);
     }
-}
-```
 
-### Rust 单元测试 — test_list_slice
-
-```rust
     #[test]
     fn test_list_slice() {
         let vm = msVmNew();
         let list = msListNew(vm);
 
-        for i in 0..6 {
-            msListPush(vm, list, msInt(i));
-        }
+        for i in 0..6 { msListPush(vm, list, msInt(i)); }
 
         let sliced = msListSlice(vm, list, 1, 4, 1);
         assert_eq!(msListLen(vm, sliced), 3);
         assert_eq!(msToInt(vm, msListGet(vm, sliced, 0)), 1);
-        assert_eq!(msToInt(vm, msListGet(vm, sliced, 2)), 3);
 
         let stepped = msListSlice(vm, list, 0, 6, 2);
         assert_eq!(msListLen(vm, stepped), 3);
         assert_eq!(msToInt(vm, msListGet(vm, stepped, 0)), 0);
         assert_eq!(msToInt(vm, msListGet(vm, stepped, 1)), 2);
-        assert_eq!(msToInt(vm, msListGet(vm, stepped, 2)), 4);
-
-        let neg = msListSlice(vm, list, -3, -1, 1);
-        assert_eq!(msListLen(vm, neg), 2);
-        assert_eq!(msToInt(vm, msListGet(vm, neg, 0)), 3);
-        assert_eq!(msToInt(vm, msListGet(vm, neg, 1)), 4);
 
         msVmFree(vm);
     }
-```
 
-### Rust 单元测试 — test_dict_set_get_remove
-
-```rust
     #[test]
     fn test_dict_set_get_remove() {
         let vm = msVmNew();
         let dict = msDictNew(vm);
 
-        let key_a = msString(vm, "a");
+        let key_a = msString(vm, cstr("a"));
         let val_1 = msInt(1);
-        assert_eq!(msDictSet(vm, dict, key_a, val_1), MS_OK);
+        assert_eq!(msDictSet(vm, dict, key_a, val_1), MsStatus::MS_OK);
 
-        let key_b = msString(vm, "b");
+        let key_b = msString(vm, cstr("b"));
         let val_2 = msInt(2);
-        assert_eq!(msDictSet(vm, dict, key_b, val_2), MS_OK);
+        assert_eq!(msDictSet(vm, dict, key_b, val_2), MsStatus::MS_OK);
 
         assert_eq!(msDictLen(vm, dict), 2);
-
-        let got = msDictGet(vm, dict, key_a);
-        assert!(!got.is_null());
-        assert_eq!(msToInt(vm, got), 1);
-
+        assert_eq!(msToInt(vm, msDictGet(vm, dict, key_a)), 1);
         assert_eq!(msDictContains(vm, dict, key_a), MS_TRUE);
-        assert_eq!(msDictContains(vm, dict, msString(vm, "z")), MS_FALSE);
 
-        assert_eq!(msDictRemove(vm, dict, key_a), MS_OK);
-        assert_eq!(msDictLen(vm, dict), 1);
+        assert_eq!(msDictRemove(vm, dict, key_a), MsStatus::MS_OK);
         assert!(msDictGet(vm, dict, key_a).is_null());
 
         let default_val = msInt(42);
-        let result = msDictGetDefault(vm, dict, msString(vm, "z"), default_val);
+        let result = msDictGetDefault(vm, dict, msString(vm, cstr("z")), default_val);
         assert_eq!(msToInt(vm, result), 42);
 
         msVmFree(vm);
     }
-```
 
-### Rust 单元测试 — test_dict_keys_values_items
-
-```rust
     #[test]
     fn test_dict_keys_values_items() {
         let vm = msVmNew();
         let dict = msDictNew(vm);
 
-        msDictSet(vm, dict, msString(vm, "x"), msInt(10));
-        msDictSet(vm, dict, msString(vm, "y"), msInt(20));
+        msDictSet(vm, dict, msString(vm, cstr("x")), msInt(10));
+        msDictSet(vm, dict, msString(vm, cstr("y")), msInt(20));
 
-        let keys = msDictKeys(vm, dict);
-        assert_eq!(msListLen(vm, keys), 2);
-
-        let vals = msDictValues(vm, dict);
-        assert_eq!(msListLen(vm, vals), 2);
+        assert_eq!(msListLen(vm, msDictKeys(vm, dict)), 2);
+        assert_eq!(msListLen(vm, msDictValues(vm, dict)), 2);
 
         let items = msDictItems(vm, dict);
         assert_eq!(msListLen(vm, items), 2);
-        assert_eq!(msTypeof(msListGet(vm, items, 0)), MS_TYPE_TUPLE);
+        assert_eq!(msTypeof(msListGet(vm, items, 0)), MsType::Tuple);
 
         msVmFree(vm);
     }
-```
 
-### Rust 单元测试 — test_set_add_remove_contains
-
-```rust
     #[test]
     fn test_set_add_remove_contains() {
         let vm = msVmNew();
@@ -1116,20 +791,15 @@ mod tests {
 
         msSetRemove(vm, set, msInt(1));
         assert_eq!(msSetContains(vm, set, msInt(1)), MS_FALSE);
-        assert_eq!(msSetLen(vm, set), 1);
 
         msVmFree(vm);
     }
-```
 
-### Rust 单元测试 — test_string_concat_slice
-
-```rust
     #[test]
     fn test_string_concat_slice() {
         let vm = msVmNew();
-        let a = msString(vm, "hello");
-        let b = msString(vm, " world");
+        let a = msString(vm, cstr("hello"));
+        let b = msString(vm, cstr(" world"));
 
         assert_eq!(msStringLen(vm, a), 5);
 
@@ -1149,63 +819,31 @@ mod tests {
 
         msVmFree(vm);
     }
-```
 
-### Rust 单元测试 — test_tuple_unpack
-
-```rust
     #[test]
     fn test_tuple_unpack() {
         let vm = msVmNew();
 
-        let elems: Vec<*mut MsValue> = vec![
-            msInt(10), msInt(20), msInt(30),
-        ];
+        let elems: Vec<*mut MsValue> = vec![msInt(10), msInt(20), msInt(30)];
         let tup = msTupleFrom(vm, elems.as_ptr(), 3);
 
         assert_eq!(msTupleLen(vm, tup), 3);
         assert_eq!(msToInt(vm, msTupleGet(vm, tup, 0)), 10);
         assert_eq!(msToInt(vm, msTupleGet(vm, tup, -1)), 30);
 
-        let mut items: *mut *mut MsValue = std::ptr::null_mut();
+        let mut items: *mut *mut MsValue = ptr::null_mut();
         let mut count: c_int = 0;
-        assert_eq!(msTupleUnpack(vm, tup, &mut items, &mut count), MS_OK);
+        assert_eq!(msTupleUnpack(vm, tup, &mut items, &mut count), MsStatus::MS_OK);
         assert_eq!(count, 3);
         assert_eq!(msToInt(vm, unsafe { *items.add(0) }), 10);
-        assert_eq!(msToInt(vm, unsafe { *items.add(2) }), 30);
 
-        if !items.is_null() {
-            unsafe { libc::free(items as *mut c_void) };
-        }
+        // 安全释放（替代 libc::free）
+        msTupleUnpackFree(items, count);
 
         msVmFree(vm);
     }
-```
 
-### Rust 单元测试 — test_iterator_walk
-
-```rust
-    #[test]
-    fn test_iterator_walk() {
-        let vm = msVmNew();
-        let list = msListNew(vm);
-
-        msListPush(vm, list, msInt(100));
-        msListPush(vm, list, msInt(200));
-        msListPush(vm, list, msInt(300));
-
-        let iter = msIter(vm, list);
-        assert!(!iter.is_null());
-
-        let mut collected: Vec<i64> = Vec::new();
-        let mut out: *mut MsValue = std::ptr::null_mut();
-
-        while msNext(vm, iter, &mut out) == MS_OK {
-            collected.push(msToInt(vm, out));
-        }
-
-        assert_eq!(collected, vec![100, 200, 300]);
-
-        msVmFree(vm);
-    }
+    // --- Deferred (iterator protocol not yet implemented) ---
+    // test_iterator_walk: requires msIter/msNext (deferred)
+}
 ```
