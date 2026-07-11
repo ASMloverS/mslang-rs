@@ -10,6 +10,14 @@ Cargo.lock
 *.dylib
 *.a
 *.lib
+*.obj
+*.ilk
+*.exp
+*.pdb
+
+# CMake build artifacts
+tests/capi/build/
+tests/capi/Testing/
 
 # Editor / IDE
 *.swp
@@ -34,3 +42,4 @@ coverage/
 # Claude & Agent
 .claude
 .opencode
+.github
