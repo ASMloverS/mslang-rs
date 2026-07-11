@@ -6,11 +6,12 @@ Phase 6 — 模块系统 + 标准库
 
 ## 前置任务
 
-65-capi-infrastructure, 66-capi-vm, 70-capi-call
+65-capi-infrastructure, 66-capi-vm, 68-capi-value-convert, 70-capi-call
 
 - **65-capi-infrastructure**：提供 `src/capi/` 模块框架、`#[cfg(feature = "capi")]` 编译门控、cbindgen 头文件生成流程
-- **66-capi-vm**：提供 `msVmNew` / `msVmFree` / `msExecString` 等 VM 生命周期 API，以及 VM 内部结构的 C API 访问能力
-- **70-capi-call**：提供 `msCall` / `msCallAsync` 及 `MsCFunction` / `MsAsyncFunction` 类型包装，本任务复用其 `NativeFunction` / `NativeAsyncFunction` 构建逻辑
+- **66-capi-vm**：提供 `msVmNew` / `msVmFree` / `msExecString` 等 VM 生命周期 API，以及 `lock_vm` / `VmInner` 访问模式
+- **68-capi-value-convert**：提供 `MsValue { inner: Object }` 包装、`msValueFree`
+- **70-capi-call**：提供 `alloc_c_native_function`（`src/vm/builtins.rs:115`）将 `MsCFunction` 包装为 `MsCNativeFunction` 堆对象（`TypeTag::NATIVE_C_FUNCTION`）
 
 ## 目标
 
@@ -128,11 +129,18 @@ pub struct MsModuleDef {
 }
 ```
 
-`MsCFunction` 和 `MsAsyncFunction` 在 Task 70（call）中已定义，此处 `use` 引入。
+`MsCFunction` 在 `src/capi/types.rs`（Task 65）中已定义。此处定义的
+`#[repr(C)]` 结构体由 cbindgen 自动生成到 `module.h`（types.h:123-124
+注释已预留）。确保 cbindgen.toml 的 `[export] exclude` 不排除这些类型。
 
 ### 2. msRegisterModule
 
 ```rust
+use crate::capi::vm::{lock_vm, MsVM};
+use crate::capi::types::{MsCFunction, MsStatus, MsValue};
+use crate::vm::object::{alloc_module, alloc_c_native_function, read_module_mut, Object, TypeTag};
+use crate::vm::builtins::alloc_c_native_function;
+
 #[no_mangle]
 pub extern "C" fn msRegisterModule(
     vm: *mut MsVM,
@@ -142,8 +150,8 @@ pub extern "C" fn msRegisterModule(
         return MsStatus::MS_ERROR;
     }
 
-    let vm_inner = unsafe { &mut *get_vm_inner(vm) };
-    let _lock = vm_inner.lock();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
     let def_ref = unsafe { &*def };
 
@@ -151,20 +159,31 @@ pub extern "C" fn msRegisterModule(
         .to_string_lossy()
         .into_owned();
 
-    // 创建 Module 对象
-    let module = create_module_object(&module_name);
+    // 重复注册检查
+    if inner.vm.module_resolver.native_modules.contains_key(&module_name) {
+        return MsStatus::MS_ERROR;
+    }
+
+    // 创建 Module 堆对象（TypeTag::MODULE）
+    let module_obj = alloc_module(&module_name);
+    let module_ptr = match module_obj {
+        Object::Ref(p) => p,
+        _ => return MsStatus::MS_ERROR,
+    };
 
     // 注册方法：遍历 methods 直到 NULL 终止
+    const MAX_EXPORTS: usize = 1024;
     if !def_ref.methods.is_null() {
         let mut ptr = def_ref.methods;
         unsafe {
-            while !(*ptr).name.is_null() {
+            for _ in 0..MAX_EXPORTS {
+                if (*ptr).name.is_null() { break; }
                 let method_name = CStr::from_ptr((*ptr).name)
                     .to_string_lossy()
                     .into_owned();
                 if let Some(func) = (*ptr).func {
-                    let native_fn = wrap_native_function(func);
-                    module.add_method(method_name, native_fn);
+                    let fn_obj = alloc_c_native_function(&method_name, func, -1);
+                    read_module_mut(module_ptr).exports.insert(method_name, fn_obj);
                 }
                 ptr = ptr.add(1);
             }
@@ -175,31 +194,33 @@ pub extern "C" fn msRegisterModule(
     if !def_ref.consts.is_null() {
         let mut ptr = def_ref.consts;
         unsafe {
-            while !(*ptr).name.is_null() {
+            for _ in 0..MAX_EXPORTS {
+                if (*ptr).name.is_null() { break; }
                 let const_name = CStr::from_ptr((*ptr).name)
                     .to_string_lossy()
                     .into_owned();
-                let val = (*ptr).val;
-                if !val.is_null() {
-                    module.add_const(const_name, val);
+                if !(*ptr).val.is_null() {
+                    let val_obj = (*(*ptr).val).inner.clone();
+                    read_module_mut(module_ptr).exports.insert(const_name, val_obj);
                 }
                 ptr = ptr.add(1);
             }
         }
     }
 
-    // 注册到 VM 模块缓存
-    vm_inner.register_module(module_name, module);
+    // 注册到 VM 的原生模块表
+    inner.vm.module_resolver.native_modules.insert(module_name, module_ptr);
 
     MsStatus::MS_OK
 }
 ```
 
 关键点：
-- `wrap_native_function` 复用 Task 70 的逻辑，将 `MsCFunction` 函数指针包装为 VM 内部的 `NativeFunction` 对象
-- `create_module_object` 创建一个新的 Module 内部对象（设置 `TypeTag::MODULE`）
-- `vm_inner.register_module` 将模块存入 VM 的模块缓存（`HashMap<String, ModuleRef>`）
-- 方法遍历以 `name == NULL` 为终止条件，与 C 侧 NULL 终止数组约定一致
+- `alloc_c_native_function` 复用 Task 70 的逻辑（`src/vm/builtins.rs:115`），arity = -1 表示可变参数
+- `alloc_module` 创建 MsModule 堆对象（`src/vm/object.rs:1029`）
+- `read_module_mut` 直接操作 MsModule.exports（`src/vm/object.rs:1059`）
+- 注册到 `inner.vm.module_resolver.native_modules`（`src/module/resolver.rs:41`），使 `import` 可命中
+- `MAX_EXPORTS` 防止缺少 NULL 终止符时的无限遍历
 
 ### 3. msModuleNew
 
@@ -210,26 +231,25 @@ pub extern "C" fn msModuleNew(
     name: *const c_char,
 ) -> *mut MsValue {
     if vm.is_null() || name.is_null() {
-        return null_mut();
+        return std::ptr::null_mut();
     }
 
-    let vm_inner = unsafe { &mut *get_vm_inner(vm) };
-    let _lock = vm_inner.lock();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
     let module_name = unsafe { CStr::from_ptr(name) }
         .to_string_lossy()
         .into_owned();
 
-    let module = create_module_object(&module_name);
-    allocate_value(vm_inner, module)
+    let module_obj = alloc_module(&module_name);
+    Box::into_raw(Box::new(MsValue { inner: module_obj }))
 }
 ```
 
-- 创建空 Module 对象（仅含 name，无方法和常量）
-- 返回 `MsValue*` 指针，调用方后续通过 `msModuleAddFunc` / `msModuleAddConst` 填充内容
-- 返回的值已被 GC 追踪，调用方如需跨调用帧持有应 `msRoot`
+- 返回 `MsValue*`（Object::Ref → TypeTag::MODULE），调用方后续通过 `msModuleAddFunc` / `msModuleAddConst` 填充 exports
+- 返回的 MsValue\* 由 Box 管理，调用方应 `msRoot` 或及时 `msValueFree`
 
-### 4. msModuleAddFunc / msModuleAddAsyncFunc
+### 4. msModuleAddFunc
 
 ```rust
 #[no_mangle]
@@ -237,34 +257,38 @@ pub extern "C" fn msModuleAddFunc(
     vm: *mut MsVM,
     mod_val: *mut MsValue,
     name: *const c_char,
-    fn_ptr: Option<MsCFunction>,
+    fn_ptr: MsCFunction,
 ) -> MsStatus {
     if vm.is_null() || mod_val.is_null() || name.is_null() {
         return MsStatus::MS_ERROR;
     }
-
-    let vm_inner = unsafe { &mut *get_vm_inner(vm) };
-    let _lock = vm_inner.lock();
 
     let func_name = unsafe { CStr::from_ptr(name) }
         .to_string_lossy()
         .into_owned();
 
     let native_fn = match fn_ptr {
-        Some(f) => wrap_native_function(f),
+        Some(f) => alloc_c_native_function(&func_name, f, -1),
         None => return MsStatus::MS_ERROR,
     };
 
-    let module = unsafe { &mut *get_module_inner(mod_val) };
-    module.add_method(func_name, native_fn);
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    MsStatus::MS_OK
+    // 类型校验：mod_val 必须为 MODULE
+    match &unsafe { &*mod_val }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::MODULE as u8 => {
+            unsafe { read_module_mut(*ptr) }.exports.insert(func_name, native_fn);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
 }
 ```
 
-`msModuleAddAsyncFunc` 结构相同，区别在于：
-- 参数类型为 `Option<MsAsyncFunction>`
-- 调用 `wrap_native_async_function`（Task 70）包装为 `NativeAsyncFunction`
+> **msModuleAddAsyncFunc**：异步函数注册依赖 `MsAsyncFunction` 桥接和
+> `msCallAsync`（task 76）。本任务 MVP 不实现，返回 `MS_ERROR` 占位
+> 或标注为 `#[cfg(feature = "capi")] fn msModuleAddAsyncFunc(...) -> MsStatus { MS_ERROR }`。
 
 ### 5. msModuleAddConst
 
@@ -280,17 +304,21 @@ pub extern "C" fn msModuleAddConst(
         return MsStatus::MS_ERROR;
     }
 
-    let vm_inner = unsafe { &mut *get_vm_inner(vm) };
-    let _lock = vm_inner.lock();
-
     let const_name = unsafe { CStr::from_ptr(name) }
         .to_string_lossy()
         .into_owned();
+    let val_obj = unsafe { (*val).inner.clone() };
 
-    let module = unsafe { &mut *get_module_inner(mod_val) };
-    module.add_const(const_name, val);
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    MsStatus::MS_OK
+    match &unsafe { &*mod_val }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::MODULE as u8 => {
+            unsafe { read_module_mut(*ptr) }.exports.insert(const_name, val_obj);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
 }
 ```
 
@@ -306,19 +334,20 @@ pub extern "C" fn msRegisterModuleValue(
         return MsStatus::MS_ERROR;
     }
 
-    let vm_inner = unsafe { &mut *get_vm_inner(vm) };
-    let _lock = vm_inner.lock();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    let module = unsafe { &mut *get_module_inner(mod_val) };
-    let module_name = module.name().to_owned();
-
-    // 检查是否已注册同名模块
-    if vm_inner.is_module_registered(&module_name) {
-        return MsStatus::MS_ERROR;
+    match &unsafe { &*mod_val }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::MODULE as u8 => {
+            let module_name = unsafe { read_module(*ptr) }.name.clone();
+            if inner.vm.module_resolver.native_modules.contains_key(&module_name) {
+                return MsStatus::MS_ERROR;
+            }
+            inner.vm.module_resolver.native_modules.insert(module_name, *ptr);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
     }
-
-    vm_inner.register_module(module_name, module);
-    MsStatus::MS_OK
 }
 ```
 
@@ -328,14 +357,15 @@ pub extern "C" fn msRegisterModuleValue(
 
 #### 7.1 Cargo.toml 变更
 
-在 `[dependencies]` 下添加：
+将 `libloading` 作为 optional dependency，通过 capi feature 启用：
 
 ```toml
-[target.'cfg(feature = "capi")'.dependencies]
-libloading = "0.8"
-```
+[dependencies]
+libloading = { version = "0.8", optional = true }
 
-`libloading` 仅在 `capi` feature 启用时引入。
+[features]
+capi = ["dep:libloading"]
+```
 
 #### 7.2 平台库文件名格式
 
@@ -353,17 +383,18 @@ fn format_native_lib_name(name: &str) -> String {
 
 #### 7.3 模块搜索路径
 
-复用 Task 45 的 `ModuleResolver::search_paths`，在此基础上追加动态库搜索：
+VmInner 的 `module_paths` 为 `Vec<String>`（`src/capi/vm.rs:40`）。
+ModuleResolver 的 `search_paths` 为 `Vec<PathBuf>`（`src/module/resolver.rs:30`）。
+动态库搜索复用 ModuleResolver.search_paths：
 
 ```rust
-fn search_native_module_paths(
+fn search_native_module(
     search_paths: &[PathBuf],
     lib_filename: &str,
-) -> Vec<PathBuf> {
+) -> Option<PathBuf> {
     search_paths.iter()
         .map(|p| p.join(lib_filename))
-        .filter(|p| p.exists())
-        .collect()
+        .find(|p| p.exists())
 }
 ```
 
@@ -373,31 +404,28 @@ fn search_native_module_paths(
 fn load_native_module(
     vm: *mut MsVM,
     name: &str,
-) -> Result<*mut MsValue, String> {
-    let vm_inner = unsafe { &mut *get_vm_inner(vm) };
-
+) -> Result<(), String> {
     let lib_filename = format_native_lib_name(name);
-    let candidates = search_native_module_paths(
-        &vm_inner.module_paths(),
+
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+
+    let path = search_native_module(
+        &inner.vm.module_resolver.search_paths,
         &lib_filename,
-    );
+    ).ok_or_else(|| format!("native module '{}' not found", name))?;
 
-    if candidates.is_empty() {
-        return Err(format!("native module '{}' not found", name));
-    }
-
-    let path = &candidates[0];
+    drop(guard); // 释放锁，dlopen 可能耗时长
 
     let lib = unsafe {
-        libloading::Library::new(path)
+        libloading::Library::new(&path)
             .map_err(|e| format!("cannot load '{}': {}", path.display(), e))?
     };
 
     let init_fn: libloading::Symbol<unsafe extern "C" fn(*mut MsVM) -> *const MsModuleDef> =
         unsafe {
             lib.get(b"msModuleInit\0")
-                .map_err(|e| format!("symbol 'msModuleInit' not found in '{}': {}",
-                    path.display(), e))?
+                .map_err(|e| format!("symbol 'msModuleInit' not found: {}", e))?
         };
 
     let def_ptr = unsafe { init_fn(vm) };
@@ -410,115 +438,80 @@ fn load_native_module(
         return Err("msRegisterModule failed".into());
     }
 
-    // 保持库句柄存活，防止卸载
-    vm_inner.add_loaded_library(lib);
+    // 保持库句柄存活：存入 VM 的 loaded_libs，生命周期与 VM 相同
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    inner.vm.loaded_libs.push(lib);
 
-    let module_name = name.to_owned();
-    Ok(vm_inner.get_cached_module(&module_name)
-        .ok_or_else(|| "module not found after registration".to_string())?)
+    Ok(())
 }
 ```
 
 关键设计决策：
-- `lib` 句柄存入 `vm_inner.loaded_libs: Vec<libloading::Library>`，生命周期与 VM 相同
-- 找到第一个匹配的动态库即加载，不继续搜索
-- 入口函数返回 NULL 视为错误
+- `lib` 句柄存入 `VM.loaded_libs: Vec<libloading::Library>`，生命周期与 VM 相同（msVmFree 时 drop）
+- `Library` 必须存活以保持 C 函数指针有效（MsCNativeFunction 存储裸指针，不持有 Library 引用）
+- 加载前先 drop guard 释放锁（dlopen 可能耗时长），注册时重新获取锁
 
-#### 7.5 与模块系统（Task 45）集成
+#### 7.5 与 VM::load_module 集成
 
-在 `ModuleResolver::load` 中，`.ms` 文件查找失败后，尝试动态库加载：
+在 `VM::load_module`（`src/vm/mod.rs:3181`）中，`native_modules` 查找和
+`.ms` 文件查找都失败后，尝试动态库加载：
 
 ```rust
-impl ModuleResolver {
-    pub fn load(&mut self, name: &str, vm: *mut MsVM) -> Result<ModuleRef, ModuleError> {
-        // 1. 检查缓存
-        if let Some(m) = self.cache.get(name) {
-            return Ok(m.clone());
+// src/vm/mod.rs — VM::load_module 中，resolve() 失败后添加：
+#[cfg(feature = "capi")]
+{
+    if let Ok(()) = crate::capi::module::load_native_module(
+        self.capi_vm_ptr as *mut crate::capi::vm::MsVM,
+        mod_name,
+    ) {
+        // load_native_module 内部已注册到 native_modules
+        if let Some(&ptr) = self.module_resolver.native_modules.get(mod_name) {
+            return Ok(ptr);
         }
-
-        // 2. 搜索 .ms 文件
-        if let Some(path) = self.resolve(name) {
-            return self.load_ms_file(&path, vm);
-        }
-
-        // 3. 搜索原生动态库（fallback）
-        #[cfg(feature = "capi")]
-        {
-            if let Ok(module_val) = load_native_module(vm, name) {
-                // load_native_module 内部已注册到缓存
-                return self.cache.get(name)
-                    .cloned()
-                    .ok_or(ModuleError::NotFound(name.to_owned()));
-            }
-        }
-
-        Err(ModuleError::NotFound(name.to_owned()))
     }
 }
 ```
 
 `#[cfg(feature = "capi")]` 门控确保不启用 capi 时不引入 libloading 依赖。
 
+> **注意**：`load_native_module` 内部调用 `lock_vm(vm)` 加锁，但
+> `VM::load_module` 由 VM 内部调用（已在 C API 层加锁或纯 Rust 调用）。
+> 纯 Rust 调用时 `capi_vm_ptr` 为 null，此时动态库加载跳过（仅 C API 上下文可用）。
+
 ### 8. VM 内部结构扩展
 
-VM 内部需新增以下字段以支持本任务：
+在 `VM` 结构体中新增字段（`src/vm/mod.rs`）：
 
 ```rust
-struct VmInner {
+pub struct VM {
     // ... 已有字段 ...
 
-    /// 已加载的模块缓存（Task 45 已定义）
-    modules: HashMap<String, *mut MsValueInner>,
-
-    /// 已加载的动态库句柄，生命周期与 VM 相同
+    /// 已加载的动态库句柄，生命周期与 VM 相同。
+    /// Library 必须存活以保持 C 函数指针有效。
     #[cfg(feature = "capi")]
-    loaded_libs: Vec<libloading::Library>,
-
-    /// 模块搜索路径（Task 45 已定义，本任务复用）
-    module_paths: Vec<PathBuf>,
+    pub loaded_libs: Vec<libloading::Library>,
 }
 ```
 
-新增方法：
-
-```rust
-impl VmInner {
-    fn register_module(&mut self, name: String, module: *mut MsValueInner) { ... }
-    fn is_module_registered(&self, name: &str) -> bool { ... }
-    fn get_cached_module(&self, name: &str) -> Option<*mut MsValue> { ... }
-
-    #[cfg(feature = "capi")]
-    fn add_loaded_library(&mut self, lib: libloading::Library) {
-        self.loaded_libs.push(lib);
-    }
-}
-```
+`VM::new()` 中初始化为 `Vec::new()`。模块注册通过已有的
+`module_resolver.native_modules: HashMap<String, *mut MsObjHeader>`
+（`src/module/resolver.rs:41`），无需新增字段。
 
 ### 9. 辅助函数
 
-```rust
-/// 从 MsValue* 提取内部 Module 对象指针
-fn get_module_inner(val: *mut MsValue) -> *mut MsValueInner {
-    unsafe { (*val).inner }
-}
+本任务的辅助函数已在 §2–§6 的代码中内联，无需独立的 helper 模块：
 
-/// 创建 Module 对象并包装为 MsValueInner
-fn create_module_object(name: &str) -> *mut MsValueInner {
-    // 分配 MsValueInner，设置 TypeTag::MODULE
-    // 内部含 name: String, methods: HashMap<String, ...>, consts: HashMap<String, ...>
-    ...
-}
-
-/// 将 MsCFunction 包装为 VM 内部的 NativeFunction 对象
-fn wrap_native_function(func: MsCFunction) -> NativeFunction {
-    // 复用 Task 70 的包装逻辑
-    ...
-}
-```
+- 模块创建：`alloc_module(name)` → `Object::Ref`（`src/vm/object.rs:1029`）
+- C 函数包装：`alloc_c_native_function(name, func, arity)` → `Object::Ref`（`src/vm/builtins.rs:115`）
+- 模块读写：`read_module(ptr)` / `read_module_mut(ptr)`（`src/vm/object.rs:1050/1059`）
+- 模块注册：`inner.vm.module_resolver.native_modules.insert(name, ptr)`
 
 ### 10. module.h 头文件
 
-cbindgen 从 `src/capi/module.rs` 的 `#[no_mangle] pub extern "C"` 函数自动生成。Task 65 的 `build.rs` 已配置 `module` → `module.h` 的生成规则。
+cbindgen 从 `src/capi/module.rs` 的 `#[repr(C)]` 结构体（MsFuncDef/MsConstDef/MsModuleDef）
+和 `#[no_mangle] pub extern "C"` 函数自动生成。Task 65 的 `build.rs` 已配置
+`module` → `module.h` 的生成规则。
 
 生成后取消 `include/mslang/mslang.h` 中 `module.h` 的注释：
 
@@ -530,15 +523,16 @@ cbindgen 从 `src/capi/module.rs` 的 `#[no_mangle] pub extern "C"` 函数自动
 
 1. `msRegisterModule` 传入包含 2 个函数和 1 个常量的 `MsModuleDef`，注册成功，mslang 脚本可 `import` 并调用
 2. `msModuleNew` + `msModuleAddFunc` + `msModuleAddConst` + `msRegisterModuleValue` 动态构建的模块可被 mslang 脚本正常导入使用
-3. `msModuleAddAsyncFunc` 注册的异步函数可通过 `msCallAsync` 调用，返回 Future
+3. ~~`msModuleAddAsyncFunc` 注册的异步函数可通过 `msCallAsync` 调用~~（**Deferred to task 76**，本任务 `msModuleAddAsyncFunc` 为占位实现）
 4. 模块常量（`MsConstDef`）可从 mslang 脚本通过 `module.CONST_NAME` 访问
 5. 动态库加载：编译一个 C 扩展为 `.dll` / `.so`，`import` 时自动搜索、加载、调用 `msModuleInit`，模块功能可用
 6. 动态库加载在库文件不存在时返回错误，不崩溃
 7. `msModuleInit` 返回 NULL 时，加载失败并报告错误
 8. 同名模块重复注册返回 `MS_ERROR`，不覆盖已有模块
 9. 多个不同模块可同时注册且互不冲突
-10. `cargo build --features capi` 编译无错误，`cargo test --features capi` 通过
-11. 13-capi.md 中的完整扩展模块示例（fileio 模块）端到端工作正常
+10. `msModuleAddFunc`/`msModuleAddConst` 对非 Module 类型的 `MsValue*` 返回 `MS_ERROR`
+11. `cargo build --features capi` 编译无错误，`cargo test --features capi` 通过
+12. 13-capi.md 中的完整扩展模块示例（fileio 模块）端到端工作正常
 
 ## 测试用例
 
