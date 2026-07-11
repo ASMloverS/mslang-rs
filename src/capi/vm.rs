@@ -42,6 +42,8 @@ pub(crate) struct VmInner {
     args: Vec<String>,
     stdout_cb: Option<WriteCallback>,
     stderr_cb: Option<WriteCallback>,
+    /// task 74：C 侧 finalizer 注册表（msOnFinalize 注册、msGcCollect 时执行）。
+    pub(crate) c_finalizers: Vec<crate::capi::gc::CFinalizerEntry>,
 }
 
 /// 不透明 VM 句柄（C 侧 `typedef struct MsVM MsVM`）。
@@ -82,6 +84,7 @@ pub extern "C" fn msVmNew() -> *mut MsVM {
         args: Vec::new(),
         stdout_cb: None,
         stderr_cb: None,
+        c_finalizers: Vec::new(),
     };
     let vm = Box::new(MsVM {
         inner: ReentrantMutex::new(UnsafeCell::new(inner)),

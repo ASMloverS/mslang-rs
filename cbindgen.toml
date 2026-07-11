@@ -18,7 +18,11 @@ exclude = [
     "MsValue",
     "MsVM",
     "MsGcType",
+    "MsGcStats",
     "MsFutureState",
+    "MsWriteFn",
+    "MsWriteFnRaw",
+    "Option_MsWriteFnRaw",
 ]
 
 [fn]

@@ -1,5 +1,5 @@
-#ifndef MSLANG_GENERATED_H
-#define MSLANG_GENERATED_H
+#ifndef MSLANG_VM_H
+#define MSLANG_VM_H
 
 /* Generated with cbindgen:0.26.0 */
 
@@ -29,13 +29,6 @@
  * 默认晋升年龄。
  */
 #define DEFAULT_PROMOTION_AGE 2
-
-struct Option_MsWriteFnRaw;
-
-/**
- * 与 C 侧 `MsWriteFn` 对应：可为 NULL 的函数指针。
- */
-typedef struct Option_MsWriteFnRaw MsWriteFn;
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
@@ -318,10 +311,6 @@ MS_API int msIsFunction(MsValue *val);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 MS_API int msIsClass(MsValue *val);
-#endif
-
-#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
-MS_API int msIsInstance(MsValue *val);
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
@@ -842,6 +831,38 @@ MS_API MsStatus msRegisterModuleValue(MsVM *vm, MsValue *mod_val);
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msGetClass(MsVM *vm, const int8_t *name);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msInstanceNew(MsVM *vm, MsValue *cls, MsValue *const *args, int nargs);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msInstanceGet(MsVM *vm, MsValue *obj, const int8_t *attr);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msInstanceSet(MsVM *vm, MsValue *obj, const int8_t *attr, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msIsInstance(MsVM *vm, MsValue *obj, MsValue *cls);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msClassDefine(MsVM *vm, const int8_t *name, MsValue *parent);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msClassAddMethod(MsVM *vm, MsValue *cls, const int8_t *name, MsCFunction method);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msClassAddStatic(MsVM *vm, MsValue *cls, const int8_t *name, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
  * 将对象注册为 GC 根，返回 `val` 本身。注册后 GC 不会回收此对象。
  * 仅对 Ref 类型（堆对象）有效。内联值为安全 no-op。NULL 安全。
@@ -857,4 +878,84 @@ MS_API MsValue *msRoot(MsVM *vm, MsValue *val);
 MS_API void msUnroot(MsVM *vm, MsValue *val);
 #endif
 
-#endif /* MSLANG_GENERATED_H */
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 写屏障。MVP STW GC 无并发标记，此处为 no-op（仅指针非空校验）。
+ * Phase 7.5 升级为快照-at-the-barrier。
+ */
+MS_API void msWriteBarrier(MsVM *vm, MsValue *parent, MsValue *new_val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 注册 C finalizer 回调。对象被 GC 回收前在 mutator 线程中调用回调。
+ * MsFinalizerFn 签名：`void (*)(MsVM* vm, MsValue* obj, void* userdata)`。
+ *
+ * 失败时（vm/obj 为 NULL、obj 非 Ref 类型、fn 为 NULL）返回 MS_ERROR。
+ */
+MS_API
+MsStatus msOnFinalize(MsVM *vm,
+                      MsValue *obj,
+                      void (*fn_ptr)(MsVM*, MsValue*, void*),
+                      void *userdata);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 按 MsGcType 触发 GC（Minor / Major / Full）。手动触发不受 gc_enabled 影响。
+ */
+MS_API void msGcCollect(MsVM *vm, MsGcType gc_type);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 启用（enable=1）或禁用（enable=0）自动 GC。
+ */
+MS_API void msGcEnable(MsVM *vm, int32_t enable);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回当前自动 GC 状态（1=启用，0=禁用）。
+ */
+MS_API int32_t msGcIsEnabled(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 设置 GC 触发阈值。
+ * - MS_GC_MAJOR / MS_GC_FULL：threshold 为 Old GC 触发比率
+ * - MS_GC_MINOR：threshold 为 Young 代大小（MB），clamp [0.5, 64.0]
+ */
+MS_API void msGcSetThreshold(MsVM *vm, MsGcType gc_type, double threshold);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 设置晋升年龄（1-3，超出范围被 clamp）。默认值为 2。
+ */
+MS_API void msGcSetPromotionAge(MsVM *vm, uint32_t age);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 设置 GC 线程数（MVP 仅存储不使用；Phase 7.5 控制 Worker 线程池）。
+ */
+MS_API void msGcSetGcThreads(MsVM *vm, uint32_t threads);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 启用/禁用 GC 调试模式。仅 debug_assertions 构建中有实际效果。
+ */
+MS_API void msGcSetDebug(MsVM *vm, int32_t enable);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 GC 统计快照。NULL vm 返回全零 MsGcStats。
+ */
+MS_API MsGcStats msGcStats(MsVM *vm);
+#endif
+
+#endif /* MSLANG_VM_H */

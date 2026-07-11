@@ -74,3 +74,31 @@ pub type MsAsyncFunction = Option<
         *mut MsValue,
     ),
 >;
+
+/// GC 类型枚举（与 types.h 中 MsGcType 对应）。
+/// task 74 在 Rust 侧匹配 types.h 手写定义；放在 types.rs 而非 gc.rs，
+/// 避免 cbindgen with_src(gc.rs) 重复输出到 gc.h。
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum MsGcType {
+    MS_GC_MINOR = 0,
+    MS_GC_MAJOR = 1,
+    MS_GC_FULL = 2,
+}
+
+/// GC 统计结构（与 types.h 中 MsGcStats 对应）。
+/// task 74 在 Rust 侧匹配 types.h 手写定义（camelCase 字段）。
+/// `#[repr(C)]` 保证字段顺序与类型匹配；Rust snake_case 与 C camelCase 不影响布局。
+#[repr(C)]
+#[derive(Default, Clone)]
+pub struct MsGcStats {
+    pub minor_gc_count: u64,
+    pub major_gc_count: u64,
+    pub total_pause_ns: u64,
+    pub last_pause_ns: u64,
+    pub young_size: u64,
+    pub old_size: u64,
+    pub los_size: u64,
+    pub bytes_freed: u64,
+}

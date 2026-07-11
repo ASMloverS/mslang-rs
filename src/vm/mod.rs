@@ -119,7 +119,8 @@ pub struct VM {
     gen_call_method: Option<u8>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
-    heap: gc::MsHeap,
+    /// task 74：pub(crate) 供 capi::gc 的 GC 控制/统计/finalizer API 直接访问。
+    pub(crate) heap: gc::MsHeap,
     /// task 42：隐式 Object 基类（Immortal 代）。无显式父类的类在 CLASS handler
     /// 中自动链接至此；提供默认 __repr__/__eq__/__ne__。
     pub(crate) object_class: *mut MsObjHeader,
@@ -336,6 +337,18 @@ impl VM {
         gc::run_finalizers(&mut self.heap);
     }
 
+    /// task 74：仅 Major GC + finalizers（供 msGcCollect(MS_GC_MAJOR) 调用）。
+    pub fn gc_major_only(&mut self) {
+        gc::major_gc(
+            &mut self.heap,
+            &self.stack,
+            &self.globals,
+            &self.defer_stack,
+            &self.call_stack,
+        );
+        gc::run_finalizers(&mut self.heap);
+    }
+
     // ---- task 66：C API 访问器 ----
 
     /// 全局变量表只读引用（供 capi::vm 的 msGetGlobal 使用）。
@@ -354,6 +367,42 @@ impl VM {
         &mut self,
     ) -> &mut std::collections::HashSet<*mut MsObjHeader> {
         &mut self.c_roots
+    }
+
+    /// task 74：检查对象是否从 GC 根集（stack + globals + c_roots + call_stack
+    /// current_exc）可达。用于 C finalizer 的可达性判定。
+    /// 注意：此为浅层检查（不遍历对象图），覆盖 MVP test 用例。
+    #[cfg(feature = "capi")]
+    pub(crate) fn is_obj_reachable(&self, header: *mut MsObjHeader) -> bool {
+        // stack
+        for v in self.stack.iter() {
+            if let Object::Ref(r) = v {
+                if *r == header {
+                    return true;
+                }
+            }
+        }
+        // globals
+        for v in self.globals.values() {
+            if let Object::Ref(r) = v {
+                if *r == header {
+                    return true;
+                }
+            }
+        }
+        // c_roots
+        if self.c_roots.contains(&header) {
+            return true;
+        }
+        // call_stack current_exc
+        for frame in &self.call_stack {
+            if let Some(Object::Ref(r)) = &frame.current_exc {
+                if *r == header {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

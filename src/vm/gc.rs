@@ -861,6 +861,11 @@ pub struct MsHeap {
     pub gc_enabled: bool,
     /// 用户经 gc.set_gc_threads 设置的偏好值（MVP STW 单线程，不生效；Phase 7.5 用）。
     pub gc_threads_setting: u32,
+    /// task 74：GC 调试模式（仅 debug_assertions 构建中由 msGcSetDebug 设置）。
+    /// 启用后 root/unroot 配对检查、类型标签校验、堆一致性验证。
+    /// MVP：存储不用（检查项随后续 task 落地）。
+    #[allow(dead_code)]
+    pub debug: bool,
 }
 
 impl MsHeap {
@@ -882,6 +887,7 @@ impl MsHeap {
             bytes_freed: 0,
             gc_enabled: true,
             gc_threads_setting: 1,
+            debug: false,
         }
     }
 

@@ -36,9 +36,15 @@ fn main() {
                 ];
 
                 for (module_name, filename) in &modules {
+                    // Each module header gets a unique include guard so that
+                    // mslang.h can include them all without one masking the rest.
+                    let guard_name = format!("MSLANG_{}_H", module_name.to_uppercase());
+                    let mut module_config = config.clone();
+                    module_config.include_guard = Some(guard_name);
+
                     let mut builder = cbindgen::Builder::new()
                         .with_crate(&crate_dir)
-                        .with_config(config.clone());
+                        .with_config(module_config);
 
                     // V3: use absolute path (based on crate_dir) to avoid CWD dependency.
                     let src_path = std::path::Path::new(&crate_dir)
@@ -58,10 +64,10 @@ fn main() {
                                 let patched = if content.contains("call_macros.h") {
                                     content
                                 } else {
-                                    let marker = "#endif /* MSLANG_GENERATED_H */";
+                                    let marker = "#endif /* MSLANG_CALL_H */";
                                     content.replace(
                                         marker,
-                                        "#include \"call_macros.h\"\n\n#endif /* MSLANG_GENERATED_H */",
+                                        "#include \"call_macros.h\"\n\n#endif /* MSLANG_CALL_H */",
                                     )
                                 };
                                 std::fs::write(&out_path, patched)
