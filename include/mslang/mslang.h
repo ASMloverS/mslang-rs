@@ -9,12 +9,12 @@
 
  #include "vm.h"
 
- /* #include "value.h"
-  * #include "call.h"
-  * #include "error.h"
+ /* #include "error.h"
   * #include "module.h"
   * #include "class.h"
   * #include "gc.h"
   */
+
+#include "call_macros.h"
 
 #endif /* MSLANG_H */

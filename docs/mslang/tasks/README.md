@@ -99,7 +99,7 @@
 | 67 | [C API — 值创建与类型判断](67-capi-value-creation.md) | ✅ |
 | 68 | [C API — 值转换、比较与通用操作](68-capi-value-convert.md) | ✅ |
 | 69 | [C API — 集合操作（List/Dict/Tuple/Set + 迭代器）](69-capi-collections.md) | ✅ |
-| 70 | [C API — 函数调用](70-capi-call.md) | ⬜ |
+| 70 | [C API — 函数调用](70-capi-call.md) | ✅ |
 | 71 | [C API — 异常处理](71-capi-error.md) | ⬜ |
 | 72 | [C API — C 扩展模块注册与动态加载](72-capi-module.md) | ⬜ |
 | 73 | [C API — Class 操作](73-capi-class.md) | ⬜ |

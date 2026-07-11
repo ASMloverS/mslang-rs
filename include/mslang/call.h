@@ -34,10 +34,32 @@ struct Option_MsWriteFnRaw;
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
+ * C 原生函数签名（与 types.h 中 `MsCFunction` 对应）。
+ * `Option` 表示可为 NULL（C 侧）。
+ */
+typedef MsValue *(*MsCFunction)(MsVM*, MsValue*const *, int32_t);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
  * 与 C 侧 `MsWriteFn` 对应：可为 NULL 的函数指针。
  */
 typedef struct Option_MsWriteFnRaw MsWriteFn;
 #endif
+
+/**
+ * 调用可调用对象，返回结果（新引用）。异常时返回 NULL。
+ *
+ * func 必须是可调用对象（Function、Closure、BoundMethod、C 原生函数，
+ * 或带 `__call__` 的 Instance）。可调用性由 VM `call_value` 内部 match 处理。
+ */
+MS_API MsValue *msCall(MsVM *vm, MsValue *func, MsValue *const *args, int nargs);
+
+/**
+ * 将 C 函数指针包装为 VM 可调用对象（MsValue*）。
+ * 返回的值可作为全局变量注册，供 mslang 脚本调用。
+ */
+MS_API MsValue *msMakeCFunction(MsVM *vm, const char *name, MsCFunction func, int arity);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 MS_API MsVM *msVmNew(void);
@@ -658,6 +680,24 @@ MS_API MsStatus msNext(MsVM *vm, MsValue *iterator, MsValue **out);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
+ * 调用可调用对象，返回结果（新引用）。异常时返回 NULL。
+ *
+ * func 必须是可调用对象（Function、Closure、BoundMethod、C 原生函数，
+ * 或带 `__call__` 的 Instance）。可调用性由 VM `call_value` 内部 match 处理。
+ */
+MS_API MsValue *msCall(MsVM *vm, MsValue *func, MsValue *const *args, int nargs);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 将 C 函数指针包装为 VM 可调用对象（MsValue*）。
+ * 返回的值可作为全局变量注册，供 mslang 脚本调用。
+ */
+MS_API MsValue *msMakeCFunction(MsVM *vm, const char *name, MsCFunction func, int arity);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
  * 将对象注册为 GC 根，返回 `val` 本身。注册后 GC 不会回收此对象。
  * 仅对 Ref 类型（堆对象）有效。内联值为安全 no-op。NULL 安全。
  */
@@ -671,5 +711,7 @@ MS_API MsValue *msRoot(MsVM *vm, MsValue *val);
  */
 MS_API void msUnroot(MsVM *vm, MsValue *val);
 #endif
+
+#include "call_macros.h"
 
 #endif /* MSLANG_GENERATED_H */

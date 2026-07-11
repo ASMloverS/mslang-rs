@@ -49,6 +49,7 @@ pub enum TypeTag {
     /// 文件句柄（task 46 新增）。MsFileHandle：path/mode/file 二级分配。
     /// 持 Rust 资源（std::fs::File），Immortal 代 + has_finalizer。
     FILE_HANDLE = 20,
+    NATIVE_C_FUNCTION = 21,
     LARGE_OBJECT = 0xFF,
 }
 

@@ -86,7 +86,12 @@ pub extern "C" fn msVmNew() -> *mut MsVM {
     let vm = Box::new(MsVM {
         inner: ReentrantMutex::new(UnsafeCell::new(inner)),
     });
-    Box::into_raw(vm)
+    let ptr = Box::into_raw(vm);
+    let guard = lock_vm(ptr);
+    let inner = unsafe { &mut *guard.get() };
+    inner.vm.capi_vm_ptr = ptr as *mut u8;
+    drop(guard);
+    ptr
 }
 
 #[no_mangle]

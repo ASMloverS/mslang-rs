@@ -739,6 +739,44 @@ static FILE_HANDLE_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<MsFileHandle>(),
 };
 
+// task 70：NATIVE_C_FUNCTION。Box 分配（alloc_c_native_function），未接入 GC 堆。
+// trace 为 noop（func/arity/name_ptr 为原始类型，无 Object 引用）。
+// free 回收 name_ptr 的 Box<[u8]> + MsCNativeFunction 主体。
+#[cfg(feature = "capi")]
+fn free_c_native_function(obj: *mut MsObjHeader) {
+    use crate::vm::builtins::MsCNativeFunction;
+    unsafe {
+        let h = Box::from_raw(obj as *mut MsCNativeFunction);
+        let name_fat =
+            std::ptr::slice_from_raw_parts_mut(h.name_ptr as *mut u8, h.name_len as usize);
+        drop(Box::from_raw(name_fat));
+    }
+}
+
+#[cfg(feature = "capi")]
+static NATIVE_C_FUNCTION_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::NATIVE_C_FUNCTION,
+    name: "native_c_function",
+    trace: trace_noop,
+    copy_for_gc: copy_placeholder,
+    forward_fields: forward_noop,
+    free: free_c_native_function,
+    finalize: None,
+    size_base: std::mem::size_of::<crate::vm::builtins::MsCNativeFunction>(),
+};
+
+#[cfg(not(feature = "capi"))]
+static NATIVE_C_FUNCTION_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::NATIVE_C_FUNCTION,
+    name: "native_c_function",
+    trace: trace_noop,
+    copy_for_gc: copy_placeholder,
+    forward_fields: forward_noop,
+    free: free_placeholder,
+    finalize: None,
+    size_base: std::mem::size_of::<MsObjHeader>(),
+};
+
 // FUNCTION/CLOSURE/ITERATOR/GENERATOR/FUTURE/CHANNEL/JOIN_HANDLE 在当前 Phase 2.5
 static PLACEHOLDER_DESC: TypeDescriptor = TypeDescriptor {
     type_tag: TypeTag::FUNCTION, // 占位 tag，实际查找不依赖此字段
@@ -771,6 +809,8 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::MODULE as u8 => &MODULE_DESC,
         // task 46：FILE_HANDLE（Immortal + finalizer）。trace/copy/free/defensive。
         t if t == TypeTag::FILE_HANDLE as u8 => &FILE_HANDLE_DESC,
+        // task 70：NATIVE_C_FUNCTION（Box 分配，未接入 GC 堆）→ 占位 noop。
+        t if t == TypeTag::NATIVE_C_FUNCTION as u8 => &NATIVE_C_FUNCTION_DESC,
         // 合法但当前未托管 TypeTag（6..=19 除 MODULE，与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。

@@ -144,6 +144,10 @@ pub struct VM {
     /// task 68：C API 错误消息占位（Task 71 完成后由 msThrowTypeError 取代）。
     #[cfg(feature = "capi")]
     pub(crate) error_message: String,
+    /// task 70：MsVM* 反向指针。C API 上下文运行时由 msVmNew 设置；
+    /// 纯 Rust 调用时为 null。call_value 的 NATIVE_C_FUNCTION 分支使用。
+    #[cfg(feature = "capi")]
+    pub capi_vm_ptr: *mut u8,
 }
 
 impl VM {
@@ -175,6 +179,8 @@ impl VM {
             has_error: false,
             #[cfg(feature = "capi")]
             error_message: String::new(),
+            #[cfg(feature = "capi")]
+            capi_vm_ptr: std::ptr::null_mut(),
         };
         vm.register_builtins();
         vm.init_object_class();
@@ -919,6 +925,13 @@ impl VM {
                     Object::Nil,
                 ))?;
             }
+            // task 70：C 原生函数（NATIVE_C_FUNCTION）— 桥接 C 函数调用。
+            #[cfg(feature = "capi")]
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag }
+                == TypeTag::NATIVE_C_FUNCTION as u8 =>
+            {
+                self.call_c_native(*ptr, argc, callee_idx)?;
+            }
             // task 40：用户类对象（CLASS）— `ClassName(args)` 构造实例并调用 __init__。
             Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
                 self.call_class(*ptr, argc)?;
@@ -1060,7 +1073,77 @@ impl VM {
         self.pop()
     }
 
-    /// task 43 §8：若 obj 是 Instance 且其类（沿继承链）定义了 `method_name`，
+    /// task 70：调用 C 原生函数（NATIVE_C_FUNCTION）。
+    /// 将栈上 Object 参数转为 MsValue* 数组传给 C 函数，回收参数包装，
+    /// 将返回的 MsValue* 转为 Object 并压栈。C 函数返回 NULL 表示异常。
+    #[cfg(feature = "capi")]
+    fn call_c_native(
+        &mut self,
+        ptr: *mut MsObjHeader,
+        argc: usize,
+        callee_idx: usize,
+    ) -> Result<(), String> {
+        use crate::capi::types::MsValue;
+        use crate::capi::vm::MsVM;
+        use crate::vm::builtins::read_c_native_function;
+
+        let (c_func, arity, name) = {
+            let cnf = unsafe { read_c_native_function(ptr) };
+            (cnf.func, cnf.arity, cnf.name().to_owned())
+        };
+
+        if arity >= 0 && arity as usize != argc {
+            return Err(format!(
+                "TypeError: {}() takes exactly {} argument{} but {} were given",
+                name,
+                arity,
+                if arity == 1 { "" } else { "s" },
+                argc,
+            ));
+        }
+
+        let arg_vals: Vec<Box<MsValue>> = self.stack[self.stack.len() - argc..]
+            .iter()
+            .map(|obj| Box::new(MsValue { inner: obj.clone() }))
+            .collect();
+        let arg_ptrs: Vec<*mut MsValue> = arg_vals
+            .iter()
+            .map(|b| b.as_ref() as *const MsValue as *mut MsValue)
+            .collect();
+
+        self.stack.truncate(callee_idx);
+
+        let c_fn = c_func.ok_or("TypeError: null C function pointer")?;
+        let result_ptr = c_fn(
+            self.capi_vm_ptr as *mut MsVM,
+            arg_ptrs.as_ptr(),
+            argc as i32,
+        );
+
+        drop(arg_vals);
+
+        if result_ptr.is_null() {
+            let msg = self.error_message.clone();
+            self.has_error = false;
+            self.error_message.clear();
+            let exc = alloc_exception(
+                "Error",
+                alloc_string(&msg),
+                alloc_string(""),
+                Object::Nil,
+            );
+            return self.throw(exc);
+        }
+
+        let result = unsafe { (*result_ptr).inner.clone() };
+        unsafe {
+            drop(Box::from_raw(result_ptr));
+        }
+        self.push(result)?;
+        Ok(())
+    }
+
+
     /// 调用 obj.method(args...) 并返回 Ok(Some(result))；否则返回 Ok(None)，
     /// 由调用方决定 fallback（内置运算）或报错。
     /// 复用 invoke_method（§8）：内部创建 BoundMethod、压参、call_value、嵌套 run_loop、

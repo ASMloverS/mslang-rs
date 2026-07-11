@@ -57,3 +57,9 @@ pub enum MsType {
     BoundMethod = 17,
     JoinHandle = 18,
 }
+
+/// C 原生函数签名（与 types.h 中 `MsCFunction` 对应）。
+/// `Option` 表示可为 NULL（C 侧）。MsVM 为不透明指针，使用裸指针类型。
+pub type MsCFunction = Option<
+    extern "C" fn(*mut crate::capi::vm::MsVM, *const *mut MsValue, i32) -> *mut MsValue,
+>;

@@ -81,6 +81,69 @@ pub unsafe fn read_native_function<'a>(ptr: *mut MsObjHeader) -> &'a MsNativeFun
     &*(ptr as *mut MsNativeFunction)
 }
 
+// ---------------------------------------------------------------------------
+// C 原生函数堆对象（task 70）
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "capi")]
+use crate::capi::types::MsCFunction;
+
+/// C 原生函数堆对象（TypeTag::NATIVE_C_FUNCTION）。
+/// 与 `MsNativeFunction` 分离：C 函数签名不兼容 Rust `NativeFn`。
+#[repr(C)]
+pub struct MsCNativeFunction {
+    pub header: MsObjHeader,
+    pub name_ptr: *const u8,
+    pub name_len: u32,
+    #[cfg(feature = "capi")]
+    pub func: MsCFunction,
+    pub arity: i32,
+}
+
+#[cfg(feature = "capi")]
+impl MsCNativeFunction {
+    pub fn name(&self) -> &str {
+        unsafe {
+            let slice = std::slice::from_raw_parts(self.name_ptr, self.name_len as usize);
+            std::str::from_utf8_unchecked(slice)
+        }
+    }
+}
+
+/// 分配 MsCNativeFunction 堆对象，返回 Object::Ref。
+#[cfg(feature = "capi")]
+pub fn alloc_c_native_function(name: &str, func: MsCFunction, arity: i32) -> Object {
+    let name_bytes = name.as_bytes();
+    let name_box: Box<[u8]> = Box::from(name_bytes);
+    let name_len = name_box.len() as u32;
+    let name_ptr = Box::into_raw(name_box) as *const u8;
+
+    let obj = Box::new(MsCNativeFunction {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::NATIVE_C_FUNCTION as u8,
+            size: std::mem::size_of::<MsCNativeFunction>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        name_ptr,
+        name_len,
+        func,
+        arity,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsCNativeFunction 堆对象（alloc_c_native_function 的对偶）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_c_native_function` 分配的、在 `'a` 期间保持有效的
+/// `MsCNativeFunction`。
+#[cfg(feature = "capi")]
+pub unsafe fn read_c_native_function<'a>(ptr: *mut MsObjHeader) -> &'a MsCNativeFunction {
+    &*(ptr as *mut MsCNativeFunction)
+}
+
 impl VM {
     /// 注册全部内置函数到全局变量表。
     ///

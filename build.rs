@@ -50,6 +50,23 @@ fn main() {
                         if !hand_written.contains(filename) {
                             let out_path = include_dir.join(filename);
                             module_bindings.write_to_file(&out_path);
+                            // task 70: append #include "call_macros.h" to generated call.h
+                            // so standalone inclusion of call.h provides the msCall0-3 macros.
+                            if *filename == "call.h" {
+                                let content = std::fs::read_to_string(&out_path)
+                                    .expect("cannot read generated call.h");
+                                let patched = if content.contains("call_macros.h") {
+                                    content
+                                } else {
+                                    let marker = "#endif /* MSLANG_GENERATED_H */";
+                                    content.replace(
+                                        marker,
+                                        "#include \"call_macros.h\"\n\n#endif /* MSLANG_GENERATED_H */",
+                                    )
+                                };
+                                std::fs::write(&out_path, patched)
+                                    .expect("cannot write patched call.h");
+                            }
                         }
                     }
                 }
