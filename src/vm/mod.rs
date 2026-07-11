@@ -10,12 +10,13 @@ use crate::module::{self, ModuleResolver};
 use crate::vm::builtins::{alloc_native_function, read_native_function, NativeFunction, to_iterator};
 use crate::vm::object::{
     alloc_bound_method, alloc_class, alloc_closure, alloc_dict, alloc_exception,
-    alloc_exception_class, alloc_function, alloc_generator, alloc_instance, alloc_iterator,
-    alloc_list, alloc_module, alloc_set, alloc_string, alloc_tuple, alloc_upvalue, read_bound_method,
-    read_class, read_closure, read_dict, read_exception, read_exception_class, read_exception_mut,
-    read_function, read_generator, read_generator_mut, read_instance, read_iterator, read_list,
-    read_module, read_module_mut, read_set, read_str, read_tuple, read_upvalue, CmpOp, DictMap,
-    Function, GeneratorState, MsException, MsGenerator, MsObjHeader, MsUpvalue, Object, TypeTag,
+    alloc_exception_class, alloc_function, alloc_future, alloc_generator, alloc_instance,
+    alloc_iterator, alloc_list, alloc_module, alloc_set, alloc_string, alloc_tuple, alloc_upvalue,
+    read_bound_method, read_class, read_closure, read_dict, read_exception, read_exception_class,
+    read_exception_mut, read_function, read_future, read_generator, read_generator_mut,
+    read_instance, read_iterator, read_list, read_module, read_module_mut, read_set, read_str,
+    read_tuple, read_upvalue, CmpOp, DictMap, Function, FutureState, GeneratorState, MsException,
+    MsGenerator, MsObjHeader, MsUpvalue, Object, TypeTag,
 };
 use frame::CallFrame;
 use std::collections::HashMap;
@@ -40,7 +41,7 @@ enum GenOutcome {
 
 /// 异常处理器条目（task 37）。与 defer_stack 一样按帧分区，但用 frame_stack_base
 /// （值栈基址）判定所属帧。throw() 自顶向下扫描，匹配当前帧者跳到 catch_address。
-struct ExceptionHandler {
+pub struct ExceptionHandler {
     /// except 分派器入口（throw 跳转点）。
     catch_address: usize,
     /// finally 块入口地址（None 表示无 finally 块）。当前由编译端 dispatcher 经 JUMP
@@ -51,6 +52,51 @@ struct ExceptionHandler {
     frame_stack_base: usize,
     /// 进入 try 时值栈长度（unwind 时恢复栈平衡）。
     scope_stack_base: usize,
+}
+
+// ---------------------------------------------------------------------------
+// task 53：async/await 协程
+// ---------------------------------------------------------------------------
+
+/// 协程。每个协程拥有独立的执行上下文（call_stack / value_stack / defer_stack 等）。
+/// EventLoop 在协程间切换时整体保存/恢复这些字段。
+pub struct Coroutine {
+    pub call_stack: Vec<CallFrame>,
+    pub stack: Vec<Object>,
+    pub defer_stack: Vec<DeferEntry>,
+    pub open_upvalues: Vec<*mut MsObjHeader>,
+    pub exception_handlers: Vec<ExceptionHandler>,
+    pub pending_unwind: Option<Object>,
+    /// async fn 协程关联的 Future（TypeTag::FUTURE）；主协程为 None。
+    /// 协程完成时 EventLoop 通过此字段 resolve 对应 Future。
+    pub future: Option<*mut MsObjHeader>,
+}
+
+/// 暂停的协程。waiting_on 指向被 await 的 MsFuture。
+pub struct PausedCoroutine {
+    pub coroutine: Coroutine,
+    pub waiting_on: *mut MsObjHeader,
+}
+
+/// 事件循环。协作式调度，FIFO 就绪队列 + 暂停列表。
+pub struct EventLoop {
+    pub ready_queue: std::collections::VecDeque<Coroutine>,
+    pub paused: Vec<PausedCoroutine>,
+}
+
+impl EventLoop {
+    pub fn new() -> Self {
+        Self {
+            ready_queue: std::collections::VecDeque::new(),
+            paused: Vec::new(),
+        }
+    }
+}
+
+impl Default for EventLoop {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 内置异常层级（父类链）。父类一律为 Error。Phase 5 升级为正式 Class 后此表废弃。
@@ -121,6 +167,14 @@ pub struct VM {
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     /// task 74：pub(crate) 供 capi::gc 的 GC 控制/统计/finalizer API 直接访问。
     pub(crate) heap: gc::MsHeap,
+    /// task 53：事件循环。管理协程的就绪队列与暂停列表。
+    pub(crate) event_loop: EventLoop,
+    /// task 53：AWAIT Pending 时设置的 yield 信号。run_loop 退出后 EventLoop 检查此字段：
+    /// Some(fp) → 协程因 await 暂停；None → 协程正常完成。
+    yield_future: Option<*mut MsObjHeader>,
+    /// task 53：协程未捕获异常的 Object 快照。drive_unwind 在 call_stack 空时格式化错误
+    /// 前存储此值，供 EventLoop 据此 reject Future。
+    last_uncaught_exception: Option<Object>,
     /// task 42：隐式 Object 基类（Immortal 代）。无显式父类的类在 CLASS handler
     /// 中自动链接至此；提供默认 __repr__/__eq__/__ne__。
     pub(crate) object_class: *mut MsObjHeader,
@@ -171,6 +225,9 @@ impl VM {
             gen_outcome: None,
             gen_call_method: None,
             heap: gc::MsHeap::new(),
+            event_loop: EventLoop::new(),
+            yield_future: None,
+            last_uncaught_exception: None,
             object_class: std::ptr::null_mut(),
             module_resolver: ModuleResolver::new(),
             baseline_globals: HashMap::new(),
@@ -295,13 +352,120 @@ impl VM {
             required_arity: 0,
             is_generator: false,
             locals_count: 1,
+            is_async: false,
         };
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
         };
         self.call_stack
             .push(CallFrame::new(closure_ptr, 0, self.defer_stack.len()));
-        self.run()
+        // task 53：主脚本作为主协程在事件循环中执行。
+        let main_coro = self.take_coroutine_state(None);
+        self.event_loop.ready_queue.push_back(main_coro);
+        self.event_loop_run()
+    }
+
+    // ---- task 53：async/await 事件循环 ----
+
+    /// 将当前 VM 执行状态提取为 Coroutine（move 语义，VM 字段被清空）。
+    fn take_coroutine_state(&mut self, future: Option<*mut MsObjHeader>) -> Coroutine {
+        Coroutine {
+            call_stack: std::mem::take(&mut self.call_stack),
+            stack: std::mem::take(&mut self.stack),
+            defer_stack: std::mem::take(&mut self.defer_stack),
+            open_upvalues: std::mem::take(&mut self.open_upvalues),
+            exception_handlers: std::mem::take(&mut self.exception_handlers),
+            pending_unwind: self.pending_unwind.take(),
+            future,
+        }
+    }
+
+    /// 将 Coroutine 的状态恢复到 VM（move 语义）。
+    fn restore_coroutine_state(&mut self, coro: Coroutine) {
+        self.call_stack = coro.call_stack;
+        self.stack = coro.stack;
+        self.defer_stack = coro.defer_stack;
+        self.open_upvalues = coro.open_upvalues;
+        self.exception_handlers = coro.exception_handlers;
+        self.pending_unwind = coro.pending_unwind;
+    }
+
+    /// 唤醒等待指定 Future 的暂停协程，将它们从 paused 移至 ready_queue。
+    fn wake_waiters(&mut self, resolved_future: *mut MsObjHeader) {
+        let mut still_paused = Vec::new();
+        for paused in self.event_loop.paused.drain(..) {
+            if paused.waiting_on == resolved_future {
+                self.event_loop.ready_queue.push_back(paused.coroutine);
+            } else {
+                still_paused.push(paused);
+            }
+        }
+        self.event_loop.paused = still_paused;
+    }
+
+    /// 事件循环主方法。协作式调度：从 ready_queue 取协程 → 恢复 → run_loop →
+    /// 根据 yield/complete/error 结果调度。所有协程完成后返回主协程结果。
+    fn event_loop_run(&mut self) -> Result<Object, String> {
+        let mut main_result = Object::Nil;
+
+        while !self.event_loop.ready_queue.is_empty() || !self.event_loop.paused.is_empty() {
+            let coro = match self.event_loop.ready_queue.pop_front() {
+                Some(c) => c,
+                None => {
+                    // 无就绪协程但有暂停协程 → 死锁
+                    return Err("deadlock: all coroutines paused".to_string());
+                }
+            };
+            let coro_future = coro.future;
+            self.restore_coroutine_state(coro);
+
+            self.yield_future = None;
+            self.last_uncaught_exception = None;
+            let result = self.run_loop(None);
+
+            if let Some(fp) = self.yield_future.take() {
+                // 协程因 AWAIT Pending 暂停——保存当前状态到 paused
+                let coro = self.take_coroutine_state(coro_future);
+                self.event_loop.paused.push(PausedCoroutine {
+                    coroutine: coro,
+                    waiting_on: fp,
+                });
+            } else {
+                // 协程完成或出错
+                match result {
+                    Ok(val) => {
+                        if let Some(fp) = coro_future {
+                            // resolve Future
+                            let f = unsafe { read_future(fp) };
+                            *f.state.borrow_mut() = FutureState::Resolved(val);
+                            self.wake_waiters(fp);
+                        } else {
+                            main_result = val;
+                        }
+                    }
+                    Err(msg) => {
+                        if let Some(fp) = coro_future {
+                            // reject Future with exception
+                            let exc = self.last_uncaught_exception.take().unwrap_or_else(|| {
+                                alloc_exception(
+                                    "Error",
+                                    alloc_string(&msg),
+                                    alloc_string(""),
+                                    Object::Nil,
+                                )
+                            });
+                            let f = unsafe { read_future(fp) };
+                            *f.state.borrow_mut() = FutureState::Rejected(exc);
+                            self.wake_waiters(fp);
+                        } else {
+                            return Err(msg);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(main_result)
     }
 
     // ---- task 60：GC 便捷方法（供 gc stdlib native 函数调用） ----
@@ -916,6 +1080,34 @@ impl VM {
                 if is_generator {
                     let final_argc = self.stack.len() - callee_idx - 1;
                     return self.call_generator(*ptr, final_argc);
+                }
+
+                // task 53: is_async 预检 — async fn 调用不直接压帧，
+                // 而是创建 Future + Coroutine，加入就绪队列，返回 Future。
+                let is_async_fn = unsafe { read_function(func_ptr) }.function.is_async;
+                if is_async_fn {
+                    // 创建 Future（Pending）
+                    let future = alloc_future(FutureState::Pending);
+                    let Object::Ref(future_ptr) = future else {
+                        unreachable!()
+                    };
+                    // 提取 callee + args 作为协程初始值栈（stack_base = 0）
+                    let coro_stack: Vec<Object> = self.stack[callee_idx..].to_vec();
+                    self.stack.truncate(callee_idx);
+                    let frame = CallFrame::new(*ptr, 0, 0);
+                    let coroutine = Coroutine {
+                        call_stack: vec![frame],
+                        stack: coro_stack,
+                        defer_stack: Vec::new(),
+                        open_upvalues: Vec::new(),
+                        exception_handlers: Vec::new(),
+                        pending_unwind: None,
+                        future: Some(future_ptr),
+                    };
+                    self.event_loop.ready_queue.push_back(coroutine);
+                    // 返回 Future 给调用者
+                    self.push(future)?;
+                    return Ok(());
                 }
 
                 // stack_base = callee_idx：slot 0 = callee（closure 自身），
@@ -1553,7 +1745,10 @@ impl VM {
         loop {
             let frame_stack_base = match self.call_stack.last() {
                 Some(f) => f.stack_base,
-                None => return Err(self.format_uncaught_error(&err)),
+                None => {
+                    self.last_uncaught_exception = Some(err.clone());
+                    return Err(self.format_uncaught_error(&err));
+                }
             };
             let defer_base = self.call_stack.last().unwrap().defer_stack_base;
 
@@ -1647,6 +1842,7 @@ impl VM {
                 if is_gen_exit {
                     return Ok(());
                 }
+                self.last_uncaught_exception = Some(err.clone());
                 return Err(self.format_uncaught_error(&err));
             }
             if self.call_stack.len() > 1 {
@@ -1654,6 +1850,7 @@ impl VM {
                 self.call_stack.pop();
                 continue;
             }
+            self.last_uncaught_exception = Some(err.clone());
             return Err(self.format_uncaught_error(&err));
         }
     }
@@ -3222,6 +3419,53 @@ impl VM {
                     }
                 }
 
+                // AWAIT（task 53）：弹出 Future，检查状态。
+                // Resolved → 压结果值继续；Rejected → 抛异常；Pending → 回退 ip 让出协程。
+                OpCode::Await => {
+                    let future_val = self.peek(0)?.clone(); // 先不弹——Pending 时需留在栈上
+                    let future_ptr = match &future_val {
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::FUTURE as u8 =>
+                        {
+                            *ptr
+                        }
+                        _ => {
+                            return Err(format!(
+                                "TypeError: object '{}' is not awaitable",
+                                future_val.type_name()
+                            ))
+                        }
+                    };
+                    // 克隆状态以立即释放 RefCell borrow（AWAIT 是 GC 安全点）
+                    let state = {
+                        let f = unsafe { read_future(future_ptr) };
+                        f.state.borrow().clone()
+                    };
+                    match state {
+                        FutureState::Resolved(val) => {
+                            self.pop()?; // 弹出 Future
+                            self.push(val)?; // 压入结果
+                        }
+                        FutureState::Rejected(exc) => {
+                            self.pop()?; // 弹出 Future
+                            // throw 设置 catch_address 或传播异常；Ok 则继续循环
+                            self.throw(exc)?;
+                            continue;
+                        }
+                        FutureState::Pending => {
+                            // 回退 ip 使 AWAIT 在恢复时重新执行（Future 留在栈上）
+                            let frame = self.call_stack.last_mut().unwrap();
+                            frame.ip = frame
+                                .ip
+                                .checked_sub(1)
+                                .ok_or("ip underflow in AWAIT")?;
+                            // 设置 yield 信号，run_loop 将退出交还 EventLoop
+                            self.yield_future = Some(future_ptr);
+                            return Ok(Object::Nil);
+                        }
+                    }
+                }
+
                 _ => {
                     return Err(format!("unimplemented opcode: {:?}", opcode));
                 }
@@ -3412,6 +3656,7 @@ impl VM {
             required_arity: 0,
             is_generator: false,
             locals_count: 1,
+            is_async: false,
         };
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
@@ -3462,8 +3707,8 @@ mod tests {
     use crate::parser::Parser;
     use crate::vm::object::{
         alloc_bound_method, alloc_class, alloc_dict, alloc_instance, alloc_iterator, alloc_list,
-        alloc_set, alloc_string, alloc_tuple, read_bound_method, read_class, read_list, DictMap,
-        IteratorState, Object,
+        alloc_set, alloc_string, alloc_tuple, read_bound_method, read_class, read_list,
+        DictMap, IteratorState, Object,
     };
     use std::collections::HashSet;
 
@@ -5484,6 +5729,7 @@ mod tests {
             required_arity: 2,
             is_generator: false,
             locals_count: 1,
+            is_async: false,
         };
         let func_obj = alloc_function(func);
         let Object::Ref(func_ptr) = func_obj else {
@@ -9539,5 +9785,225 @@ assert(make() == 111)
         let m = alloc_module("demo");
         assert_eq!(m.type_name(), "module");
         assert_eq!(format!("{}", m), "<module \"demo\">");
+    }
+
+    // -----------------------------------------------------------------------
+    // task 53：async/await 协程测试
+    // -----------------------------------------------------------------------
+
+    /// 编译源码但不 unwrap，返回编译结果（用于编译错误测试）。
+    fn compile_result(source: &str) -> Result<Chunk, String> {
+        let program = parse(source);
+        let mut compiler = Compiler::new();
+        compiler.compile(&program)
+    }
+
+    #[test]
+    fn test_async_basic() {
+        let result = compile_and_run(
+            r#"
+            async fn fetch_data() {
+                return "data"
+            }
+            result = await fetch_data()
+            assert(result == "data")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_multiple() {
+        let result = compile_and_run(
+            r#"
+            async fn compute(x) {
+                return x * 2
+            }
+            a = await compute(3)
+            b = await compute(5)
+            assert(a + b == 16)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_toplevel() {
+        let result = compile_and_run(
+            r#"
+            async fn greet(name) {
+                return "Hello, " + name
+            }
+            msg = await greet("World")
+            assert(msg == "Hello, World")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_chain() {
+        let result = compile_and_run(
+            r#"
+            async fn step1() {
+                return 10
+            }
+            async fn step2(x) {
+                return x + 5
+            }
+            async fn pipeline() {
+                a = await step1()
+                b = await step2(a)
+                return b
+            }
+            result = await pipeline()
+            assert(result == 15)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_interleave() {
+        // 验证多个协程在 await 点交替执行（非串行）。
+        let result = compile_and_run(
+            r#"
+            async fn yield_helper() {
+                return nil
+            }
+            async fn task_a() {
+                await yield_helper()
+                return "a"
+            }
+            async fn task_b() {
+                await yield_helper()
+                return "b"
+            }
+            fa = task_a()
+            fb = task_b()
+            ra = await fa
+            rb = await fb
+            assert(ra + rb == "ab")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_rejected() {
+        // Rejected Future 正确抛出异常，try/except 可捕获。
+        let result = compile_and_run(
+            r#"
+            async fn fail() {
+                throw RuntimeError("intentional failure")
+            }
+            async fn main() {
+                try {
+                    result = await fail()
+                    return "should not reach here"
+                } except RuntimeError {
+                    return "caught error"
+                }
+            }
+            fa = main()
+            stored = await fa
+            assert(stored == "caught error")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_deadlock() {
+        // 循环 await 导致所有协程暂停且无就绪协程 → 死锁。
+        // 通过共享容器建立两个相互等待的 Future。
+        let result = compile_and_run(
+            r#"
+            async fn await_idx(lst, i) {
+                return await lst[i]
+            }
+
+            box = [nil, nil]
+            fa = await_idx(box, 1)
+            fb = await_idx(box, 0)
+            box[0] = fa
+            box[1] = fb
+            result = await fa
+        "#,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("deadlock"),
+            "expected deadlock error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_async_defer() {
+        // 协程结束时 defer 正常执行。
+        let result = compile_and_run(
+            r#"
+            var order = ""
+            async fn worker(id) {
+                defer print("cleanup " + id)
+                print("running " + id)
+                return id
+            }
+            async fn main() {
+                a = await worker("1")
+                b = await worker("2")
+                return "all done"
+            }
+            fa = main()
+            stored = await fa
+            assert(stored == "all done")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_returns_future() {
+        // async fn 调用返回 Future；await 后获取值。
+        let result = compile_and_run(
+            r#"
+            var side_effect = "before"
+            async fn slow() {
+                side_effect = "executed"
+                return 42
+            }
+            f = slow()
+            # Future 已创建，await 后获取值
+            val = await f
+            assert(val == 42)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_await_non_future_is_error() {
+        // await 非 Future 对象应报错。
+        let result = compile_and_run(
+            r#"
+            x = await 42
+        "#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_await_outside_async_is_error() {
+        // await 在普通 fn 内应编译报错。
+        let chunk = compile_result(
+            r#"
+            fn normal() {
+                return await nil
+            }
+        "#,
+        );
+        assert!(chunk.is_err(), "expected compile error");
     }
 }

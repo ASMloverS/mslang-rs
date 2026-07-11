@@ -119,8 +119,14 @@ impl Compiler {
                 self.emit_byte(OpCode::YieldFromResume as u8, line);
                 Ok(())
             }
-            Expr::Await { .. } => {
-                Err("await compilation not yet implemented (task 53)".to_string())
+            Expr::Await { expr } => {
+                // task 53：await 仅允许在 async fn 体或脚本顶层。
+                if !self.unit.is_async_context {
+                    return Err("'await' outside async function".to_string());
+                }
+                self.compile_expression(expr, line)?;
+                self.emit_byte(OpCode::Await as u8, line);
+                Ok(())
             }
             Expr::Go { .. } => Err("go compilation not yet implemented (task 55)".to_string()),
         }
@@ -566,6 +572,7 @@ impl Compiler {
             upvalues: Vec::new(),
             scope_depth: 0,
             is_generator: false,
+            is_async_context: false, // 匿名函数体不允许 await（MVP）
             parent: std::ptr::null(),
         };
         // task 31：参数顺序校验 + 默认/可变分类（镜像 compile_fn_decl）。
@@ -626,6 +633,7 @@ impl Compiler {
             required_arity,
             is_generator: func_unit.is_generator,
             locals_count: func_unit.locals.len(),
+            is_async: false,
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)
@@ -933,6 +941,7 @@ impl Compiler {
             upvalues: Vec::new(),
             scope_depth: 0,
             is_generator: true,
+            is_async_context: false,
             parent: std::ptr::null(),
         };
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
@@ -995,6 +1004,7 @@ impl Compiler {
             required_arity: 1,
             is_generator: true,
             locals_count: func_unit.locals.len(),
+            is_async: false,
         };
         let func_idx = self.add_constant(crate::vm::object::alloc_function(function));
         let func_idx = u16::try_from(func_idx).map_err(|_| "constant pool overflow".to_string())?;
@@ -1568,8 +1578,22 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_await_returns_error() {
+    fn test_compile_await_in_async_context() {
+        // 顶层（is_async_context = true）await 应编译成功
         let mut compiler = Compiler::new();
+        let expr = Expr::Await {
+            expr: Box::new(Expr::Literal(Literal::Nil)),
+        };
+        compiler.compile_expression(&expr, 1).unwrap();
+        assert!(find_opcode(&compiler, OpCode::Await).is_some());
+    }
+
+    #[test]
+    fn test_compile_await_outside_async_is_error() {
+        // 普通 fn 内 await 应报错
+        let mut compiler = Compiler::new();
+        // 模拟进入普通 fn 体（is_async_context = false）
+        compiler.unit.is_async_context = false;
         let expr = Expr::Await {
             expr: Box::new(Expr::Literal(Literal::Nil)),
         };

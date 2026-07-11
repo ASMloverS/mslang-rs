@@ -112,7 +112,7 @@
 
 | # | 任务 | 状态 |
 |---|---|---|
-| 53 | [async/await 协程](53-async-await.md) | ⬜ |
+| 53 | [async/await 协程](53-async-await.md) | ✅ |
 | 54 | [Channel 通信](54-channel.md) | ⬜ |
 | 55 | [go 关键字与并发执行](55-go-concurrency.md) | ⬜ |
 | 59 | [select 语句（多 channel 复用）](59-select.md) | ⬜ |

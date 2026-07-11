@@ -55,6 +55,9 @@ pub struct CompilationUnit {
     /// task 39：函数体编译期间是否出现 yield / yield from。函数编译完成时据此
     /// 设置 Function.is_generator。父单元的该字段不被读取（仅当前子单元有效）。
     pub is_generator: bool,
+    /// task 53：当前编译单元是否为 async 上下文（async fn 体或脚本顶层）。
+    /// `await` 表达式仅允许在 is_async_context == true 的单元中使用。
+    pub is_async_context: bool,
     /// 父编译单元（用于闭包上值解析）。
     ///
     /// 采用裸指针（clox 风格）规避 `self.unit` 经 `mem::replace` 换出/换入时
@@ -135,6 +138,7 @@ impl Compiler {
             upvalues: Vec::new(),
             scope_depth: 0,
             is_generator: false,
+            is_async_context: true, // 脚本顶层支持顶层 await（08-concurrency.md）
             parent: std::ptr::null(),
         };
         Compiler {

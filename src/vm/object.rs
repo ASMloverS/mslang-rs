@@ -518,6 +518,8 @@ pub struct Function {
     /// task 39：局部变量槽位数（含 slot 0 占位）。生成器创建时据此校验
     /// MAX_GENERATOR_LOCALS 上限（V6/R6），亦作为快照栈区间的合理上界参考。
     pub locals_count: usize,
+    /// task 53：是否为 async fn。CALL 时据此创建 Future + Coroutine 而非直接压帧。
+    pub is_async: bool,
 }
 
 impl Function {
@@ -534,6 +536,7 @@ impl Function {
             required_arity: arity,
             is_generator: false,
             locals_count: 1,
+            is_async: false,
         }
     }
 }
@@ -748,6 +751,73 @@ pub unsafe fn read_generator<'a>(ptr: *mut MsObjHeader) -> &'a MsGenerator {
 /// 同 read_generator；调用方须保证无其它 `&MsGenerator` / `&mut MsGenerator` 同时存活。
 pub unsafe fn read_generator_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsGenerator {
     &mut *(ptr as *mut MsGenerator)
+}
+
+// ---------------------------------------------------------------------------
+// Future 对象（task 53）
+// ---------------------------------------------------------------------------
+
+/// Future 状态。Pending → Resolved(value) 或 Rejected(error)。
+///
+/// Rejected 持有异常 Object（MsException 实例），以便 AWAIT 时直接抛出带类型的异常，
+/// 与 try/except 类型匹配机制集成。
+#[derive(Clone, Debug)]
+pub enum FutureState {
+    Pending,
+    Resolved(Object),
+    Rejected(Object),
+}
+
+/// Future 堆对象（TypeTag::FUTURE = 13）。
+///
+/// 等待者管理由 EventLoop 的 `paused` 列表集中负责，Future 自身不存储等待者列表。
+/// `state` 使用 RefCell 允许内部可变性（resolve_future 在协程完成时写入）。
+#[repr(C)]
+pub struct MsFuture {
+    pub header: MsObjHeader,
+    pub state: std::cell::RefCell<FutureState>,
+}
+
+/// 分配 MsFuture 堆对象（TypeTag::FUTURE），返回 Object::Ref。
+/// MVP：Box 分配（与既有 alloc_* 一致）。
+pub fn alloc_future(state: FutureState) -> Object {
+    let obj = Box::new(MsFuture {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::FUTURE as u8,
+            size: std::mem::size_of::<MsFuture>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        state: std::cell::RefCell::new(state),
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsFuture（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_future` 分配的、在 `'a` 期间有效的 `MsFuture`。
+pub unsafe fn read_future<'a>(ptr: *mut MsObjHeader) -> &'a MsFuture {
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::FUTURE as u8,
+        "read_future on non-FUTURE"
+    );
+    &*(ptr as *const MsFuture)
+}
+
+/// 读取 MsFuture（可变，用于 resolve/reject）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_future` 分配的、在 `'a` 期间有效的 `MsFuture`。
+pub unsafe fn read_future_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsFuture {
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::FUTURE as u8,
+        "read_future_mut on non-FUTURE"
+    );
+    &mut *(ptr as *mut MsFuture)
 }
 
 // ---------------------------------------------------------------------------

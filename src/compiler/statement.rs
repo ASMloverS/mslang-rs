@@ -44,8 +44,8 @@ impl Compiler {
             Stmt::Nonlocal { names } => self.compile_nonlocal(names, line),
             Stmt::Global { names } => self.compile_global(names, line),
             Stmt::FnDecl {
-                name, params, body, ..
-            } => self.compile_fn_decl(name, params, body, line),
+                name, params, body, is_async, ..
+            } => self.compile_fn_decl(name, params, body, *is_async, line),
             Stmt::ClassDecl {
                 name,
                 parent,
@@ -329,6 +329,7 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
         is_method: bool,
+        is_async: bool,
     ) -> Result<(), String> {
         // task 41 §4：方法首参数必须为 self（self 在词法层为关键字，仅此位置可作标识符）。
         if is_method && (params.is_empty() || params[0].name != "self") {
@@ -354,6 +355,7 @@ impl Compiler {
             upvalues: Vec::new(),
             scope_depth: 0,
             is_generator: false,
+            is_async_context: is_async, // async fn 体允许 await；普通 fn 不允许
             parent: std::ptr::null(),
         };
         // task 31：参数顺序校验（普通 → 默认 → 可变）+ 默认/可变参数分类。
@@ -416,6 +418,7 @@ impl Compiler {
             required_arity,
             is_generator: func_unit.is_generator,
             locals_count: func_unit.locals.len(),
+            is_async,
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)
@@ -447,9 +450,10 @@ impl Compiler {
         name: &str,
         params: &[crate::ast::node::Param],
         body: &[Stmt],
+        is_async: bool,
         line: usize,
     ) -> Result<(), String> {
-        self.compile_function_closure(name, params, body, line, false)?;
+        self.compile_function_closure(name, params, body, line, false, is_async)?;
         if self.unit.parent.is_null() {
             // 顶层：STORE_GLOBAL（与 task 27 一致）
             let name_idx = self.add_constant(alloc_string(name));
@@ -616,7 +620,7 @@ impl Compiler {
                 };
             self.emit_byte(OpCode::LoadGlobal as u8, line);
             self.emit_bytes(&name_idx.to_be_bytes(), line);
-            self.compile_function_closure(m_name, m_params, m_body, line, true)?;
+            self.compile_function_closure(m_name, m_params, m_body, line, true, false)?;
             let m_idx = self.add_constant(alloc_string(m_name));
             let m_idx = u16::try_from(m_idx)
                 .map_err(|_| "constant pool overflow: more than 65535 constants".to_string())?;
