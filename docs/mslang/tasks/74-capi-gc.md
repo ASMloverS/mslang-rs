@@ -154,7 +154,7 @@ pub extern "C" fn msOnFinalize(
 
     // 设置 has_finalizer 标志位
     unsafe {
-        (*header).gc_meta |= 0b0001_0000; // HAS_FINALIZER
+        (*header).gc_meta |= MsObjHeader::HAS_FINALIZER;
     }
 
     // 注册 finalizer 回调
@@ -162,7 +162,6 @@ pub extern "C" fn msOnFinalize(
         header as usize,
         fn_ptr,
         userdata,
-        obj,
     );
 
     MsStatus::MS_OK
@@ -173,28 +172,33 @@ pub extern "C" fn msOnFinalize(
 1. 加锁 VM
 2. 校验 `obj` 是 Ref 类型（堆对象），获取其 `MsObjHeader` 指针
 3. 设置 `gc_meta` 的 `HAS_FINALIZER` 位（bit 4）
-4. 在 VM 的 finalizer 注册表中记录 `(obj_addr, fn, userdata, MsValue*)` 四元组
-5. GC 回收对象前，在 finalizer 队列中查找匹配项，调用回调
+4. 在 VM 的 finalizer 注册表中记录 `(obj_addr, fn, userdata)` 三元组
+5. GC sweep 阶段在 finalizer 队列中查找匹配项，Finalize 阶段调用回调
 
-**Finalizer 调用机制**（复用 GC 核心的 finalizer 队列）：
+> 失败时（vm/obj 为 NULL、obj 非 Ref 类型、fn 为 NULL）返回 `MS_ERROR`。当前版本不设置可查询异常（不调用 `msThrow*`），C 侧仅凭返回值判断失败。后续版本可补充 `msThrowTypeError` 等错误信息。
+
+**Finalizer 调用机制**（参照 [14-gc](../14-gc.md) § Finalize，复用 GC 核心的 finalizer 队列）：
 
 GC 在标记-清除的 sweep 阶段，发现对象的 `HAS_FINALIZER` 位置位但对象不可达时：
-1. 将对象加入 finalizer 队列（而非立即回收）
-2. 重新标记该对象为可达（resurrection 一次机会）
-3. 下一次 GC 时，如果对象仍然不可达，调用注册的 C finalizer
-4. 调用后在 mutator 线程中执行 `fn(vm, obj, userdata)`
-5. 真正回收对象内存
+1. 将对象加入 `pending_finalizers` 队列，置 Gray（保留到 Finalize 阶段执行，而非立即回收）
+2. GC 结束后，由 mutator 线程在 `run_finalizers` 中执行回调（参照 `52-gc.md:578-594`）
+3. 在 finalizer 注册表中按 `obj_addr` 查找匹配的 C finalizer 回调，执行 `fn(vm, obj, userdata)`
+4. 清除 `HAS_FINALIZER` 标记、置 White（下次 GC 可正常回收，不再无限复活）
+5. 真正回收对象内存（下次 GC 周期）
+
+> **重入保护**：`run_finalizers` 执行 C finalizer 期间设置 `gc_disabled = true`（与 `52-gc.md` task 40 扩展中 `__del__` 的执行路径一致），防止 finalizer 回调内触发的分配操作递归触发 GC。C finalizer 与 mslang `__del__` 共享同一 finalizer 队列，按注册顺序依次执行。
 
 Finalizer 注册表结构：
 
 ```rust
 struct FinalizerEntry {
-    obj_addr: usize,
+    obj_addr: usize,   // MsObjHeader 地址，作为查找键（GC 移动对象时由 minor_gc/major_gc 的 forwarding 更新）
     fn_ptr: extern "C" fn(*mut MsVM, *mut MsValue, *mut std::ffi::c_void),
     userdata: *mut std::ffi::c_void,
-    value_ptr: *mut MsValue,
 }
 
+// SAFETY: FinalizerEntry 仅在持有 VmInner 互斥锁时访问（注册、查找、执行）。
+// finalizer 回调在 mutator 线程、持有锁的状态下执行。裸指针不跨线程并发访问。
 unsafe impl Send for FinalizerEntry {}
 unsafe impl Sync for FinalizerEntry {}
 ```
@@ -213,21 +217,31 @@ pub extern "C" fn msGcCollect(vm: *mut MsVM, gc_type: MsGcType) {
     if vm.is_null() {
         return;
     }
+    // 防御非法枚举值（C 侧可传入越界整数）
+    if (gc_type as u32) > MsGcType::MS_GC_FULL as u32 {
+        return;
+    }
     let vm_ref = unsafe { &*vm };
     let mut inner = vm_ref.inner.lock().unwrap();
 
+    // 注：minor_gc/major_gc 为 Task 52 定义的自由函数，签名为
+    //   fn minor_gc(heap: &mut MsHeap, vm: &mut VM)
+    //   fn major_gc(heap: &mut MsHeap, vm: &VM)
+    // heap 与 vm 同属 VmInner，需通过结构体拆借或 unsafe 别名调用。
     match gc_type {
         MsGcType::MS_GC_MINOR => {
-            inner.vm.gc.minor_collect();
+            minor_gc(&mut inner.vm.gc, &mut inner.vm);
         }
         MsGcType::MS_GC_MAJOR => {
-            inner.vm.gc.major_collect();
+            major_gc(&mut inner.vm.gc, &inner.vm);
         }
         MsGcType::MS_GC_FULL => {
-            inner.vm.gc.minor_collect();
-            inner.vm.gc.major_collect();
+            minor_gc(&mut inner.vm.gc, &mut inner.vm);
+            major_gc(&mut inner.vm.gc, &inner.vm);
         }
     }
+    // GC 后执行 pending finalizers（mutator 线程；仅 Major/Full 产生 pending finalizers）
+    run_finalizers(&mut inner.vm.gc, &mut inner.vm);
 }
 ```
 
@@ -235,9 +249,9 @@ pub extern "C" fn msGcCollect(vm: *mut MsVM, gc_type: MsGcType) {
 
 | C 枚举值 | Rust 行为 |
 |---|---|
-| `MS_GC_MINOR` | 调用 `minor_collect()` |
-| `MS_GC_MAJOR` | 调用 `major_collect()` |
-| `MS_GC_FULL` | 先 `minor_collect()` 再 `major_collect()` |
+| `MS_GC_MINOR` | 调用 `minor_gc()` |
+| `MS_GC_MAJOR` | 调用 `major_gc()` |
+| `MS_GC_FULL` | 先 `minor_gc()` 再 `major_gc()` + `run_finalizers()` |
 
 Full GC 先执行 Minor 是因为 Minor 可能产生新的晋升对象到 Old 代，需要 Major 来处理。
 
@@ -269,15 +283,21 @@ pub extern "C" fn msGcIsEnabled(vm: *mut MsVM) -> i32 {
 }
 ```
 
-`gc_enabled` 标志存储在 `GcConfig` 中（Task 52 创建的 `MsHeap` 扩展）：
+`enabled` / `debug` / `gc_threads` 字段直接存储在 `MsHeap` 上（在 Task 52 的 MsHeap 基础上新增）：
 
 ```rust
-struct GcConfig {
-    enabled: bool,
-    debug: bool,
-    gc_threads: u32,
+// 在 52-gc.md 的 MsHeap 结构体中新增以下字段：
+struct MsHeap {
+    // ... Task 52 既有字段 ...
+    enabled: bool,       // 自动 GC 开关，默认 true
+    debug: bool,         // 调试模式，默认 false
+    gc_threads: u32,     // GC 线程数（MVP 存储不用），默认 1
+    stats: GcStats,      // GC 统计（见 §9）
+    c_finalizers: Vec<FinalizerEntry>,  // C 侧 finalizer 注册表
 }
 ```
+
+> 注：14-gc.md § GcConfig 使用 Atomic 类型（并发 GC 场景），MVP 阶段（STW GC）使用普通类型即可。Phase 7.5 升级时替换为原子类型。`promotion_age`（Task 52 已有）和阈值参数（`next_major_gc` 等，Task 52 已有）不重复定义。
 
 禁用自动 GC 时：
 - `maybe_gc()` 检查 `enabled` 标志，为 false 时跳过
@@ -300,16 +320,15 @@ pub extern "C" fn msGcSetThreshold(
     let mut inner = vm_ref.inner.lock().unwrap();
 
     match gc_type {
-        MsGcType::MS_GC_MAJOR => {
+        MsGcType::MS_GC_MAJOR | MsGcType::MS_GC_FULL => {
             inner.vm.gc.set_major_ratio(threshold);
         }
         MsGcType::MS_GC_MINOR => {
             // threshold 作为 Young 代大小（MB → bytes）
-            let young_bytes = (threshold * 1024.0 * 1024.0) as usize;
+            // 限制范围 [0.5, 64.0] MB（参照 14-gc.md 自适应上限 64MB）
+            let clamped = threshold.clamp(0.5, 64.0);
+            let young_bytes = (clamped * 1024.0 * 1024.0) as usize;
             inner.vm.gc.set_young_size(young_bytes);
-        }
-        MsGcType::MS_GC_FULL => {
-            inner.vm.gc.set_major_ratio(threshold);
         }
     }
 }
@@ -319,7 +338,7 @@ pub extern "C" fn msGcSetThreshold(
 
 | MsGcType | threshold 含义 | 存储位置 |
 |---|---|---|
-| `MS_GC_MINOR` | Young 代大小（MB），转换为 bytes | `MsHeap.young_from.len()` 重分配 |
+| `MS_GC_MINOR` | Young 代大小（MB），clamp [0.5, 64.0]，转换为 bytes | 下次 Minor GC 后新 From-Space 目标大小 |
 | `MS_GC_MAJOR` | Old GC 触发比率（`MAJOR_GC_RATIO`） | `MsHeap.next_major_gc` 计算依据 |
 | `MS_GC_FULL` | 等同 `MS_GC_MAJOR` | 同上 |
 
@@ -400,9 +419,10 @@ Debug 模式对性能有显著影响，仅用于开发调试。
 
 #### C 结构体定义
 
-`MsGcStats` 定义在 `include/mslang/types.h` 中（Task 65 已创建），由 cbindgen 从 Rust 侧 `#[repr(C)]` 结构体生成或手写：
+`MsGcStats` 已由 Task 65 在 `include/mslang/types.h` 中**手写定义**（camelCase 字段）。Rust 侧匹配定义放在 `src/capi/types.rs`（**不放 gc.rs**，避免 cbindgen `with_src(gc.rs)` 时重复输出到 gc.h）：
 
 ```rust
+// src/capi/types.rs — 不被 cbindgen with_src 直接解析
 #[repr(C)]
 #[derive(Default, Clone)]
 pub struct MsGcStats {
@@ -416,6 +436,8 @@ pub struct MsGcStats {
     pub bytes_freed: u64,
 }
 ```
+
+> **ABI 兼容**：`#[repr(C)]` 保证字段顺序和类型匹配。Rust snake_case 字段名与 C camelCase 字段名不影响内存布局（`#[repr(C)]` 仅依赖声明顺序）。types.h 的手写定义为权威 C 声明。
 
 字段映射：
 
@@ -482,7 +504,7 @@ fn get_stats(&self) -> MsGcStats {
         last_pause_ns: self.stats.last_pause_ns,
         young_size: self.young_cursor as u64,
         old_size: self.old_space.bytes_used as u64,
-        los_size: self.los_space.map_or(0, |los| los.bytes_used as u64),
+        los_size: self.los_space.bytes_used as u64,
         bytes_freed: self.stats.bytes_freed,
     }
 }
@@ -490,9 +512,10 @@ fn get_stats(&self) -> MsGcStats {
 
 ### 10. MsGcType 枚举映射
 
-Rust 侧 `MsGcType` 定义（复用 Task 65 types.h 中的 C 枚举）：
+Rust 侧 `MsGcType` 定义（复用 Task 65 types.h 中的 C 枚举）。与 `MsGcStats` 同理，放在 `src/capi/types.rs`（**不放 gc.rs**，避免 cbindgen 重复输出）：
 
 ```rust
+// src/capi/types.rs — 不被 cbindgen with_src 直接解析
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsGcType {
@@ -504,7 +527,7 @@ pub enum MsGcType {
 
 ### 11. VM 内部 GC 接口扩展
 
-本任务需要在 `MsHeap`（Task 52）上扩展以下接口：
+本任务需要在 `MsHeap`（Task 52）及 `VM` 上扩展以下接口：
 
 ```rust
 impl MsHeap {
@@ -516,9 +539,25 @@ impl MsHeap {
     fn set_promotion_age(&mut self, age: u8);
     fn set_gc_threads(&mut self, threads: u32);
     fn get_stats(&self) -> MsGcStats;
-    fn register_finalizer(&mut self, addr: usize, fn_ptr: ..., userdata: ..., value: ...);
+    fn register_finalizer(
+        &mut self,
+        addr: usize,
+        fn_ptr: extern "C" fn(*mut MsVM, *mut MsValue, *mut std::ffi::c_void),
+        userdata: *mut std::ffi::c_void,
+    );
+}
+
+impl VM {
+    /// 从 MsValue* 提取底层 MsObjHeader 指针（仅 Ref 类型有效）。
+    /// MsValue 为不透明封装：内部持有 Object 枚举，Ref 变体包含 *mut MsObjHeader。
+    /// 非 Ref 类型（Nil/Bool/Int/Float）返回 None。
+    fn get_obj_header(&self, val: *mut MsValue) -> Option<*mut MsObjHeader>;
 }
 ```
+
+> **MsHeap 新增字段**（在 Task 52 基础上）：`enabled: bool`、`debug: bool`、`gc_threads: u32`、`stats: GcStats`、`c_finalizers: Vec<FinalizerEntry>`（见 §4 GcConfig 说明）。
+
+> **`set_young_size` 语义**：设置下次 Minor GC 后新 From-Space 的**目标大小**，不立即重分配当前空间。当前 From-Space 中的活跃对象在下次 Minor GC 时复制到按新大小分配的 To-Space，然后交换。避免运行中 resize 导致 UAF。
 
 这些方法在 GC 核心模块（`src/vm/gc.rs`）中实现，C API 层（`src/capi/gc.rs`）仅做薄封装：加锁 → 调用 → 返回。
 
@@ -544,7 +583,7 @@ impl MsHeap {
 12. **msGcSetDebug**：debug 构建中启用调试模式，release 构建为 no-op
 13. **msGcStats**：GC 执行后返回非零计数，暂停时间 > 0
 14. **msGcStats**：未执行 GC 时 `minorGcCount`/`majorGcCount` 为 0
-15. **Finalizer 回调时序**：回调在 GC sweep 阶段、对象被回收前调用
+15. **Finalizer 回调时序**：回调在 GC Finalize 阶段（sweep 后、对象内存回收前）由 mutator 线程调用
 16. **多 VM 隔离**：不同 VM 的 GC 状态互不影响
 17. **NULL 安全**：所有函数传入 NULL vm 指针不崩溃
 
@@ -671,9 +710,8 @@ mod tests {
         let status = msOnFinalize(vm, obj, Some(my_finalizer), called_ptr);
         assert_eq!(status, MsStatus::MS_OK);
 
-        // 删除全局引用，触发 GC
+        // 删除全局引用，触发 GC（单次 GC 即在 Finalize 阶段执行回调）
         unsafe { crate::capi::vm::msDelGlobal(vm, name.as_ptr()) };
-        msGcCollect(vm, MsGcType::MS_GC_FULL);
         msGcCollect(vm, MsGcType::MS_GC_FULL);
 
         let called = unsafe { Arc::from_raw(called_ptr as *const Mutex<bool>) };
@@ -809,6 +847,37 @@ mod tests {
 
         msVmFree(vm);
     }
+
+    #[test]
+    fn test_multi_vm_isolation() {
+        let vm1 = msVmNew();
+        let vm2 = msVmNew();
+
+        // vm1 禁用 GC，vm2 保持启用
+        msGcEnable(vm1, 0);
+        assert_eq!(msGcIsEnabled(vm1), 0);
+        assert_eq!(msGcIsEnabled(vm2), 1);
+
+        // vm1 设置 promotion_age=1，vm2 设置 promotion_age=3
+        msGcSetPromotionAge(vm1, 1);
+        msGcSetPromotionAge(vm2, 3);
+
+        // 各自执行 GC，统计互不影响
+        msGcCollect(vm1, MsGcType::MS_GC_MINOR);
+        msGcCollect(vm2, MsGcType::MS_GC_MAJOR);
+
+        let s1 = msGcStats(vm1);
+        let s2 = msGcStats(vm2);
+        assert!(s1.minor_gc_count > 0);
+        assert!(s2.major_gc_count > 0);
+        // vm1 未执行 Major GC
+        assert_eq!(s1.major_gc_count, 0);
+        // vm2 未执行 Minor GC
+        assert_eq!(s2.minor_gc_count, 0);
+
+        msVmFree(vm1);
+        msVmFree(vm2);
+    }
 }
 ```
 
@@ -834,6 +903,10 @@ static char captured_buf[4096];
 static size_t captured_len = 0;
 
 static int write_capture(const char* data, size_t len, void* userdata) {
+    if (captured_len + len > sizeof(captured_buf)) {
+        len = sizeof(captured_buf) - captured_len;
+    }
+    if (len == 0) return 0;
     memcpy(captured_buf + captured_len, data, len);
     captured_len += len;
     return 0;
@@ -894,6 +967,9 @@ void test_gc_stats_pause(void) {
 }
 
 void test_finalizer(void) {
+    finalizer_called = 0;
+    finalizer_userdata = NULL;
+
     MsVM* vm = msVmNew();
 
     msExecString(vm, "obj = [1, 2, 3]", "test.ms");
@@ -905,7 +981,6 @@ void test_finalizer(void) {
     assert(s == MS_OK);
 
     msDelGlobal(vm, "obj");
-    msGcCollect(vm, MS_GC_FULL);
     msGcCollect(vm, MS_GC_FULL);
 
     assert(finalizer_called == 1);
@@ -981,6 +1056,28 @@ void test_null_vm(void) {
     assert(s.minorGcCount == 0);
 }
 
+void test_multi_vm_isolation(void) {
+    MsVM* vm1 = msVmNew();
+    MsVM* vm2 = msVmNew();
+
+    msGcEnable(vm1, MS_FALSE);
+    assert(msGcIsEnabled(vm1) == MS_FALSE);
+    assert(msGcIsEnabled(vm2) == MS_TRUE);
+
+    msGcCollect(vm1, MS_GC_MINOR);
+    msGcCollect(vm2, MS_GC_MAJOR);
+
+    MsGcStats s1 = msGcStats(vm1);
+    MsGcStats s2 = msGcStats(vm2);
+    assert(s1.minorGcCount > 0);
+    assert(s2.majorGcCount > 0);
+    assert(s1.majorGcCount == 0);
+    assert(s2.minorGcCount == 0);
+
+    msVmFree(vm1);
+    msVmFree(vm2);
+}
+
 int main(void) {
     test_gc_collect();
     test_gc_enable_disable();
@@ -993,6 +1090,7 @@ int main(void) {
     test_gc_threads();
     test_gc_debug();
     test_null_vm();
+    test_multi_vm_isolation();
 
     printf("all gc tests passed\n");
     return 0;
