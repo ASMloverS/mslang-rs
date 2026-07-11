@@ -1190,6 +1190,804 @@ fn repr_object(obj: &Object) -> String {
     }
 }
 
+// ===========================================================================
+// Task 69 — 集合操作（List/Dict/Tuple/Set + 字符串操作 + 迭代器）
+// ===========================================================================
+
+use crate::capi::vm::lock_vm;
+
+/// 将 C 索引（支持负数）解析为 usize。越界返回 None。
+fn resolve_index(index: c_int, len: isize) -> Option<usize> {
+    let idx = if index < 0 {
+        len + index as isize
+    } else {
+        index as isize
+    };
+    if idx < 0 || idx >= len {
+        None
+    } else {
+        Some(idx as usize)
+    }
+}
+
+/// 计算 slice 的 (start, end) 边界。正/负 step 分别处理 clamp。
+fn compute_slice_bounds(start: c_int, end: c_int, step: isize, len: isize) -> (isize, isize) {
+    let s = if start < 0 {
+        (len + start as isize).max(if step > 0 { 0 } else { -1 })
+    } else {
+        (start as isize).min(if step > 0 { len } else { len - 1 })
+    };
+    let s = s.max(0);
+    let e = if end < 0 {
+        (len + end as isize).max(if step > 0 { 0 } else { -1 })
+    } else {
+        (end as isize).min(len)
+    };
+    (s, e)
+}
+
+// ---------------------------------------------------------------------------
+// 字符串操作
+// ---------------------------------------------------------------------------
+
+/// 返回字符串 UTF-8 字节长度。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msStringLen(vm: *mut MsVM, str_val: *mut MsValue) -> usize {
+    if vm.is_null() || str_val.is_null() {
+        return 0;
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*str_val).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+            unsafe { read_str(*ptr) }.len()
+        }
+        _ => 0,
+    }
+}
+
+/// 返回内部 UTF-8 数据指针（借用引用，无需 free）。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msStringData(vm: *mut MsVM, str_val: *mut MsValue) -> *const c_char {
+    if vm.is_null() || str_val.is_null() {
+        return std::ptr::null();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*str_val).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+            unsafe { read_str(*ptr) }.as_ptr() as *const c_char
+        }
+        _ => std::ptr::null(),
+    }
+}
+
+/// 连接两个字符串，返回新字符串。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msStringConcat(
+    vm: *mut MsVM,
+    a: *mut MsValue,
+    b: *mut MsValue,
+) -> *mut MsValue {
+    if vm.is_null() || a.is_null() || b.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match (unsafe { &(*a).inner }, unsafe { &(*b).inner }) {
+        (Object::Ref(pa), Object::Ref(pb))
+            if unsafe { (**pa).type_tag } == TypeTag::STRING as u8
+                && unsafe { (**pb).type_tag } == TypeTag::STRING as u8 =>
+        {
+            let sa = unsafe { read_str(*pa) };
+            let sb = unsafe { read_str(*pb) };
+            let combined = format!("{}{}", sa, sb);
+            let obj = alloc_string(&combined);
+            Box::into_raw(Box::new(MsValue { inner: obj }))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// 字符串切片，支持负索引。按字节切片。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msStringSlice(
+    vm: *mut MsVM,
+    str_val: *mut MsValue,
+    start: c_int,
+    end: c_int,
+) -> *mut MsValue {
+    if vm.is_null() || str_val.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*str_val).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+            let s = unsafe { read_str(*ptr) };
+            let len = s.len() as isize;
+            let lo = if start < 0 {
+                (len + start as isize).max(0)
+            } else {
+                (start as isize).min(len)
+            };
+            let hi = if end < 0 {
+                (len + end as isize).max(0)
+            } else {
+                (end as isize).min(len)
+            };
+            let lo_u = lo as usize;
+            let hi_u = hi.max(lo) as usize;
+            let sliced = s.get(lo_u..hi_u).unwrap_or("");
+            let obj = alloc_string(sliced);
+            Box::into_raw(Box::new(MsValue { inner: obj }))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// List 操作
+// ---------------------------------------------------------------------------
+
+/// 返回 List 长度。非 List 返回 -1。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListLen(vm: *mut MsVM, list: *mut MsValue) -> c_int {
+    if vm.is_null() || list.is_null() {
+        return -1;
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            unsafe { read_list(*ptr) }.len() as c_int
+        }
+        _ => -1,
+    }
+}
+
+/// 获取 List 元素（支持负索引）。越界设异常返回 NULL。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListGet(
+    vm: *mut MsVM,
+    list: *mut MsValue,
+    index: c_int,
+) -> *mut MsValue {
+    if vm.is_null() || list.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            let items = unsafe { read_list(*ptr) };
+            let len = items.len() as isize;
+            match resolve_index(index, len) {
+                Some(i) => Box::into_raw(Box::new(MsValue { inner: items[i].clone() })),
+                None => {
+                    set_type_error(vm, "valid index", unsafe { &(*list).inner });
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        _ => {
+            set_type_error(vm, "list", unsafe { &(*list).inner });
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 原地修改指定位置（支持负索引）。越界设异常返回 MS_ERROR。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListSet(
+    vm: *mut MsVM,
+    list: *mut MsValue,
+    index: c_int,
+    val: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || list.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let new_val = unsafe { (*val).inner.clone() };
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            let items = unsafe { read_list(*ptr) };
+            let len = items.len() as isize;
+            match resolve_index(index, len) {
+                Some(i) => {
+                    items[i] = new_val;
+                    MsStatus::MS_OK
+                }
+                None => {
+                    set_type_error(vm, "valid index", unsafe { &(*list).inner });
+                    MsStatus::MS_ERROR
+                }
+            }
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 尾部追加元素，返回 MS_OK。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListPush(
+    vm: *mut MsVM,
+    list: *mut MsValue,
+    val: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || list.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let new_val = unsafe { (*val).inner.clone() };
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            unsafe { read_list(*ptr) }.push(new_val);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 弹出末尾元素并返回。空列表设异常返回 NULL。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListPop(vm: *mut MsVM, list: *mut MsValue) -> *mut MsValue {
+    if vm.is_null() || list.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            let items = unsafe { read_list(*ptr) };
+            match items.pop() {
+                Some(val) => Box::into_raw(Box::new(MsValue { inner: val })),
+                None => {
+                    set_type_error(vm, "non-empty list", unsafe { &(*list).inner });
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// 在指定位置插入元素（支持负索引）。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListInsert(
+    vm: *mut MsVM,
+    list: *mut MsValue,
+    index: c_int,
+    val: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || list.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let new_val = unsafe { (*val).inner.clone() };
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            let items = unsafe { read_list(*ptr) };
+            let len = items.len() as isize;
+            let idx = if index < 0 {
+                (len + index as isize).max(0) as usize
+            } else {
+                (index as usize).min(len as usize)
+            };
+            items.insert(idx, new_val);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 包含则返回 MS_TRUE，否则 MS_FALSE。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListContains(
+    vm: *mut MsVM,
+    list: *mut MsValue,
+    val: *mut MsValue,
+) -> c_int {
+    if vm.is_null() || list.is_null() || val.is_null() {
+        return MS_FALSE;
+    }
+    let _guard = lock_vm(vm);
+    let target = unsafe { (*val).inner.clone() };
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            if unsafe { read_list(*ptr) }.contains(&target) {
+                MS_TRUE
+            } else {
+                MS_FALSE
+            }
+        }
+        _ => MS_FALSE,
+    }
+}
+
+/// 创建新列表切片，支持负索引和 step。step=0 设异常返回 NULL。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msListSlice(
+    vm: *mut MsVM,
+    list: *mut MsValue,
+    start: c_int,
+    end: c_int,
+    step: c_int,
+) -> *mut MsValue {
+    if vm.is_null() || list.is_null() {
+        return std::ptr::null_mut();
+    }
+    if step == 0 {
+        let _guard = lock_vm(vm);
+        set_type_error(vm, "non-zero step", unsafe { &(*list).inner });
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*list).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
+            let items = unsafe { read_list(*ptr) };
+            let len = items.len() as isize;
+            let step_is = step as isize;
+            let (s_idx, e_idx) = compute_slice_bounds(start, end, step_is, len);
+            let mut result = Vec::new();
+            let mut i = s_idx;
+            if step_is > 0 {
+                while i < e_idx && i >= 0 {
+                    result.push(items[i as usize].clone());
+                    i += step_is;
+                }
+            } else {
+                while i > e_idx && i >= 0 && i < len {
+                    result.push(items[i as usize].clone());
+                    i += step_is;
+                }
+            }
+            let result_obj = alloc_list(result);
+            Box::into_raw(Box::new(MsValue { inner: result_obj }))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dict 操作
+// ---------------------------------------------------------------------------
+
+/// 返回 Dict 长度。非 Dict 返回 -1。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictLen(vm: *mut MsVM, dict: *mut MsValue) -> c_int {
+    if vm.is_null() || dict.is_null() {
+        return -1;
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            unsafe { read_dict(*ptr) }.len() as c_int
+        }
+        _ => -1,
+    }
+}
+
+/// 获取键对应的值。键不存在返回 NULL（不设异常）。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictGet(
+    vm: *mut MsVM,
+    dict: *mut MsValue,
+    key: *mut MsValue,
+) -> *mut MsValue {
+    if vm.is_null() || dict.is_null() || key.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    let key_obj = unsafe { (*key).inner.clone() };
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            let map = unsafe { read_dict(*ptr) };
+            match map.get(&key_obj) {
+                Some(val) => Box::into_raw(Box::new(MsValue { inner: val.clone() })),
+                None => std::ptr::null_mut(),
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// 获取键对应的值，不存在时返回 defaultVal。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictGetDefault(
+    vm: *mut MsVM,
+    dict: *mut MsValue,
+    key: *mut MsValue,
+    default_val: *mut MsValue,
+) -> *mut MsValue {
+    if vm.is_null() || dict.is_null() || key.is_null() {
+        return default_val;
+    }
+    let _guard = lock_vm(vm);
+    let key_obj = unsafe { (*key).inner.clone() };
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            let map = unsafe { read_dict(*ptr) };
+            match map.get(&key_obj) {
+                Some(val) => Box::into_raw(Box::new(MsValue { inner: val.clone() })),
+                None => default_val,
+            }
+        }
+        _ => default_val,
+    }
+}
+
+/// 设置键值对（存在则覆盖）。键不可哈希设异常返回 MS_ERROR。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictSet(
+    vm: *mut MsVM,
+    dict: *mut MsValue,
+    key: *mut MsValue,
+    val: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || dict.is_null() || key.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let key_obj = unsafe { (*key).inner.clone() };
+    let val_obj = unsafe { (*val).inner.clone() };
+    if !is_hashable(&key_obj) {
+        set_type_error(vm, "hashable key", unsafe { &(*key).inner });
+        return MsStatus::MS_ERROR;
+    }
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            unsafe { read_dict(*ptr) }.insert(key_obj, val_obj);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 删除键值对。键不存在设异常返回 MS_ERROR。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictRemove(
+    vm: *mut MsVM,
+    dict: *mut MsValue,
+    key: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || dict.is_null() || key.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let key_obj = unsafe { (*key).inner.clone() };
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            let map = unsafe { read_dict(*ptr) };
+            if map.remove(&key_obj).is_some() {
+                MsStatus::MS_OK
+            } else {
+                set_type_error(vm, "existing key", unsafe { &(*key).inner });
+                MsStatus::MS_ERROR
+            }
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 包含则返回 MS_TRUE，否则 MS_FALSE。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictContains(
+    vm: *mut MsVM,
+    dict: *mut MsValue,
+    key: *mut MsValue,
+) -> c_int {
+    if vm.is_null() || dict.is_null() || key.is_null() {
+        return MS_FALSE;
+    }
+    let _guard = lock_vm(vm);
+    let key_obj = unsafe { (*key).inner.clone() };
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            if unsafe { read_dict(*ptr) }.get(&key_obj).is_some() {
+                MS_TRUE
+            } else {
+                MS_FALSE
+            }
+        }
+        _ => MS_FALSE,
+    }
+}
+
+/// 返回新 List，包含所有键（保持插入顺序）。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictKeys(vm: *mut MsVM, dict: *mut MsValue) -> *mut MsValue {
+    if vm.is_null() || dict.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            let map = unsafe { read_dict(*ptr) };
+            let keys: Vec<Object> = map.keys().into_iter().cloned().collect();
+            let obj = alloc_list(keys);
+            Box::into_raw(Box::new(MsValue { inner: obj }))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// 返回新 List，包含所有值（保持插入顺序）。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictValues(vm: *mut MsVM, dict: *mut MsValue) -> *mut MsValue {
+    if vm.is_null() || dict.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            let map = unsafe { read_dict(*ptr) };
+            let vals: Vec<Object> = map.items().iter().map(|(_, v)| (*v).clone()).collect();
+            let obj = alloc_list(vals);
+            Box::into_raw(Box::new(MsValue { inner: obj }))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// 返回新 List，每个元素为二元 Tuple (key, value)。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msDictItems(vm: *mut MsVM, dict: *mut MsValue) -> *mut MsValue {
+    if vm.is_null() || dict.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*dict).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
+            let map = unsafe { read_dict(*ptr) };
+            let pairs: Vec<Object> = map
+                .items()
+                .iter()
+                .map(|(k, v)| alloc_tuple(vec![(**k).clone(), (*v).clone()]))
+                .collect();
+            let obj = alloc_list(pairs);
+            Box::into_raw(Box::new(MsValue { inner: obj }))
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tuple 操作
+// ---------------------------------------------------------------------------
+
+/// 返回 Tuple 长度。非 Tuple 返回 -1。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msTupleLen(vm: *mut MsVM, tup: *mut MsValue) -> c_int {
+    if vm.is_null() || tup.is_null() {
+        return -1;
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*tup).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+            unsafe { read_tuple(*ptr) }.len() as c_int
+        }
+        _ => -1,
+    }
+}
+
+/// 获取 Tuple 元素（支持负索引）。越界设异常返回 NULL。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msTupleGet(
+    vm: *mut MsVM,
+    tup: *mut MsValue,
+    index: c_int,
+) -> *mut MsValue {
+    if vm.is_null() || tup.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*tup).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+            let items = unsafe { read_tuple(*ptr) };
+            let len = items.len() as isize;
+            match resolve_index(index, len) {
+                Some(i) => Box::into_raw(Box::new(MsValue { inner: items[i].clone() })),
+                None => {
+                    set_type_error(vm, "valid index", unsafe { &(*tup).inner });
+                    std::ptr::null_mut()
+                }
+            }
+        }
+        _ => {
+            set_type_error(vm, "tuple", unsafe { &(*tup).inner });
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// 解包 Tuple，通过 malloc 分配 MsValue* 数组。调用方用 msTupleUnpackFree 释放。
+#[no_mangle]
+pub extern "C" fn msTupleUnpack(
+    vm: *mut MsVM,
+    tup: *mut MsValue,
+    items_out: *mut *mut *mut MsValue,
+    count_out: *mut c_int,
+) -> MsStatus {
+    if vm.is_null() || tup.is_null() || items_out.is_null() || count_out.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*tup).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::TUPLE as u8 => {
+            let elements = unsafe { read_tuple(*ptr) };
+            let n = elements.len();
+            if n == 0 {
+                unsafe {
+                    *items_out = std::ptr::null_mut();
+                    *count_out = 0;
+                }
+                return MsStatus::MS_OK;
+            }
+            let layout = match std::alloc::Layout::array::<*mut MsValue>(n) {
+                Ok(l) => l,
+                Err(_) => return MsStatus::MS_ERROR,
+            };
+            let arr = unsafe { std::alloc::alloc(layout) as *mut *mut MsValue };
+            if arr.is_null() {
+                return MsStatus::MS_ERROR;
+            }
+            for (i, elem) in elements.iter().enumerate() {
+                let ms_val = Box::into_raw(Box::new(MsValue { inner: elem.clone() }));
+                unsafe {
+                    *arr.add(i) = ms_val;
+                }
+            }
+            unsafe {
+                *items_out = arr;
+                *count_out = n as c_int;
+            }
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 释放 msTupleUnpack 分配的数组（逐个释放 MsValue + 数组本身）。
+#[no_mangle]
+pub extern "C" fn msTupleUnpackFree(items: *mut *mut MsValue, count: c_int) {
+    if items.is_null() || count <= 0 {
+        return;
+    }
+    let n = count as usize;
+    for i in 0..n {
+        let val = unsafe { *items.add(i) };
+        if !val.is_null() {
+            unsafe {
+                let _ = Box::from_raw(val);
+            }
+        }
+    }
+    let layout = std::alloc::Layout::array::<*mut MsValue>(n).unwrap();
+    unsafe {
+        std::alloc::dealloc(items as *mut u8, layout);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Set 操作
+// ---------------------------------------------------------------------------
+
+/// 返回 Set 长度。非 Set 返回 -1。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msSetLen(vm: *mut MsVM, set: *mut MsValue) -> c_int {
+    if vm.is_null() || set.is_null() {
+        return -1;
+    }
+    let _guard = lock_vm(vm);
+    match unsafe { &(*set).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+            unsafe { read_set(*ptr) }.len() as c_int
+        }
+        _ => -1,
+    }
+}
+
+/// 添加元素（已存在则无操作）。不可哈希设异常返回 MS_ERROR。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msSetAdd(
+    vm: *mut MsVM,
+    set: *mut MsValue,
+    val: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || set.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let val_obj = unsafe { (*val).inner.clone() };
+    if !is_hashable(&val_obj) {
+        set_type_error(vm, "hashable element", unsafe { &(*val).inner });
+        return MsStatus::MS_ERROR;
+    }
+    match unsafe { &(*set).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+            unsafe { read_set(*ptr) }.insert(val_obj);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 删除元素。不存在时无异常、无错误（返回 MS_OK）。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msSetRemove(
+    vm: *mut MsVM,
+    set: *mut MsValue,
+    val: *mut MsValue,
+) -> MsStatus {
+    if vm.is_null() || set.is_null() || val.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let _guard = lock_vm(vm);
+    let val_obj = unsafe { (*val).inner.clone() };
+    if !is_hashable(&val_obj) {
+        return MsStatus::MS_OK;
+    }
+    match unsafe { &(*set).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+            unsafe { read_set(*ptr) }.remove(&val_obj);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
+}
+
+/// 包含则返回 MS_TRUE，否则 MS_FALSE。NULL 安全。
+#[no_mangle]
+pub extern "C" fn msSetContains(
+    vm: *mut MsVM,
+    set: *mut MsValue,
+    val: *mut MsValue,
+) -> c_int {
+    if vm.is_null() || set.is_null() || val.is_null() {
+        return MS_FALSE;
+    }
+    let _guard = lock_vm(vm);
+    let val_obj = unsafe { (*val).inner.clone() };
+    if !is_hashable(&val_obj) {
+        return MS_FALSE;
+    }
+    match unsafe { &(*set).inner } {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
+            if unsafe { read_set(*ptr) }.contains(&val_obj) {
+                MS_TRUE
+            } else {
+                MS_FALSE
+            }
+        }
+        _ => MS_FALSE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 迭代器（Deferred — 迭代器协议内部结构尚未实现）
+// ---------------------------------------------------------------------------
+
+/// 调用可迭代对象的 __iter__ 协议。当前为占位实现，设 TypeError 返回 NULL。
+#[no_mangle]
+pub extern "C" fn msIter(vm: *mut MsVM, iterable: *mut MsValue) -> *mut MsValue {
+    if vm.is_null() || iterable.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _guard = lock_vm(vm);
+    set_type_error(
+        vm,
+        "iterable (iterator protocol not yet implemented)",
+        unsafe { &(*iterable).inner },
+    );
+    std::ptr::null_mut()
+}
+
+/// 调用迭代器的 __next__。当前为占位实现，返回 MS_ERROR。
+#[no_mangle]
+pub extern "C" fn msNext(
+    vm: *mut MsVM,
+    iterator: *mut MsValue,
+    out: *mut *mut MsValue,
+) -> MsStatus {
+    let _ = (vm, iterator, out);
+    MsStatus::MS_ERROR
+}
+
 // ---------------------------------------------------------------------------
 // Rust 单元测试
 // ---------------------------------------------------------------------------
@@ -1699,4 +2497,246 @@ mod tests_convert {
     // --- Deferred tests (require Task 69/73) ---
     // test_attr_access: requires msInstanceNew (Task 73)
     // test_item_access: requires msListPush/msGetItem/msSetItem (Task 69)
+}
+
+#[cfg(test)]
+mod tests_collections {
+    use super::*;
+    use crate::capi::vm::{msVmFree, msVmNew};
+    use crate::capi::types::{MsStatus, MsType};
+    use std::os::raw::{c_char, c_int};
+    use std::ptr;
+
+    fn free_value(val: *mut MsValue) {
+        if !val.is_null() {
+            unsafe {
+                let _ = Box::from_raw(val);
+            }
+        }
+    }
+
+    fn cstr(s: &str) -> *const c_char {
+        Box::leak(format!("{}\0", s).into_boxed_str()).as_ptr() as *const c_char
+    }
+
+    #[test]
+    fn test_list_push_pop_get_set() {
+        let vm = msVmNew();
+        let list = msListNew(vm);
+
+        let v1 = msInt(10);
+        let v2 = msInt(20);
+        let v3 = msInt(30);
+
+        assert_eq!(msListPush(vm, list, v1), MsStatus::MS_OK);
+        assert_eq!(msListPush(vm, list, v2), MsStatus::MS_OK);
+        assert_eq!(msListPush(vm, list, v3), MsStatus::MS_OK);
+        assert_eq!(msListLen(vm, list), 3);
+
+        assert_eq!(msToInt(vm, msListGet(vm, list, 0)), 10);
+        assert_eq!(msToInt(vm, msListGet(vm, list, -1)), 30);
+
+        let v99 = msInt(99);
+        assert_eq!(msListSet(vm, list, 1, v99), MsStatus::MS_OK);
+        assert_eq!(msToInt(vm, msListGet(vm, list, 1)), 99);
+
+        let popped = msListPop(vm, list);
+        assert_eq!(msToInt(vm, popped), 30);
+        assert_eq!(msListLen(vm, list), 2);
+
+        free_value(v1);
+        free_value(v2);
+        free_value(v3);
+        free_value(v99);
+        free_value(popped);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_list_slice() {
+        let vm = msVmNew();
+        let list = msListNew(vm);
+
+        for i in 0..6 {
+            msListPush(vm, list, msInt(i));
+        }
+
+        let sliced = msListSlice(vm, list, 1, 4, 1);
+        assert_eq!(msListLen(vm, sliced), 3);
+        assert_eq!(msToInt(vm, msListGet(vm, sliced, 0)), 1);
+
+        let stepped = msListSlice(vm, list, 0, 6, 2);
+        assert_eq!(msListLen(vm, stepped), 3);
+        assert_eq!(msToInt(vm, msListGet(vm, stepped, 0)), 0);
+        assert_eq!(msToInt(vm, msListGet(vm, stepped, 1)), 2);
+
+        free_value(sliced);
+        free_value(stepped);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_dict_set_get_remove() {
+        let vm = msVmNew();
+        let dict = msDictNew(vm);
+
+        let key_a = msString(vm, cstr("a"));
+        let val_1 = msInt(1);
+        assert_eq!(msDictSet(vm, dict, key_a, val_1), MsStatus::MS_OK);
+
+        let key_b = msString(vm, cstr("b"));
+        let val_2 = msInt(2);
+        assert_eq!(msDictSet(vm, dict, key_b, val_2), MsStatus::MS_OK);
+
+        assert_eq!(msDictLen(vm, dict), 2);
+        assert_eq!(msToInt(vm, msDictGet(vm, dict, key_a)), 1);
+        assert_eq!(msDictContains(vm, dict, key_a), MS_TRUE);
+
+        assert_eq!(msDictRemove(vm, dict, key_a), MsStatus::MS_OK);
+        assert!(msDictGet(vm, dict, key_a).is_null());
+
+        let default_val = msInt(42);
+        let result = msDictGetDefault(vm, dict, msString(vm, cstr("z")), default_val);
+        assert_eq!(msToInt(vm, result), 42);
+
+        free_value(key_a);
+        free_value(key_b);
+        free_value(val_1);
+        free_value(val_2);
+        free_value(default_val);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_dict_keys_values_items() {
+        let vm = msVmNew();
+        let dict = msDictNew(vm);
+
+        let kx = msString(vm, cstr("x"));
+        let vx = msInt(10);
+        msDictSet(vm, dict, kx, vx);
+        let ky = msString(vm, cstr("y"));
+        let vy = msInt(20);
+        msDictSet(vm, dict, ky, vy);
+
+        let keys = msDictKeys(vm, dict);
+        assert_eq!(msListLen(vm, keys), 2);
+        let vals = msDictValues(vm, dict);
+        assert_eq!(msListLen(vm, vals), 2);
+
+        let items = msDictItems(vm, dict);
+        assert_eq!(msListLen(vm, items), 2);
+        assert_eq!(msTypeof(msListGet(vm, items, 0)), MsType::Tuple);
+
+        free_value(kx);
+        free_value(ky);
+        free_value(vx);
+        free_value(vy);
+        free_value(keys);
+        free_value(vals);
+        free_value(items);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_set_add_remove_contains() {
+        let vm = msVmNew();
+        let set = msSetNew(vm);
+
+        assert_eq!(msSetLen(vm, set), 0);
+
+        let v1 = msInt(1);
+        let v2 = msInt(2);
+        let v1b = msInt(1);
+        msSetAdd(vm, set, v1);
+        msSetAdd(vm, set, v2);
+        msSetAdd(vm, set, v1b);
+        assert_eq!(msSetLen(vm, set), 2);
+
+        assert_eq!(msSetContains(vm, set, msInt(1)), MS_TRUE);
+        assert_eq!(msSetContains(vm, set, msInt(3)), MS_FALSE);
+
+        msSetRemove(vm, set, msInt(1));
+        assert_eq!(msSetContains(vm, set, msInt(1)), MS_FALSE);
+
+        free_value(v1);
+        free_value(v2);
+        free_value(v1b);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_string_concat_slice() {
+        let vm = msVmNew();
+        let a = msString(vm, cstr("hello"));
+        let b = msString(vm, cstr(" world"));
+
+        assert_eq!(msStringLen(vm, a), 5);
+
+        let data = msStringData(vm, a);
+        let len = msStringLen(vm, a);
+        let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+        assert_eq!(std::str::from_utf8(bytes).unwrap(), "hello");
+
+        let concat = msStringConcat(vm, a, b);
+        let c_data = msStringData(vm, concat);
+        let c_len = msStringLen(vm, concat);
+        let c_bytes = unsafe { std::slice::from_raw_parts(c_data as *const u8, c_len) };
+        assert_eq!(std::str::from_utf8(c_bytes).unwrap(), "hello world");
+
+        let sliced = msStringSlice(vm, concat, 0, 5);
+        let sl_data = msStringData(vm, sliced);
+        let sl_len = msStringLen(vm, sliced);
+        let sl_bytes = unsafe { std::slice::from_raw_parts(sl_data as *const u8, sl_len) };
+        assert_eq!(std::str::from_utf8(sl_bytes).unwrap(), "hello");
+
+        free_value(a);
+        free_value(b);
+        free_value(concat);
+        free_value(sliced);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_tuple_unpack() {
+        let vm = msVmNew();
+
+        let elems: Vec<*mut MsValue> = vec![msInt(10), msInt(20), msInt(30)];
+        let tup = msTupleFrom(vm, elems.as_ptr(), 3);
+
+        assert_eq!(msTupleLen(vm, tup), 3);
+        assert_eq!(msToInt(vm, msTupleGet(vm, tup, 0)), 10);
+        assert_eq!(msToInt(vm, msTupleGet(vm, tup, -1)), 30);
+
+        let mut items: *mut *mut MsValue = ptr::null_mut();
+        let mut count: c_int = 0;
+        assert_eq!(
+            msTupleUnpack(vm, tup, &mut items, &mut count),
+            MsStatus::MS_OK
+        );
+        assert_eq!(count, 3);
+        assert_eq!(msToInt(vm, unsafe { *items.add(0) }), 10);
+
+        msTupleUnpackFree(items, count);
+
+        for e in elems {
+            free_value(e);
+        }
+        free_value(tup);
+        msVmFree(vm);
+    }
+
+    #[test]
+    fn test_null_safety_collections() {
+        assert_eq!(msStringLen(ptr::null_mut(), ptr::null_mut()), 0);
+        assert!(msStringData(ptr::null_mut(), ptr::null_mut()).is_null());
+        assert!(msStringConcat(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()).is_null());
+        assert!(msStringSlice(ptr::null_mut(), ptr::null_mut(), 0, 1).is_null());
+        assert_eq!(msListLen(ptr::null_mut(), ptr::null_mut()), -1);
+        assert!(msListGet(ptr::null_mut(), ptr::null_mut(), 0).is_null());
+        assert_eq!(msListPush(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()), MsStatus::MS_ERROR);
+        assert_eq!(msDictLen(ptr::null_mut(), ptr::null_mut()), -1);
+        assert_eq!(msSetLen(ptr::null_mut(), ptr::null_mut()), -1);
+        assert_eq!(msTupleLen(ptr::null_mut(), ptr::null_mut()), -1);
+    }
 }

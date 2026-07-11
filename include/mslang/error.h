@@ -267,6 +267,397 @@ MS_API int msIsChannel(MsValue *val);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
+ * 从 MsValue 提取 i64。Int → i64；Float → 截断（NaN/Inf 设 TypeError 返回 0）；
+ * 其余设 TypeError 返回 0。NULL 安全。
+ */
+MS_API int64_t msToInt(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从 MsValue 提取 f64。Int/Float → f64；其余设 TypeError 返回 0.0。NULL 安全。
+ */
+MS_API double msToFloat(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 按 truthy 规则转换为 MS_TRUE/MS_FALSE。不设异常。NULL 安全。
+ */
+MS_API int msToBool(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回内部字符串指针（借用引用）。所有类型格式化到 thread_local 缓冲区
+ * （保证 null 终止符）。NULL 安全。
+ */
+MS_API const char *msToString(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回字符串副本（CString::into_raw），C 侧 free() 释放。NULL 安全。
+ */
+MS_API char *msToStringCopy(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 对应 mslang int()。Bool→0/1；Int→自身；Float→截断；String→解析。
+ * 转换失败设 TypeError 返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msConvertInt(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 对应 mslang float()。Bool→0.0/1.0；Int→f64；Float→自身；String→解析。
+ * 转换失败设 TypeError 返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msConvertFloat(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 对应 mslang str()。所有类型用 Display 格式化；String→自身。
+ * NULL 安全。
+ */
+MS_API MsValue *msConvertStr(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 对应 mslang bool()。按 truthy 规则返回 MS_TRUE_VAL/MS_FALSE_VAL。
+ * NULL 安全。
+ */
+MS_API MsValue *msConvertBool(MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 对应 mslang list()。String→字符列表；List→浅拷贝；Tuple/Set→转换；
+ * Dict→key 列表。其余报错。NULL 安全。
+ */
+MS_API MsValue *msConvertList(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 值相等比较（==）。返回 MS_TRUE/MS_FALSE。NULL 安全。
+ */
+MS_API int msEq(MsVM *vm, MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 顺序比较 a < b。类型不兼容设 TypeError。NULL 安全。
+ */
+MS_API int msLt(MsVM *vm, MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 顺序比较 a <= b。类型不兼容设 TypeError。NULL 安全。
+ */
+MS_API int msLe(MsVM *vm, MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 顺序比较 a > b。类型不兼容设 TypeError。NULL 安全。
+ */
+MS_API int msGt(MsVM *vm, MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 顺序比较 a >= b。类型不兼容设 TypeError。NULL 安全。
+ */
+MS_API int msGe(MsVM *vm, MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 身份比较（is）。对 Ref 类型比较指针；内联值返回 MS_FALSE
+ * （签名无 vm 参数，无法设 TypeError）。NULL 安全。
+ */
+MS_API int msIs(MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回哈希值。不可哈希类型设异常返回 0。NULL 安全。
+ */
+MS_API int64_t msHash(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 获取命名属性。Deferred（Task 73）：Instance/Module/Class。
+ * 其余类型设 TypeError 返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msGetAttr(MsVM *vm, MsValue *obj, const char *attr);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 设置命名属性。Deferred（Task 73）：仅 Instance 和可变对象支持。
+ * 其余类型设 TypeError 返回 MS_ERROR。NULL 安全。
+ */
+MS_API MsStatus msSetAttr(MsVM *vm, MsValue *obj, const char *attr, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 获取下标。Deferred（Task 69）：List/Dict/String/Tuple。
+ * 其余类型设 TypeError 返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msGetItem(MsVM *vm, MsValue *obj, MsValue *key);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 设置下标。Deferred（Task 69）：仅 List 和 Dict 支持。
+ * 其余类型设 TypeError 返回 MS_ERROR。NULL 安全。
+ */
+MS_API MsStatus msSetItem(MsVM *vm, MsValue *obj, MsValue *key, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 通用长度。String/List/Dict/Tuple/Set 返回元素数；其余设异常返回 -1。
+ * NULL 安全。
+ */
+MS_API int64_t msLen(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 repr 字符串。String 带引号，对象显示类型信息。NULL 安全。
+ */
+MS_API MsValue *msRepr(MsVM *vm, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回字符串 UTF-8 字节长度。NULL 安全。
+ */
+MS_API uintptr_t msStringLen(MsVM *vm, MsValue *str_val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回内部 UTF-8 数据指针（借用引用，无需 free）。NULL 安全。
+ */
+MS_API const char *msStringData(MsVM *vm, MsValue *str_val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 连接两个字符串，返回新字符串。NULL 安全。
+ */
+MS_API MsValue *msStringConcat(MsVM *vm, MsValue *a, MsValue *b);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 字符串切片，支持负索引。按字节切片。NULL 安全。
+ */
+MS_API MsValue *msStringSlice(MsVM *vm, MsValue *str_val, int start, int end);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 List 长度。非 List 返回 -1。NULL 安全。
+ */
+MS_API int msListLen(MsVM *vm, MsValue *list);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 获取 List 元素（支持负索引）。越界设异常返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msListGet(MsVM *vm, MsValue *list, int index);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 原地修改指定位置（支持负索引）。越界设异常返回 MS_ERROR。NULL 安全。
+ */
+MS_API MsStatus msListSet(MsVM *vm, MsValue *list, int index, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 尾部追加元素，返回 MS_OK。NULL 安全。
+ */
+MS_API MsStatus msListPush(MsVM *vm, MsValue *list, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 弹出末尾元素并返回。空列表设异常返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msListPop(MsVM *vm, MsValue *list);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 在指定位置插入元素（支持负索引）。NULL 安全。
+ */
+MS_API MsStatus msListInsert(MsVM *vm, MsValue *list, int index, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 包含则返回 MS_TRUE，否则 MS_FALSE。NULL 安全。
+ */
+MS_API int msListContains(MsVM *vm, MsValue *list, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建新列表切片，支持负索引和 step。step=0 设异常返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msListSlice(MsVM *vm, MsValue *list, int start, int end, int step);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 Dict 长度。非 Dict 返回 -1。NULL 安全。
+ */
+MS_API int msDictLen(MsVM *vm, MsValue *dict);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 获取键对应的值。键不存在返回 NULL（不设异常）。NULL 安全。
+ */
+MS_API MsValue *msDictGet(MsVM *vm, MsValue *dict, MsValue *key);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 获取键对应的值，不存在时返回 defaultVal。NULL 安全。
+ */
+MS_API MsValue *msDictGetDefault(MsVM *vm, MsValue *dict, MsValue *key, MsValue *default_val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 设置键值对（存在则覆盖）。键不可哈希设异常返回 MS_ERROR。NULL 安全。
+ */
+MS_API MsStatus msDictSet(MsVM *vm, MsValue *dict, MsValue *key, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 删除键值对。键不存在设异常返回 MS_ERROR。NULL 安全。
+ */
+MS_API MsStatus msDictRemove(MsVM *vm, MsValue *dict, MsValue *key);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 包含则返回 MS_TRUE，否则 MS_FALSE。NULL 安全。
+ */
+MS_API int msDictContains(MsVM *vm, MsValue *dict, MsValue *key);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回新 List，包含所有键（保持插入顺序）。NULL 安全。
+ */
+MS_API MsValue *msDictKeys(MsVM *vm, MsValue *dict);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回新 List，包含所有值（保持插入顺序）。NULL 安全。
+ */
+MS_API MsValue *msDictValues(MsVM *vm, MsValue *dict);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回新 List，每个元素为二元 Tuple (key, value)。NULL 安全。
+ */
+MS_API MsValue *msDictItems(MsVM *vm, MsValue *dict);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 Tuple 长度。非 Tuple 返回 -1。NULL 安全。
+ */
+MS_API int msTupleLen(MsVM *vm, MsValue *tup);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 获取 Tuple 元素（支持负索引）。越界设异常返回 NULL。NULL 安全。
+ */
+MS_API MsValue *msTupleGet(MsVM *vm, MsValue *tup, int index);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 解包 Tuple，通过 malloc 分配 MsValue* 数组。调用方用 msTupleUnpackFree 释放。
+ */
+MS_API MsStatus msTupleUnpack(MsVM *vm, MsValue *tup, MsValue ***items_out, int *count_out);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 释放 msTupleUnpack 分配的数组（逐个释放 MsValue + 数组本身）。
+ */
+MS_API void msTupleUnpackFree(MsValue **items, int count);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 Set 长度。非 Set 返回 -1。NULL 安全。
+ */
+MS_API int msSetLen(MsVM *vm, MsValue *set);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 添加元素（已存在则无操作）。不可哈希设异常返回 MS_ERROR。NULL 安全。
+ */
+MS_API MsStatus msSetAdd(MsVM *vm, MsValue *set, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 删除元素。不存在时无异常、无错误（返回 MS_OK）。NULL 安全。
+ */
+MS_API MsStatus msSetRemove(MsVM *vm, MsValue *set, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 包含则返回 MS_TRUE，否则 MS_FALSE。NULL 安全。
+ */
+MS_API int msSetContains(MsVM *vm, MsValue *set, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 调用可迭代对象的 __iter__ 协议。当前为占位实现，设 TypeError 返回 NULL。
+ */
+MS_API MsValue *msIter(MsVM *vm, MsValue *iterable);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 调用迭代器的 __next__。当前为占位实现，返回 MS_ERROR。
+ */
+MS_API MsStatus msNext(MsVM *vm, MsValue *iterator, MsValue **out);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
  * 将对象注册为 GC 根，返回 `val` 本身。注册后 GC 不会回收此对象。
  * 仅对 Ref 类型（堆对象）有效。内联值为安全 no-op。NULL 安全。
  */
