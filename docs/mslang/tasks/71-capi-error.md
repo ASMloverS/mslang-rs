@@ -4,7 +4,7 @@
 Phase 6 — 模块系统 + 标准库
 
 ## 前置任务
-65-capi-infrastructure, 66-capi-vm, 68-capi-value-convert
+65-capi-infrastructure, 66-capi-vm, 68-capi-value-convert, 70-capi-call
 
 ## 目标
 实现 `error.h` 全部 API：异常查询（`msErrOccurred`/`msErrFetch`/`msErrClear`）、异常对象属性访问（`msErrTypeName`/`msErrMessage`/`msErrTraceback`/`msErrCause`）、C 侧抛出异常（`msThrow`/`msThrowValue`/`msThrowRethrow` 及六个便捷函数）、try/catch 模式（`msTry`）。使 C 扩展模块能够抛出和捕获 mslang 异常，与脚本侧异常系统无缝对接。
@@ -73,137 +73,197 @@ MS_API MsStatus msTry(MsVM* vm, MsValue* func, MsValue* const* args, int nargs,
 
 ```
 src/capi/error.rs    — 全部 error.h API 实现
+include/mslang/mslang.h  — 取消 error.h 注释
 ```
 
-### 1. VmInner 扩展 — pending_error 字段
-
-在 Task 66（`src/capi/vm.rs`）定义的 `VmInner` 中追加 `pending_error`：
-
-```rust
-struct VmInner {
-    // ... Task 66 已有字段 ...
-    pending_error: Option<Box<CapiError>>,
-}
+依赖（前置任务已完成）:
+```
+src/capi/vm.rs       — MsVM、lock_vm、VmInner
+src/capi/types.rs     — MsValue、MsStatus
+src/capi/call.rs      — msCall（task 70，msTry 复用）
+src/vm/object.rs      — MsException、TypeTag::EXCEPTION、alloc_exception、read_exception
+src/vm/mod.rs         — VM.has_error / VM.error_message
 ```
 
-`CapiError` 定义（`src/capi/error.rs`）：
+### 1. 错误状态机制 — 复用 VM.has_error / VM.error_message
 
-```rust
-struct CapiError {
-    type_name: String,
-    message: String,
-    traceback: String,
-    cause: Option<NonNull<MsValueInner>>,
-}
-```
+不新增 `CapiError` 结构体或 `pending_error` 字段。Task 68 已在 `VM` 上
+引入 `has_error: bool` + `error_message: String`（`src/vm/mod.rs:141-146`，
+`#[cfg(feature = "capi")]`），作为 C API 错误状态的统一存储。
+Task 71 的全部 `msThrow*` / `msErr*` 函数直接读写这两个字段。
 
-初始化时 `pending_error = None`。`VmInner` 由 `Mutex` 保护，`pending_error` 的读写自动线程安全。
+| 操作 | 代码 |
+|---|---|
+| 设置错误 | `inner.vm.has_error = true; inner.vm.error_message = format!(...)` |
+| 检查错误 | `inner.vm.has_error` |
+| 清除错误 | `inner.vm.has_error = false; inner.vm.error_message.clear()` |
 
-### 2. 异常查询函数
+> **set_type_error 迁移**：`src/capi/mod.rs:32-43` 的占位函数 `set_type_error`
+> 标注 "Task 71 完成后由 msThrowTypeError 取代"。本任务完成后，`set_type_error`
+> 的调用方（value.rs 中的类型错误设置）改为调用 `msThrowTypeError`，
+> `set_type_error` 函数可移除或改为 `msThrowTypeError` 的 thin wrapper。
+
+异常对象（msErrFetch 返回值）使用已有的 `MsException` 堆对象
+（`TypeTag::EXCEPTION`，`src/vm/object.rs:771-777`）：
+`class_name: String`, `message: Object`, `traceback: Object`, `cause: Object`。
+
+### 2. 异常查询函数 — src/capi/error.rs
 
 #### msErrOccurred
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msErrOccurred(vm: *mut MsVM) -> c_int {
-    let vm = unsafe { &mut *vm };
-    let inner = vm.inner.lock().unwrap();
-    if inner.pending_error.is_some() {
-        MS_TRUE
-    } else {
-        MS_FALSE
+    if vm.is_null() {
+        return MS_FALSE;
     }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &*guard.get() };
+    if inner.vm.has_error { MS_TRUE } else { MS_FALSE }
 }
 ```
 
 #### msErrFetch
 
+取出错误状态，构建 `MsException` 堆对象（`TypeTag::EXCEPTION`）返回。
+
 ```rust
 #[no_mangle]
 pub extern "C" fn msErrFetch(vm: *mut MsVM) -> *mut MsValue {
-    let vm = unsafe { &mut *vm };
-    let mut inner = vm.inner.lock().unwrap();
-    match inner.pending_error.take() {
-        Some(err) => {
-            let val = error_to_value(vm, err);
-            val as *mut MsValue
-        }
-        None => std::ptr::null_mut(),
+    if vm.is_null() {
+        return std::ptr::null_mut();
+    }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    if !inner.vm.has_error {
+        return std::ptr::null_mut();
+    }
+
+    // 解析 error_message → type_name + message
+    // VM 错误格式通常为 "TypeName: message" 或纯 message
+    let (type_name, message) = parse_error_message(&inner.vm.error_message);
+
+    // 重置错误状态
+    inner.vm.has_error = false;
+    inner.vm.error_message.clear();
+
+    // 构建 MsException 堆对象
+    let exc = alloc_exception(
+        &type_name,
+        alloc_string(&message),
+        alloc_string(""),
+        Object::Nil,
+    );
+    Box::into_raw(Box::new(MsValue { inner: exc }))
+}
+
+/// 从 error_message 解析 type_name 和 message。
+/// 格式 "TypeName: message" → ("TypeName", "message")；
+/// 无前缀 → ("Error", full_message)。
+fn parse_error_message(msg: &str) -> (String, String) {
+    if let Some(colon) = msg.find(": ") {
+        (msg[..colon].to_string(), msg[colon + 2..].to_string())
+    } else {
+        ("Error".to_string(), msg.to_string())
     }
 }
 ```
-
-`error_to_value` 将 `CapiError` 转换为 `MsValue`（创建 `MsValueInner::Error` 变体），注册为 GC root，返回新引用。转换后 `pending_error` 被清空（`take()`）。
 
 #### msErrClear
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msErrClear(vm: *mut MsVM) {
-    let vm = unsafe { &mut *vm };
-    let mut inner = vm.inner.lock().unwrap();
-    inner.pending_error = None;
+    if vm.is_null() {
+        return;
+    }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    inner.vm.has_error = false;
+    inner.vm.error_message.clear();
 }
 ```
 
 ### 3. 异常对象属性函数
 
-四个属性函数从 `MsValueInner::Error` 中提取字段，返回借用指针。
-
-#### MsValueInner 扩展
-
-在 Task 68 定义的 `MsValueInner` 枚举中追加：
-
-```rust
-enum MsValueInner {
-    // ... 已有变体 ...
-    Error {
-        type_name: String,
-        message: String,
-        traceback: String,
-        cause: Option<NonNull<MsValueInner>>,
-    },
-}
-```
-
-字符串字段存储在 `MsValueInner` 内部，确保指针稳定性（只要 `MsValueInner` 存活，`const char*` 有效）。
+四个属性函数检查 `MsValue.inner` 是否为 `Object::Ref` 且 `type_tag == TypeTag::EXCEPTION`，
+然后用 `read_exception(ptr)` 提取字段。返回的 `const char*` 指向 MsException 堆对象
+的 String 字段内部缓冲器，只要 MsValue\* 有效（Ref 存活），指针有效。
 
 #### msErrTypeName
 
 ```rust
 #[no_mangle]
-pub extern "C" fn msErrTypeName(vm: *mut MsVM, err: *mut MsValue) -> *const c_char {
-    let inner = unsafe { &*err }.inner();
-    match inner {
-        MsValueInner::Error { type_name, .. } => {
-            type_name.as_ptr() as *const c_char
+pub extern "C" fn msErrTypeName(_vm: *mut MsVM, err: *mut MsValue) -> *const c_char {
+    if err.is_null() {
+        return std::ptr::null();
+    }
+    let val = unsafe { &*err };
+    match &val.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
+            let exc = unsafe { read_exception(*ptr) };
+            exc.class_name.as_ptr() as *const c_char
         }
         _ => std::ptr::null(),
     }
 }
 ```
 
-`msErrMessage`、`msErrTraceback` 同理，分别返回 `message` 和 `traceback` 的 `as_ptr()`。
+> **生命周期**：`exc.class_name` 是 `MsException` 堆对象的 `String` 字段。
+> 只要 MsValue\* 有效（Ref 指向的 MsException 未被 GC 回收），String 存活，
+> `as_ptr()` 有效。C 侧应在 MsValue\* 存活期间使用返回的指针。
+
+#### msErrMessage / msErrTraceback
+
+```rust
+#[no_mangle]
+pub extern "C" fn msErrMessage(_vm: *mut MsVM, err: *mut MsValue) -> *const c_char {
+    if err.is_null() { return std::ptr::null(); }
+    match &unsafe { &*err }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
+            let exc = unsafe { read_exception(*ptr) };
+            // message 为 Object，提取 String
+            string_object_to_cstr(&exc.message)
+        }
+        _ => std::ptr::null(),
+    }
+}
+```
+
+`msErrTraceback` 同理访问 `exc.traceback`。
+
+`string_object_to_cstr` 辅助函数：从 `Object::Ref` (TypeTag::STRING) 提取
+`*const c_char`，非 String 类型返回 null。
 
 #### msErrCause
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msErrCause(_vm: *mut MsVM, err: *mut MsValue) -> *mut MsValue {
-    let inner = unsafe { &*err }.inner();
-    match inner {
-        MsValueInner::Error { cause: Some(c), .. } => {
-            // 将 NonNull<MsValueInner> 转回 *mut MsValue
-            c.as_ptr() as *mut MsValue
+    if err.is_null() { return std::ptr::null_mut(); }
+    match &unsafe { &*err }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
+            let exc = unsafe { read_exception(*ptr) };
+            match &exc.cause {
+                Object::Nil => std::ptr::null_mut(),
+                cause_obj => {
+                    // 返回借用引用（新 Box<MsValue>，不注册 GC root）
+                    Box::into_raw(Box::new(MsValue { inner: cause_obj.clone() }))
+                }
+            }
         }
         _ => std::ptr::null_mut(),
     }
 }
 ```
 
-返回借用引用（不增加 root 计数）。
-
 ### 4. C 侧抛出异常
+
+所有 `msThrow*` 设置 `inner.vm.has_error = true` +
+`inner.vm.error_message = "TypeName: message"`，返回 `MS_ERROR`。
+
+错误消息格式统一为 `"TypeName: message"`，使 `msErrFetch` 的
+`parse_error_message` 能正确拆分 type_name 和 message。
 
 #### msThrow
 
@@ -213,59 +273,54 @@ pub extern "C" fn msThrow(
     vm: *mut MsVM,
     type_: *const c_char,
     fmt: *const c_char,
-    ...
 ) -> MsStatus {
-    let vm = unsafe { &mut *vm };
+    if vm.is_null() || type_.is_null() || fmt.is_null() {
+        return MsStatus::MS_ERROR;
+    }
     let type_name = unsafe { CStr::from_ptr(type_).to_string_lossy().into_owned() };
+    // MVP：fmt 直接作为消息文本（va_list 不可用，见下文注释）
+    let message = unsafe { CStr::from_ptr(fmt).to_string_lossy().into_owned() };
 
-    let message = format_c_string(fmt); // va_list → String
-
-    let error = CapiError {
-        type_name,
-        message,
-        traceback: String::new(),
-        cause: None,
-    };
-
-    let mut inner = vm.inner.lock().unwrap();
-    inner.pending_error = Some(Box::new(error));
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    inner.vm.has_error = true;
+    inner.vm.error_message = format!("{}: {}", type_name, message);
 
     MsStatus::MS_ERROR
 }
 ```
 
-`format_c_string` 通过 `va_list`（使用 `std::ffi::VaList` 或 `libc::va_list`）格式化可变参数，与 Task 67 中 `msStringFmt` 使用相同机制。若 `va_list` 不可用，退化为直接将 `fmt` 作为最终字符串（无格式化占位符替换）。
+> **va_list 限制**：Rust stable 不支持在 `extern "C" fn(...)` 中提取
+> C 可变参数。与 Task 67 的 `msStringFmt` 同策略：MVP 阶段 `fmt` 直接
+> 作为消息文本（无 `%d` / `%s` 格式化替换）。后续可通过 C shim 文件
+> （如 `vsnprintf_shim.c`）在 C 侧预格式化后传入。
 
 #### msThrowValue
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msThrowValue(vm: *mut MsVM, err: *mut MsValue) -> MsStatus {
-    let vm = unsafe { &mut *vm };
-    let inner_val = unsafe { &*err }.inner();
+    if vm.is_null() || err.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    let error = match inner_val {
-        MsValueInner::Error { type_name, message, traceback, cause } => {
-            CapiError {
-                type_name: type_name.clone(),
-                message: message.clone(),
-                traceback: traceback.clone(),
-                cause: *cause,
-            }
+    match &unsafe { &*err }.inner {
+        // err 已是 MsException 堆对象：提取 type_name + message
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
+            let exc = unsafe { read_exception(*ptr) };
+            let type_name = exc.class_name.clone();
+            let message = object_to_string(&exc.message);
+            inner.vm.has_error = true;
+            inner.vm.error_message = format!("{}: {}", type_name, message);
         }
-        _ => {
-            // 非 Error 类型：将值转为字符串作为 message
-            CapiError {
-                type_name: "Error".into(),
-                message: format!("{:?}", inner_val),
-                traceback: String::new(),
-                cause: None,
-            }
+        // 非 Exception：将值转为字符串作为 message
+        other => {
+            inner.vm.has_error = true;
+            inner.vm.error_message = format!("Error: {:?}", other);
         }
-    };
-
-    let mut inner = vm.inner.lock().unwrap();
-    inner.pending_error = Some(Box::new(error));
+    }
 
     MsStatus::MS_ERROR
 }
@@ -273,30 +328,53 @@ pub extern "C" fn msThrowValue(vm: *mut MsVM, err: *mut MsValue) -> MsStatus {
 
 #### msThrowRethrow
 
-重新抛出当前 pending error（不清除）：
+重新抛出当前已有错误（保持 has_error = true）：
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msThrowRethrow(vm: *mut MsVM) -> MsStatus {
-    // pending_error 已存在，直接返回 MS_ERROR
+    if vm.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    let guard = lock_vm(vm);
+    let inner = unsafe { &*guard.get() };
+    // 若无 pending error，设置一个默认错误
+    if !inner.vm.has_error {
+        drop(guard);
+        let guard = lock_vm(vm);
+        let inner = unsafe { &mut *guard.get() };
+        inner.vm.has_error = true;
+        inner.vm.error_message = "Error: rethrow with no pending error".into();
+    }
+    // 已有错误保持不变
     MsStatus::MS_ERROR
 }
 ```
 
-若当前无 pending error，行为等同于无操作（仍返回 `MS_ERROR`）。
-
 #### 便捷 throw 函数
 
-六个便捷函数内部调用相同的逻辑，仅 `type_name` 和 `message` 格式不同：
+六个便捷函数设置不同的 `type_name`，统一使用 `has_error` + `error_message`：
 
 | 函数 | type_name | message 格式 |
 |---|---|---|
 | `msThrowTypeError(vm, expected, actual)` | `"TypeError"` | `"expected {expected}, got {actual}"` |
-| `msThrowValueError(vm, fmt, ...)` | `"ValueError"` | `sprintf(fmt, ...)` |
-| `msThrowIndexError(vm, fmt, ...)` | `"IndexError"` | `sprintf(fmt, ...)` |
+| `msThrowValueError(vm, fmt)` | `"ValueError"` | `CStr::from_ptr(fmt)` |
+| `msThrowIndexError(vm, fmt)` | `"IndexError"` | `CStr::from_ptr(fmt)` |
 | `msThrowKeyError(vm, key)` | `"KeyError"` | `msToString(vm, key)` |
-| `msThrowRuntimeError(vm, fmt, ...)` | `"RuntimeError"` | `sprintf(fmt, ...)` |
-| `msThrowIoError(vm, fmt, ...)` | `"IOError"` | `sprintf(fmt, ...)` |
+| `msThrowRuntimeError(vm, fmt)` | `"RuntimeError"` | `CStr::from_ptr(fmt)` |
+| `msThrowIoError(vm, fmt)` | `"IOError"` | `CStr::from_ptr(fmt)` |
+
+公共辅助函数：
+
+```rust
+fn set_capi_error(vm: *mut MsVM, type_name: &str, message: &str) -> MsStatus {
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    inner.vm.has_error = true;
+    inner.vm.error_message = format!("{}: {}", type_name, message);
+    MsStatus::MS_ERROR
+}
+```
 
 `msThrowTypeError` 实现：
 
@@ -307,71 +385,35 @@ pub extern "C" fn msThrowTypeError(
     expected: *const c_char,
     actual: *const c_char,
 ) -> MsStatus {
-    let vm = unsafe { &mut *vm };
+    if vm.is_null() || expected.is_null() || actual.is_null() {
+        return MsStatus::MS_ERROR;
+    }
     let exp = unsafe { CStr::from_ptr(expected).to_string_lossy() };
     let act = unsafe { CStr::from_ptr(actual).to_string_lossy() };
-    let message = format!("expected {}, got {}", exp, act);
-
-    let error = CapiError {
-        type_name: "TypeError".into(),
-        message,
-        traceback: String::new(),
-        cause: None,
-    };
-
-    let mut inner = vm.inner.lock().unwrap();
-    inner.pending_error = Some(Box::new(error));
-
-    MsStatus::MS_ERROR
+    set_capi_error(vm, "TypeError", &format!("expected {}, got {}", exp, act))
 }
 ```
 
-`msThrowKeyError` 特殊：接收 `MsValue* key` 而非格式字符串：
+`msThrowKeyError` 特殊：接收 `MsValue* key`：
 
 ```rust
 #[no_mangle]
 pub extern "C" fn msThrowKeyError(vm: *mut MsVM, key: *mut MsValue) -> MsStatus {
-    let vm = unsafe { &mut *vm };
-    let message = value_to_string_repr(vm, key);
-
-    let error = CapiError {
-        type_name: "KeyError".into(),
-        message,
-        traceback: String::new(),
-        cause: None,
-    };
-
-    let mut inner = vm.inner.lock().unwrap();
-    inner.pending_error = Some(Box::new(error));
-
-    MsStatus::MS_ERROR
+    if vm.is_null() || key.is_null() {
+        return MsStatus::MS_ERROR;
+    }
+    // key 的字符串表示作为 message（简化：直接 Debug 格式）
+    let key_str = format!("{:?}", unsafe { &(*key).inner });
+    set_capi_error(vm, "KeyError", &key_str)
 }
 ```
 
-其余四个（`msThrowValueError`、`msThrowIndexError`、`msThrowRuntimeError`、`msThrowIoError`）模式相同：接收 `(vm, fmt, ...)` 可变参数，仅 `type_name` 不同。可提取公共辅助函数：
-
-```rust
-fn throw_with_type(
-    vm: &mut MsVmBox,
-    type_name: &str,
-    fmt: *const c_char,
-) -> MsStatus {
-    let message = format_c_string(fmt);
-    let error = CapiError {
-        type_name: type_name.into(),
-        message,
-        traceback: String::new(),
-        cause: None,
-    };
-    let mut inner = vm.inner.lock().unwrap();
-    inner.pending_error = Some(Box::new(error));
-    MsStatus::MS_ERROR
-}
-```
-
-> 注：`format_c_string` 的 `va_list` 处理在 MSVC 和 GCC/Clang 上 ABI 不同。Windows MSVC 使用 `cargo::va_list` crate 或内联汇编获取 `va_list`；Linux/macOS 使用 `std::ffi::VaList`（nightly）或 `libc::va_list`。若不稳定，可退化为直接使用 `CStr::from_ptr(fmt)` 作为消息。
+其余四个（`msThrowValueError`/`msThrowIndexError`/`msThrowRuntimeError`/`msThrowIoError`）
+模式相同：接收 `(vm, fmt)`，用 `set_capi_error` 设置不同 `type_name`。
 
 ### 5. msTry — try/catch 模式
+
+msTry 内部调用 `msCall`（Task 70），检查 `has_error` 判断成功/失败。
 
 ```rust
 #[no_mangle]
@@ -382,20 +424,25 @@ pub extern "C" fn msTry(
     nargs: c_int,
     result: *mut *mut MsValue,
 ) -> MsStatus {
-    let vm_ref = unsafe { &mut *vm };
-
-    // 清除之前的 pending error
-    {
-        let mut inner = vm_ref.inner.lock().unwrap();
-        inner.pending_error = None;
+    if vm.is_null() || func.is_null() || result.is_null() {
+        return MsStatus::MS_ERROR;
     }
 
-    // 调用函数（复用 Task 69 的 msCall 内部逻辑）
-    let ret = capi_call(vm_ref, func, args, nargs);
+    // 清除之前的错误状态
+    {
+        let guard = lock_vm(vm);
+        let inner = unsafe { &mut *guard.get() };
+        inner.vm.has_error = false;
+        inner.vm.error_message.clear();
+    }
+
+    // 调用函数（复用 Task 70 的 msCall）
+    let ret = msCall(vm, func, args, nargs);
 
     // 检查是否产生异常
-    let mut inner = vm_ref.inner.lock().unwrap();
-    if inner.pending_error.is_some() {
+    let guard = lock_vm(vm);
+    let inner = unsafe { &*guard.get() };
+    if inner.vm.has_error {
         unsafe { *result = std::ptr::null_mut() };
         MsStatus::MS_ERROR
     } else {
@@ -405,25 +452,41 @@ pub extern "C" fn msTry(
 }
 ```
 
-`capi_call` 是 Task 69（`src/capi/call.rs`）中 `msCall` 的内部实现函数，`msTry` 和 `msCall` 共用。当 `capi_call` 内部检测到 VM 执行异常时，将异常写入 `pending_error` 并返回 `NULL`。
+> **与 Task 70 协调**：`msCall` 在函数执行失败时已设置
+> `inner.vm.has_error = true` + `inner.vm.error_message = msg`（`src/capi/call.rs:60-64`）。
+> msTry 直接复用此机制，无需额外转换。
 
-### 6. error_to_value — CapiError → MsValue 转换
+### 6. object_to_string 辅助函数
+
+从 `Object`（通常为 `Object::Ref` 指向 String 堆对象）提取 `String`：
 
 ```rust
-fn error_to_value(vm: &mut MsVmBox, err: Box<CapiError>) -> *mut MsValue {
-    let inner = MsValueInner::Error {
-        type_name: err.type_name,
-        message: err.message,
-        traceback: err.traceback,
-        cause: err.cause,
-    };
-    let boxed = Box::new(inner);
-    let ptr = Box::into_raw(boxed) as *mut MsValue;
+fn object_to_string(obj: &Object) -> String {
+    match obj {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+            let s = unsafe { read_str(*ptr) };
+            s.data().to_owned()
+        }
+        Object::Int(n) => n.to_string(),
+        Object::Float(f) => f.to_string(),
+        Object::Bool(b) => b.to_string(),
+        Object::Nil => "nil".to_string(),
+        _ => format!("{:?}", obj),
+    }
+}
+```
 
-    // 注册为 GC root
-    msRoot(vm, ptr);
+`string_object_to_cstr` 从 `Object` 提取 `*const c_char`：
 
-    ptr
+```rust
+fn string_object_to_cstr(obj: &Object) -> *const c_char {
+    match obj {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::STRING as u8 => {
+            let s = unsafe { read_str(*ptr) };
+            s.data().as_ptr() as *const c_char
+        }
+        _ => std::ptr::null(),
+    }
 }
 ```
 
@@ -437,20 +500,17 @@ Task 65 中 `include/mslang/mslang.h` 的 `error.h` include 行取消注释：
 
 ### 8. 与脚本侧异常系统的对接
 
-当 VM 执行脚本抛出异常（Task 37 try/except/finally 实现的 `Error` 对象），`capi_call` 需要捕获并将其转换为 `CapiError` 存入 `pending_error`。转换逻辑：
+VM 执行脚本时抛出异常，`call_function` / `interpret` 返回 `Err(String)`。
+Task 70 的 `msCall` 已将 `Err(msg)` 桥接为 `inner.vm.has_error = true` +
+`inner.vm.error_message = msg`。因此：
 
-```rust
-fn vm_error_to_capi(vm: &VmInner, vm_err: &VmError) -> CapiError {
-    CapiError {
-        type_name: vm_err.type_name().to_string(),
-        message: vm_err.message().to_string(),
-        traceback: vm_err.traceback().to_string(),
-        cause: None, // 首层异常无 cause
-    }
-}
-```
+- VM 错误字符串格式通常为 `"TypeError: expected X, got Y"` 或
+  `"ValueError: invalid value"`，与 `msErrFetch` 的 `parse_error_message` 兼容。
+- `msThrow*` 设置的错误格式为 `"TypeName: message"`，与 VM 错误格式一致。
+- `msTry` 调用 `msCall` 后检查 `has_error`，自然桥接 VM 侧和 C 侧异常。
 
-VM 侧异常对象（`src/vm/object.rs` 中的 `Error` 实例）的 `type`、`message`、`traceback` 属性映射到 `CapiError` 对应字段。
+> **GC root 注意**：`msErrFetch` 返回的 MsValue\*（含 MsException Ref）
+> 由调用方负责 root/unroot 或及时使用后 `msValueFree`。
 
 ## 验证标准
 
