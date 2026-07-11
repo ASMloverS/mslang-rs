@@ -33,7 +33,7 @@ pub enum MsStatus {
 ///
 /// 注意：此枚举与内部 TypeTag（14-gc.md:89-112）不同——MsType 包含
 /// Nil/Bool/Int/Float 内联类型，TypeTag 仅含堆类型。转换映射由 task 67 实现。
-#[repr(u8)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum MsType {

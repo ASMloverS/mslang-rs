@@ -15,8 +15,14 @@
 extern void* msStringn(void* vm, const char* str, size_t len);
 
 /* msStringFmt: printf-style string creation.
- * Implemented in C because Rust stable has no va_list support. */
-void* msStringFmt(void* vm, const char* fmt, ...) {
+ * Implemented in C because Rust stable has no va_list support.
+ * MS_FMT_EXPORT ensures the symbol is exported from mslang.dll on Windows. */
+#if defined(_WIN32)
+#define MS_FMT_EXPORT __declspec(dllexport)
+#else
+#define MS_FMT_EXPORT __attribute__((visibility("default")))
+#endif
+MS_FMT_EXPORT void* msStringFmt(void* vm, const char* fmt, ...) {
     char stack_buf[1024];
     va_list ap;
     va_start(ap, fmt);

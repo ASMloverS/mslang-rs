@@ -7,6 +7,18 @@
 //!
 //! 注意：`msStringFmt` 由 C 文件（vsnprintf_shim.c）导出，不在本模块定义。
 
+/// Force the linker to include msStringFmt from the C shim archive.
+/// Without this, the linker drops vsnprintf_shim.o because no Rust code
+/// references the symbol, leaving it absent from the cdylib.
+#[used]
+static MS_STRING_FMT_ANCHOR: unsafe extern "C" fn() -> () = {
+    extern "C" {
+        #[link_name = "msStringFmt"]
+        fn _force_link_ms_string_fmt();
+    }
+    _force_link_ms_string_fmt
+};
+
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 
