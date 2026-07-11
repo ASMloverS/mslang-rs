@@ -102,7 +102,7 @@
 | 70 | [C API — 函数调用](70-capi-call.md) | ✅ |
 | 71 | [C API — 异常处理](71-capi-error.md) | ✅ |
 | 72 | [C API — C 扩展模块注册与动态加载](72-capi-module.md) | ✅ |
-| 73 | [C API — Class 操作](73-capi-class.md) | ⬜ |
+| 73 | [C API — Class 操作](73-capi-class.md) | ✅ |
 | 74 | [C API — GC 交互（Root/写屏障/Finalizer/控制/统计）](74-capi-gc.md) | ⬜ |
 | 75 | [C API — 集成测试（嵌入 + 扩展端到端）](75-capi-integration-test.md) | ⬜ |
 

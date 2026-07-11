@@ -394,15 +394,6 @@ pub extern "C" fn msIsClass(val: *mut MsValue) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn msIsInstance(val: *mut MsValue) -> c_int {
-    if is_ref_type(val, TypeTag::INSTANCE) {
-        MS_TRUE
-    } else {
-        MS_FALSE
-    }
-}
-
-#[no_mangle]
 pub extern "C" fn msIsGenerator(val: *mut MsValue) -> c_int {
     if is_ref_type(val, TypeTag::GENERATOR) {
         MS_TRUE

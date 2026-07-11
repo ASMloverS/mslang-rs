@@ -122,7 +122,7 @@ pub struct VM {
     heap: gc::MsHeap,
     /// task 42：隐式 Object 基类（Immortal 代）。无显式父类的类在 CLASS handler
     /// 中自动链接至此；提供默认 __repr__/__eq__/__ne__。
-    object_class: *mut MsObjHeader,
+    pub(crate) object_class: *mut MsObjHeader,
     /// task 45：模块解析器（搜索路径/缓存/加载链/安全模式）。
     pub(crate) module_resolver: ModuleResolver,
     /// task 45：基线全局快照（内置函数 + 异常类），供 execute_module 隔离时复用，
@@ -897,6 +897,13 @@ impl VM {
                     self.stack.truncate(self.stack.len() - argc - 1);
                     let result = func(self, &args)?;
                     self.push(result)?;
+                } else if method_tag == TypeTag::NATIVE_C_FUNCTION as u8 {
+                    #[cfg(feature = "capi")]
+                    {
+                        let frame_base = self.stack.len() - argc - 1;
+                        self.stack[frame_base] = receiver;
+                        self.call_c_native(method_ptr, argc + 1, frame_base)?;
+                    }
                 } else {
                     debug_assert_eq!(
                         method_tag,
