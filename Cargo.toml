@@ -8,13 +8,14 @@ description = "mslang scripting language implementation"
 clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 parking_lot = "0.12"
+libloading = { version = "0.8", optional = true }
 
 [[bin]]
 name = "ms"
 path = "src/main.rs"
 
 [features]
-capi = []
+capi = ["dep:libloading"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

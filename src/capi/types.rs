@@ -63,3 +63,14 @@ pub enum MsType {
 pub type MsCFunction = Option<
     extern "C" fn(*mut crate::capi::vm::MsVM, *const *mut MsValue, i32) -> *mut MsValue,
 >;
+
+/// C 异步函数签名（与 types.h 中 `MsAsyncFunction` 对应）。
+/// `Option` 表示可为 NULL（C 侧）。task 76 完整实现桥接；task 72 仅占位。
+pub type MsAsyncFunction = Option<
+    extern "C" fn(
+        *mut crate::capi::vm::MsVM,
+        *const *mut MsValue,
+        i32,
+        *mut MsValue,
+    ),
+>;

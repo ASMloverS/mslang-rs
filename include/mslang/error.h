@@ -42,10 +42,74 @@ typedef struct Option_MsWriteFnRaw MsWriteFn;
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
  * C 原生函数签名（与 types.h 中 `MsCFunction` 对应）。
- * `Option` 表示可为 NULL（C 侧）。
+ * `Option` 表示可为 NULL（C 侧）。MsVM 为不透明指针，使用裸指针类型。
  */
 typedef MsValue *(*MsCFunction)(MsVM*, MsValue*const *, int32_t);
 #endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+struct MsFuncDef {
+    const char *name;
+    MsCFunction func;
+};
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+struct MsConstDef {
+    const char *name;
+    MsValue *val;
+};
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+struct MsModuleDef {
+    const char *name;
+    const struct MsFuncDef *methods;
+    const struct MsConstDef *consts;
+};
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * C 异步函数签名（与 types.h 中 `MsAsyncFunction` 对应）。
+ * `Option` 表示可为 NULL（C 侧）。task 76 完整实现桥接；task 72 仅占位。
+ */
+typedef void (*MsAsyncFunction)(MsVM*, MsValue*const *, int32_t, MsValue*);
+#endif
+
+MS_API int msErrOccurred(MsVM *vm);
+
+MS_API MsValue *msErrFetch(MsVM *vm);
+
+MS_API void msErrClear(MsVM *vm);
+
+MS_API const char *msErrTypeName(MsVM *_vm, MsValue *err);
+
+MS_API const char *msErrMessage(MsVM *_vm, MsValue *err);
+
+MS_API const char *msErrTraceback(MsVM *_vm, MsValue *err);
+
+MS_API MsValue *msErrCause(MsVM *_vm, MsValue *err);
+
+MS_API MsStatus msThrow(MsVM *vm, const char *type_, const char *fmt);
+
+MS_API MsStatus msThrowValue(MsVM *vm, MsValue *err);
+
+MS_API MsStatus msThrowRethrow(MsVM *vm);
+
+MS_API MsStatus msThrowTypeError(MsVM *vm, const char *expected, const char *actual);
+
+MS_API MsStatus msThrowValueError(MsVM *vm, const char *fmt);
+
+MS_API MsStatus msThrowIndexError(MsVM *vm, const char *fmt);
+
+MS_API MsStatus msThrowKeyError(MsVM *vm, MsValue *key);
+
+MS_API MsStatus msThrowRuntimeError(MsVM *vm, const char *fmt);
+
+MS_API MsStatus msThrowIoError(MsVM *vm, const char *fmt);
+
+MS_API MsStatus msTry(MsVM *vm, MsValue *func, MsValue *const *args, int nargs, MsValue **result);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 MS_API MsVM *msVmNew(void);
@@ -680,6 +744,102 @@ MS_API MsValue *msCall(MsVM *vm, MsValue *func, MsValue *const *args, int nargs)
  * 返回的值可作为全局变量注册，供 mslang 脚本调用。
  */
 MS_API MsValue *msMakeCFunction(MsVM *vm, const char *name, MsCFunction func, int arity);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API int msErrOccurred(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msErrFetch(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API void msErrClear(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API const char *msErrTypeName(MsVM *_vm, MsValue *err);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API const char *msErrMessage(MsVM *_vm, MsValue *err);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API const char *msErrTraceback(MsVM *_vm, MsValue *err);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msErrCause(MsVM *_vm, MsValue *err);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrow(MsVM *vm, const char *type_, const char *fmt);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowValue(MsVM *vm, MsValue *err);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowRethrow(MsVM *vm);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowTypeError(MsVM *vm, const char *expected, const char *actual);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowValueError(MsVM *vm, const char *fmt);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowIndexError(MsVM *vm, const char *fmt);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowKeyError(MsVM *vm, MsValue *key);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowRuntimeError(MsVM *vm, const char *fmt);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msThrowIoError(MsVM *vm, const char *fmt);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msTry(MsVM *vm, MsValue *func, MsValue *const *args, int nargs, MsValue **result);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msRegisterModule(MsVM *vm, const struct MsModuleDef *def);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsValue *msModuleNew(MsVM *vm, const char *name);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msModuleAddFunc(MsVM *vm, MsValue *mod_val, const char *name, MsCFunction fn_ptr);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API
+MsStatus msModuleAddAsyncFunc(MsVM *vm,
+                              MsValue *_mod_val,
+                              const char *_name,
+                              MsAsyncFunction _fn);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msModuleAddConst(MsVM *vm, MsValue *mod_val, const char *name, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsStatus msRegisterModuleValue(MsVM *vm, MsValue *mod_val);
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))

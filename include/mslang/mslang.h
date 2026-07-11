@@ -11,11 +11,11 @@
 
  #include "error.h"
 
- /* #include "module.h"
-  * #include "class.h"
+ #include "module.h"
+
+ /* #include "class.h"
   * #include "gc.h"
   */
-
 #include "call_macros.h"
 
 #endif /* MSLANG_H */

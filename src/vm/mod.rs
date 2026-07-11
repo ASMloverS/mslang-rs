@@ -124,7 +124,7 @@ pub struct VM {
     /// 中自动链接至此；提供默认 __repr__/__eq__/__ne__。
     object_class: *mut MsObjHeader,
     /// task 45：模块解析器（搜索路径/缓存/加载链/安全模式）。
-    module_resolver: ModuleResolver,
+    pub(crate) module_resolver: ModuleResolver,
     /// task 45：基线全局快照（内置函数 + 异常类），供 execute_module 隔离时复用，
     /// 使模块代码可访问 print/type/except 等而不泄漏调用方用户定义。
     baseline_globals: HashMap<String, Object>,
@@ -148,6 +148,10 @@ pub struct VM {
     /// 纯 Rust 调用时为 null。call_value 的 NATIVE_C_FUNCTION 分支使用。
     #[cfg(feature = "capi")]
     pub capi_vm_ptr: *mut u8,
+    /// task 72：已加载的动态库句柄，生命周期与 VM 相同。
+    /// Library 必须存活以保持 C 函数指针有效。
+    #[cfg(feature = "capi")]
+    pub loaded_libs: Vec<libloading::Library>,
 }
 
 impl VM {
@@ -181,6 +185,8 @@ impl VM {
             error_message: String::new(),
             #[cfg(feature = "capi")]
             capi_vm_ptr: std::ptr::null_mut(),
+            #[cfg(feature = "capi")]
+            loaded_libs: Vec::new(),
         };
         vm.register_builtins();
         vm.init_object_class();
@@ -3202,7 +3208,33 @@ impl VM {
             ));
         }
         // 3. 解析为规范化绝对路径（兼作缓存键）。
-        let canon = self.module_resolver.resolve(mod_name, stdlib_only)?;
+        //    task 72：resolve 失败（无 .ms 文件）时，尝试动态库加载（capi feature）。
+        let canon = match self.module_resolver.resolve(mod_name, stdlib_only) {
+            Ok(c) => c,
+            Err(resolve_err) => {
+                #[cfg(feature = "capi")]
+                {
+                    if !self.capi_vm_ptr.is_null() {
+                        let vm_ptr =
+                            self.capi_vm_ptr as *mut crate::capi::vm::MsVM;
+                        if crate::capi::module::load_native_module(vm_ptr, mod_name)
+                            .is_ok()
+                        {
+                            if let Some(&ptr) =
+                                self.module_resolver.native_modules.get(mod_name)
+                            {
+                                return Ok(ptr);
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "capi"))]
+                {
+                    let _ = &resolve_err;
+                }
+                return Err(resolve_err);
+            }
+        };
 
         // 4. 缓存命中：已加载完成，或循环导入下尚未填充的空壳 Module。
         if let Some(&ptr) = self.module_resolver.cache.get(&canon) {
