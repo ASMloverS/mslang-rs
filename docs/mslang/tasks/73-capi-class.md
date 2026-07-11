@@ -8,6 +8,7 @@ Phase 6 — 模块系统 + 标准库
 
 - 66-capi-vm
 - 68-capi-value-convert
+- 70-capi-call（提供 `alloc_c_native_function`）
 
 ## 目标
 
@@ -40,7 +41,7 @@ MS_API int       msIsInstance(MsVM* vm, MsValue* obj, MsValue* cls);
 ```
 
 - `msInstanceGet`：按属性查找链（实例字段 → 类方法 → 父类 MRO）查找 `attr`。未找到返回 NULL 并设置 AttributeError。
-- `msInstanceSet`：在实例字段中设置 `attr = val`。触发写屏障。返回 `MS_OK` 或 `MS_ERROR`。
+- `msInstanceSet`：在实例字段中设置 `attr = val`。MVP STW GC 无需写屏障。返回 `MS_OK` 或 `MS_ERROR`。
 - `msIsInstance`：检查 `obj` 是否是 `cls`（或 `cls` 任意父类）的实例。返回 `MS_TRUE` / `MS_FALSE`。
 
 ### C 侧定义 Class
@@ -51,9 +52,9 @@ MS_API MsStatus  msClassAddMethod(MsVM* vm, MsValue* cls, const char* name, MsCF
 MS_API MsStatus  msClassAddStatic(MsVM* vm, MsValue* cls, const char* name, MsValue* val);
 ```
 
-- `msClassDefine`：在 VM 中创建新 Class 对象。`parent` 为 NULL 时隐式继承 `Object`。注册为全局变量 `name`。返回 `MsValue*`。
-- `msClassAddMethod`：向 `cls` 添加实例方法。将 `MsCFunction` 包装为 NativeFunction 并加入类方法表。返回 `MS_OK` 或 `MS_ERROR`。
-- `msClassAddStatic`：向 `cls` 添加静态属性（值可以是函数、常量等）。返回 `MS_OK` 或 `MS_ERROR`。
+- `msClassDefine`：在 VM 中创建新 Class 对象。`parent` 为 NULL 时隐式继承 `Object`（`vm.object_class`）。注册为全局变量 `name`。返回 `MsValue*`。
+- `msClassAddMethod`：向 `cls` 添加实例方法。将 `MsCFunction` 包装为 `MsCNativeFunction` 并加入类方法表。返回 `MS_OK` 或 `MS_ERROR`。
+- `msClassAddStatic`：向 `cls` 添加静态属性。返回 `MS_OK` 或 `MS_ERROR`。
 
 ## 实现细节
 
@@ -68,13 +69,17 @@ MS_API MsStatus  msClassAddStatic(MsVM* vm, MsValue* cls, const char* name, MsVa
 
 | 符号 | 来源 | 用途 |
 |---|---|---|
-| `MsVM` / `VmInner` | `src/capi/vm.rs` | VM 不透明类型及内部状态 |
-| `MsValue` | `src/capi/types.rs` | 值的不透明类型 |
+| `MsVM` / `lock_vm` | `src/capi/vm.rs` | VM 不透明类型及加锁访问 |
+| `MsValue` | `src/capi/types.rs` | 值的不透明类型（`inner: Object`） |
 | `MsStatus` | `src/capi/types.rs` | 返回状态枚举 |
-| `MsCFunction` | `include/mslang/types.h` | C 函数指针类型 |
-| `Object::Ref` + `TypeTag::CLASS` | `src/vm/object.rs` | 运行时 Class 对象 |
-| `Object::Ref` + `TypeTag::INSTANCE` | `src/vm/object.rs` | 运行时 Instance 对象 |
-| `Object::Ref` + `TypeTag::FUNCTION` | `src/vm/object.rs` | 原生函数（通过 `alloc_native_function`） |
+| `MsCFunction` | `src/capi/types.rs` | C 函数指针类型（`Option<extern "C" fn>`） |
+| `Object::Ref` + `TypeTag::CLASS` | `src/vm/object.rs` | 运行时 Class 对象（`MsClass`） |
+| `Object::Ref` + `TypeTag::INSTANCE` | `src/vm/object.rs` | 运行时 Instance 对象（`MsInstance`） |
+| `alloc_class` / `alloc_instance` | `src/vm/object.rs` | 创建 Class / Instance 堆对象 |
+| `alloc_bound_method` | `src/vm/object.rs` | 创建 BoundMethod（receiver + method_ptr） |
+| `read_class` / `read_instance` | `src/vm/object.rs` | 读取 Class / Instance（均返回 `&mut`） |
+| `alloc_c_native_function` | `src/vm/builtins.rs` | C 函数指针 → `MsCNativeFunction` 堆对象（task 70） |
+| `MsClass.find_method` | `src/vm/object.rs` | 沿 parent 链查找方法（返回 `*mut MsObjHeader`） |
 
 ### msGetClass
 
@@ -87,13 +92,13 @@ pub extern "C" fn msGetClass(vm: *mut MsVM, name: *const i8) -> *mut MsValue {
     let name_str = unsafe {
         std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
     };
-    let vm_ref = unsafe { &*vm };
-    let inner = vm_ref.inner.lock().unwrap();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &*guard.get() };
     match inner.vm.globals().get(&name_str) {
         Some(obj) => {
-            if matches!(obj, Object::Class(_)) {
-                let val = Box::new(MsValue { inner: obj.clone() });
-                Box::into_raw(val)
+            // 验证为 Class 类型（Object::Ref + TypeTag::CLASS）
+            if matches!(obj, Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8) {
+                Box::into_raw(Box::new(MsValue { inner: obj.clone() }))
             } else {
                 std::ptr::null_mut()
             }
@@ -107,9 +112,9 @@ pub extern "C" fn msGetClass(vm: *mut MsVM, name: *const i8) -> *mut MsValue {
 
 1. 参数空指针检查
 2. C 字符串转 Rust String
-3. 加锁访问 VM 全局作用域
+3. `lock_vm` 加锁访问 VM 全局作用域
 4. 查找 `name` 对应的全局变量
-5. 类型检查：仅当值为 `Object::Class` 时返回
+5. 类型检查：仅当值为 `Object::Ref` 且 `type_tag == TypeTag::CLASS` 时返回
 6. 克隆并包装为 `MsValue*` 返回
 
 ### msInstanceNew
@@ -122,68 +127,65 @@ pub extern "C" fn msInstanceNew(
     args: *const *mut MsValue,
     nargs: i32,
 ) -> *mut MsValue {
-    if vm.is_null() || cls.is_null() {
+    if vm.is_null() || cls.is_null() || nargs < 0 {
         return std::ptr::null_mut();
     }
     let class_obj = unsafe { (*cls).inner.clone() };
-    if !matches!(class_obj, Object::Class(_)) {
-        return std::ptr::null_mut();
-    }
 
-    let vm_ref = unsafe { &*vm };
-    let mut inner = vm_ref.inner.lock().unwrap();
-
-    let instance = match inner.vm.create_instance(&class_obj) {
-        Ok(inst) => inst,
-        Err(_) => return std::ptr::null_mut(),
+    // 验证为 Class 类型并提取 class_ptr
+    let class_ptr = match &class_obj {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => *ptr,
+        _ => return std::ptr::null_mut(),
     };
 
-    let init_name = "__init__";
-    if let Some(init_fn) = find_class_method(&class_obj, init_name) {
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+
+    // 创建实例
+    let instance = alloc_instance(class_ptr);
+
+    // 查找 __init__ 方法（沿 parent 链）
+    let init_ptr = unsafe { read_class(class_ptr).find_method("__init__") };
+
+    if let Some(method_ptr) = init_ptr {
         let arg_vec = collect_args(args, nargs);
+        let init_obj = Object::Ref(method_ptr);
         let mut call_args = vec![instance.clone()];
         call_args.extend_from_slice(&arg_vec);
-        match inner.vm.call_function(&init_fn, &call_args) {
-            Ok(_) => {}
-            Err(_) => return std::ptr::null_mut(),
+        if inner.vm.call_function(&init_obj, &call_args).is_err() {
+            return std::ptr::null_mut();
         }
     }
 
-    let val = Box::new(MsValue { inner: instance });
-    Box::into_raw(val)
+    Box::into_raw(Box::new(MsValue { inner: instance }))
 }
+```
 
+`collect_args` 辅助函数将 C 侧 `MsValue* const*` 转为 `Vec<Object>`：
+
+```rust
 fn collect_args(args: *const *mut MsValue, nargs: i32) -> Vec<Object> {
     if nargs <= 0 || args.is_null() {
         return Vec::new();
     }
     (0..nargs as usize)
-        .map(|i| unsafe { (*(*args.add(i))).inner.clone() })
+        .filter_map(|i| {
+            let ptr = unsafe { *args.add(i) };
+            if ptr.is_null() { None } else { Some(unsafe { (*ptr).inner.clone() }) }
+        })
         .collect()
-}
-
-fn find_class_method(class_obj: &Object, name: &str) -> Option<Object> {
-    if let Object::Class(cls) = class_obj {
-        cls.find_method(name)
-    } else {
-        None
-    }
 }
 ```
 
 逻辑：
 
-1. 参数空指针检查
-2. 克隆 class 对象，验证类型为 Class
-3. 加锁
-4. 调用 `vm.create_instance` 创建实例
-5. 查找 `__init__` 方法（沿 MRO 链）
-6. 若存在 `__init__`：构造参数列表 `[self, args...]`，调用 `__init__`
+1. 参数空指针检查 + nargs 负值防护
+2. 克隆 class 对象，验证类型为 Class（`TypeTag::CLASS`）并提取 `class_ptr`
+3. `lock_vm` 加锁
+4. 调用 `alloc_instance(class_ptr)` 创建实例
+5. `read_class(class_ptr).find_method("__init__")` 沿 MRO 链查找 __init__
+6. 若存在 __init__：构造参数列表 `[self, args...]`，用 `call_function` 调用
 7. 返回实例作为 `MsValue*`
-
-`collect_args` 辅助函数将 C 侧 `MsValue* const*` 转为 `Vec<Object>`，供多个函数复用。
-
-`find_class_method` 辅助函数沿 MRO 链查找方法，供 `msInstanceNew` 和 `msInstanceGet` 复用。
 
 ### msInstanceGet
 
@@ -202,22 +204,27 @@ pub extern "C" fn msInstanceGet(
     };
     let obj_inner = unsafe { (*obj).inner.clone() };
 
-    let vm_ref = unsafe { &*vm };
-    let inner = vm_ref.inner.lock().unwrap();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
     match &obj_inner {
         Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
             let inst = unsafe { read_instance(*ptr) };
+            // 1. 查实例字段
             if let Some(field_val) = inst.fields.get(&attr_str) {
-                let val = Box::new(MsValue { inner: field_val.clone() });
-                return Box::into_raw(val);
+                return Box::into_raw(Box::new(MsValue { inner: field_val.clone() }));
             }
-            if let Some(method) = inst.class_obj.find_method(&attr_str) {
-                let bound = inner.vm.bind_method(obj_inner.clone(), method);
-                let val = Box::new(MsValue { inner: bound });
-                return Box::into_raw(val);
+            // 2. 查类方法 MRO 链
+            let method_ptr = unsafe { read_class(inst.class).find_method(&attr_str) };
+            if let Some(mp) = method_ptr {
+                let bound = alloc_bound_method(obj_inner.clone(), mp);
+                return Box::into_raw(Box::new(MsValue { inner: bound }));
             }
-            set_attribute_error(&inner, &attr_str, "Instance");
+            // 3. 未找到
+            inner.vm.has_error = true;
+            inner.vm.error_message = format!(
+                "AttributeError: 'instance' has no attribute '{}'", attr_str
+            );
             std::ptr::null_mut()
         }
         _ => std::ptr::null_mut(),
@@ -229,13 +236,13 @@ pub extern "C" fn msInstanceGet(
 
 1. 参数空指针检查
 2. 克隆对象，C 字符串转 Rust String
-3. 加锁
-4. 验证 `obj` 为 Instance 类型
+3. `lock_vm` 加锁
+4. 验证 `obj` 为 Instance 类型（`TypeTag::INSTANCE`）
 5. **查找顺序**：
-   - 先查实例字段 (`instance.fields`)
-   - 再查类方法 MRO 链 (`class_obj.find_method`)
-   - 方法找到时，创建 BoundMethod 返回
-6. 均未找到：设置 AttributeError 并返回 NULL
+   - 先查实例字段 (`inst.fields`)
+   - 再查类方法 MRO 链 (`read_class(inst.class).find_method`)
+   - 方法找到时，用 `alloc_bound_method(receiver, method_ptr)` 创建 BoundMethod 返回
+6. 均未找到：设置 has_error + error_message 并返回 NULL
 
 ### msInstanceSet
 
@@ -254,18 +261,16 @@ pub extern "C" fn msInstanceSet(
         std::ffi::CStr::from_ptr(attr).to_string_lossy().into_owned()
     };
     let val_obj = unsafe { (*val).inner.clone() };
-    let obj_inner = unsafe { (*obj).inner.clone() };
 
-    let vm_ref = unsafe { &*vm };
-    let mut inner = vm_ref.inner.lock().unwrap();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    match &mut obj_inner {
+    match &unsafe { &*obj }.inner {
         Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
-            let inst = unsafe { read_instance_mut(*ptr) };
-            let old = inst.fields.insert(attr_str, val_obj);
-            if old.is_none() || old != Some(val_obj) {
-                inner.vm.write_barrier(&obj_inner, &unsafe { (*val).inner });
-            }
+            // read_instance 返回 &'a mut MsInstance
+            let inst = unsafe { read_instance(*ptr) };
+            inst.fields.insert(attr_str, val_obj);
+            // MVP STW GC 无需写屏障；Phase 7.5 并发 GC 时补 write_barrier
             MsStatus::MS_OK
         }
         _ => MsStatus::MS_ERROR,
@@ -276,14 +281,13 @@ pub extern "C" fn msInstanceSet(
 逻辑：
 
 1. 参数空指针检查
-2. 克隆值和对象
-3. 加锁（可变访问）
+2. 解析属性名，克隆值
+3. `lock_vm` 加锁
 4. 验证 `obj` 为 Instance 类型
-5. 在 `instance.fields` 中插入/更新属性
-6. 触发写屏障（`write_barrier`）：通知 GC 新引用关系
-7. 返回 `MS_OK`
+5. 在 `inst.fields` 中插入/更新属性
+6. 返回 `MS_OK`
 
-> 注意：`msInstanceSet` 内部已包含写屏障调用，C 侧不需要额外调用 `msWriteBarrier`。
+> MVP STW GC 无写屏障。Phase 7.5 并发 GC 时需补 `write_barrier` 调用。
 
 ### msIsInstance
 
@@ -297,55 +301,55 @@ pub extern "C" fn msIsInstance(
     if vm.is_null() || obj.is_null() || cls.is_null() {
         return MS_FALSE;
     }
-    let obj_inner = unsafe { (*obj).inner.clone() };
-    let cls_inner = unsafe { (*cls).inner.clone() };
 
-    let obj_class = match &obj_inner {
+    // 提取 obj 的 class 指针
+    let obj_class_ptr = match &unsafe { &*obj }.inner {
         Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 => {
-            &unsafe { read_instance(*ptr) }.class_obj
+            unsafe { read_instance(*ptr) }.class
         }
         _ => return MS_FALSE,
     };
 
-    let _vm_ref = unsafe { &*vm };
+    // 提取目标 cls 指针
+    let target_ptr = match &unsafe { &*cls }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => *ptr,
+        _ => return MS_FALSE,
+    };
 
-    if let Object::Class(target_cls) = &cls_inner {
-        if check_instance_of(obj_class, target_cls) {
-            MS_TRUE
-        } else {
-            MS_FALSE
-        }
+    // 沿 parent 链遍历比较裸指针
+    if check_instance_of(obj_class_ptr, target_ptr) {
+        MS_TRUE
     } else {
         MS_FALSE
     }
 }
 
 fn check_instance_of(
-    obj_class: &Object,
-    target_cls: &crate::vm::object::MsClass,
+    class_ptr: *mut MsObjHeader,
+    target_ptr: *mut MsObjHeader,
 ) -> bool {
-    if let Object::Class(cls) = obj_class {
-        let mut current = Some(cls);
-        while let Some(c) = current {
-            if std::ptr::eq(c as *const _, target_cls as *const _) {
-                return true;
-            }
-            current = c.parent.as_ref().map(|p| p.as_ref());
+    let mut current = class_ptr;
+    loop {
+        if current == target_ptr {
+            return true;
         }
+        current = match unsafe { read_class(current) }.parent {
+            Some(p) => p,
+            None => return false,
+        };
     }
-    false
 }
 ```
 
 逻辑：
 
 1. 参数空指针检查
-2. 克隆对象，提取 `obj` 的 class 引用
-3. 验证 `obj` 为 Instance，`cls` 为 Class
-4. **沿 MRO 链遍历**：从实例的类开始，逐级向上检查是否等于目标类
-5. 找到匹配返回 `MS_TRUE`，遍历完未找到返回 `MS_FALSE`
+2. 验证 `obj` 为 Instance，提取 `inst.class`（`*mut MsObjHeader`）
+3. 验证 `cls` 为 Class，提取 `cls_ptr`
+4. **沿 parent 链遍历**：比较裸指针（`*mut MsObjHeader`），从实例的类逐级向上
+5. 找到匹配返回 `MS_TRUE`，遍历到链尾未找到返回 `MS_FALSE`
 
-`check_instance_of` 辅助函数遍历 `class.parent` 链实现 MRO 检查。单继承场景下 MRO 为线性链，无需 C3 线性化。
+`check_instance_of` 沿 `MsClass.parent: Option<*mut MsObjHeader>` 链遍历。单继承场景下 parent 链为线性，无需 C3 线性化。
 
 ### msClassDefine
 
@@ -362,27 +366,32 @@ pub extern "C" fn msClassDefine(
     let name_str = unsafe {
         std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
     };
-    let parent_obj = if parent.is_null() {
-        None
-    } else {
-        let p = unsafe { (*parent).inner.clone() };
-        if matches!(p, Object::Class(_)) {
-            Some(p)
-        } else {
-            None
-        }
+
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+
+    // 创建 Class 对象
+    let class_obj = alloc_class(name_str.clone());
+    let class_ptr = match &class_obj {
+        Object::Ref(p) => *p,
+        _ => return std::ptr::null_mut(),
     };
 
-    let vm_ref = unsafe { &*vm };
-    let mut inner = vm_ref.inner.lock().unwrap();
+    // 设置 parent：NULL 时继承 vm.object_class
+    let parent_ptr = if parent.is_null() {
+        inner.vm.object_class
+    } else {
+        match &unsafe { &*parent }.inner {
+            Object::Ref(p) if unsafe { (**p).type_tag } == TypeTag::CLASS as u8 => *p,
+            _ => inner.vm.object_class, // 非 Class 类型也回退到 Object
+        }
+    };
+    unsafe { read_class(class_ptr).parent = Some(parent_ptr); }
 
-    let class_obj = inner.vm.create_class(&name_str, parent_obj);
-    let class_val = Box::new(MsValue { inner: class_obj.clone() });
-    let raw = Box::into_raw(class_val);
+    // 注册为全局变量
+    inner.vm.globals_mut().insert(name_str, class_obj.clone());
 
-    inner.vm.globals_mut().insert(name_str, class_obj);
-
-    raw
+    Box::into_raw(Box::new(MsValue { inner: class_obj }))
 }
 ```
 
@@ -390,14 +399,11 @@ pub extern "C" fn msClassDefine(
 
 1. 参数空指针检查
 2. 解析类名字符串
-3. 处理 `parent` 参数：NULL 表示隐式继承 `Object`；非 NULL 验证为 Class 类型
-4. 加锁
-5. 调用 `vm.create_class` 创建 Class 对象
-6. 包装为 `MsValue*`
-7. 注册到全局作用域（`globals[name] = class`）
-8. 返回 Class 的 `MsValue*`
-
-C 侧创建的类与 mslang 脚本中 `class Foo { ... }` 定义的类在运行时完全等价，均可从脚本侧实例化和调用。
+3. `lock_vm` 加锁
+4. `alloc_class(name)` 创建 Class 堆对象
+5. 设置 parent：NULL 或非 Class 时继承 `vm.object_class`
+6. 注册到全局作用域
+7. 返回 Class 的 `MsValue*`
 
 ### msClassAddMethod
 
@@ -415,18 +421,20 @@ pub extern "C" fn msClassAddMethod(
     let name_str = unsafe {
         std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
     };
-    let cls_inner = unsafe { (*cls).inner.clone() };
 
-    let vm_ref = unsafe { &*vm };
-    let mut inner = vm_ref.inner.lock().unwrap();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    match &mut cls_inner {
-        Object::Class(cls_obj) => {
-            let native_fn = inner.vm.create_native_function(
-                &name_str,
-                method,
-            );
-            cls_obj.methods.insert(name_str, native_fn);
+    match &unsafe { &*cls }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
+            // 将 MsCFunction 包装为 MsCNativeFunction 堆对象
+            let native_fn = alloc_c_native_function(&name_str, method, -1);
+            // MsClass.methods 值为 *mut MsObjHeader，需从 Object::Ref 提取
+            let fn_ptr = match native_fn {
+                Object::Ref(p) => p,
+                _ => return MsStatus::MS_ERROR,
+            };
+            unsafe { read_class(*ptr) }.methods.insert(name_str, fn_ptr);
             MsStatus::MS_OK
         }
         _ => MsStatus::MS_ERROR,
@@ -436,15 +444,14 @@ pub extern "C" fn msClassAddMethod(
 
 逻辑：
 
-1. 参数空指针检查（含 `method` 函数指针 NULL 检查）
-2. 解析方法名字符串
-3. 加锁
-4. 验证 `cls` 为 Class 类型
-5. 将 `MsCFunction` 包装为 `NativeFunction` 对象（通过 `vm.create_native_function`）
-6. 插入类方法表 (`class.methods[name] = native_fn`)
-7. 返回 `MS_OK`
+1. 参数空指针检查（含 `method` 为 None 检查）
+2. `lock_vm` 加锁
+3. 验证 `cls` 为 Class 类型
+4. `alloc_c_native_function(name, method, -1)` 创建 `MsCNativeFunction`（task 70）
+5. 从 `Object::Ref` 提取 `*mut MsObjHeader`，存入 `MsClass.methods`
+6. 返回 `MS_OK`
 
-添加的方法作为实例方法：当实例调用该方法时，`self` 自动绑定为实例本身。方法接收参数为 `[self, arg1, arg2, ...]`。
+添加的方法作为实例方法：当实例调用该方法时，`self` 自动绑定为实例本身。
 
 ### msClassAddStatic
 
@@ -463,15 +470,13 @@ pub extern "C" fn msClassAddStatic(
         std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
     };
     let val_obj = unsafe { (*val).inner.clone() };
-    let cls_inner = unsafe { (*cls).inner.clone() };
 
-    let vm_ref = unsafe { &*vm };
-    let mut inner = vm_ref.inner.lock().unwrap();
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
 
-    match &mut cls_inner {
-        Object::Class(cls_obj) => {
-            cls_obj.static_attrs.insert(name_str, val_obj);
-            inner.vm.write_barrier(&cls_inner, &unsafe { (*val).inner });
+    match &unsafe { &*cls }.inner {
+        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
+            unsafe { read_class(*ptr) }.class_attrs.insert(name_str, val_obj);
             MsStatus::MS_OK
         }
         _ => MsStatus::MS_ERROR,
@@ -483,13 +488,12 @@ pub extern "C" fn msClassAddStatic(
 
 1. 参数空指针检查
 2. 解析属性名，克隆值
-3. 加锁
+3. `lock_vm` 加锁
 4. 验证 `cls` 为 Class 类型
-5. 插入类的静态属性表 (`class.static_attrs[name] = val`)
-6. 触发写屏障
-7. 返回 `MS_OK`
+5. 插入 `MsClass.class_attrs`（`HashMap<String, Object>`）
+6. 返回 `MS_OK`
 
-静态属性通过 `ClassName.attr_name` 访问，不依赖实例。典型用途：类常量、工厂方法、工具函数。
+静态属性通过 `ClassName.attr_name` 访问，不依赖实例。
 
 ### 模块声明更新
 
@@ -524,7 +528,8 @@ pub mod class;
 
 ### 线程安全
 
-所有函数内部自动加锁（`inner.lock().unwrap()`），与任务 66-capi-vm 的线程安全策略一致。C 侧无需手动加锁，除非需要多步操作的原子性。
+所有函数内部通过 `lock_vm(vm)` 自动加锁（`ReentrantMutex`），与 task 66-72
+的线程安全策略一致。C 侧无需手动加锁，除非需要多步操作的原子性。
 
 ## 验证标准
 
