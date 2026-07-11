@@ -21,25 +21,19 @@ pub mod gc;
 
 #[cfg(feature = "capi")]
 mod helpers {
-    use crate::capi::vm::{lock_vm, MsVM};
+    use std::ffi::CString;
+
+    use crate::capi::vm::MsVM;
     use crate::vm::object::Object;
 
-    /// 设置 TypeError 异常占位。Task 71 完成后委托给 msThrowTypeError。
-    ///
-    /// 在 VM 上设置 `has_error` 标志和 `error_message`，供 C 侧通过
-    /// msErrOccurred（Task 71）/msErrFetch（Task 71）查询。
-    /// vm 为 NULL 时安全 no-op（内部已检查）。
+    /// 设置 TypeError 异常。Task 71 后委托给 msThrowTypeError。
     pub(crate) fn set_type_error(vm: *mut MsVM, expected: &str, actual: &Object) {
-        // TODO(task 71): msThrowTypeError(vm, expected, actual.type_name());
         if vm.is_null() {
             return;
         }
-        let guard = lock_vm(vm);
-        // SAFETY: guard.get() 指向当前线程独占的 VmInner（由 ReentrantMutex 保证）。
-        let inner = unsafe { &mut *guard.get() };
-        inner.vm.has_error = true;
-        inner.vm.error_message =
-            format!("TypeError: expected {}, got {}", expected, actual.type_name());
+        let exp_c = CString::new(expected).unwrap_or_default();
+        let act_c = CString::new(actual.type_name()).unwrap_or_default();
+        let _ = crate::capi::error::msThrowTypeError(vm, exp_c.as_ptr(), act_c.as_ptr());
     }
 }
 

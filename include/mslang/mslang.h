@@ -9,8 +9,9 @@
 
  #include "vm.h"
 
- /* #include "error.h"
-  * #include "module.h"
+ #include "error.h"
+
+ /* #include "module.h"
   * #include "class.h"
   * #include "gc.h"
   */
