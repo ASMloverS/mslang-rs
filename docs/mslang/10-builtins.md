@@ -352,9 +352,33 @@ path.dir("a/b/c.txt")        # "a/b"
 ```ms
 import async
 
-async.sleep(1000)            # 异步休眠（毫秒）
-async.timeout(fn, 5000)      # 带超时执行
+async.sleep(1000)            # 异步休眠（毫秒），返回 Future<nil>
+async.timeout(fn, 5000)      # 带超时执行，返回 Future<value>；超时抛 TimeoutError
 ```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `async.sleep(ms)` | `sleep(ms: int) -> Future<nil>` | 异步休眠指定毫秒数；`ms` 必须为非负 int（上限 24 小时），负数抛 `TypeError` |
+| `async.timeout(fn, ms)` | `timeout(fn: function, ms: int) -> Future<value>` | 带超时执行 `fn`（async fn / 闭包）；超时 Future 被 reject 为 `TimeoutError`，fn 内部异常优先于超时 |
+
+#### TimeoutError
+
+`async.timeout` 超时时抛出的内置异常，父类为 `Error`：
+
+```ms
+try {
+    await async.timeout(fn() {
+        await async.sleep(10000)
+    }, 50)
+} except TimeoutError {
+    print("timed out")
+}
+```
+
+- 注册到内置异常表（`src/vm/mod.rs` `BUILTIN_EXCEPTION_NAMES` / `EXCEPTION_PARENTS`）
+- `except TimeoutError` 直接匹配；与 `except Error` 也匹配（父类链）
 
 ### gc
 
