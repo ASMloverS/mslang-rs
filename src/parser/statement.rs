@@ -633,11 +633,37 @@ impl Parser {
     }
 
     fn parse_module_path(&mut self) -> Result<Vec<String>> {
-        let mut path = vec![self.expect_identifier("expected module name")?];
+        let mut path = vec![self.expect_module_name("expected module name")?];
         while self.match_token(&[TokenKind::Dot]) {
-            path.push(self.expect_identifier("expected module name after '.'")?);
+            path.push(self.expect_module_name("expected module name after '.'")?);
         }
         Ok(path)
+    }
+
+    /// 模块路径段：接受 Identifier 或上下文敏感关键字（如 `async`）作为模块名。
+    /// task 61：`import async` 需要 `async` 关键字在模块路径位置作为标识符。
+    fn expect_module_name(&mut self, msg: &str) -> Result<String> {
+        let kind = self.peek().kind.clone();
+        match &kind {
+            TokenKind::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                Ok(name)
+            }
+            // 上下文敏感：关键字在模块名位置视为普通标识符
+            TokenKind::Async => {
+                self.advance();
+                Ok("async".to_string())
+            }
+            _ => {
+                let tok = self.peek();
+                Err(MspError::ParseError {
+                    line: tok.span.start.line,
+                    column: tok.span.start.column,
+                    message: msg.into(),
+                })
+            }
+        }
     }
 
     // ---- task 59：select 语句 ----

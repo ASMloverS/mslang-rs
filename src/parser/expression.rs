@@ -455,6 +455,13 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Identifier("self".into()))
             }
+            // task 61：`async` 关键字在表达式位置（如 `async.sleep(ms)`）作为
+            // 普通标识符。语句级的 `async fn` 在 parse_statement 中提前分派，
+            // 不会进入此分支。
+            TokenKind::Async => {
+                self.advance();
+                Ok(Expr::Identifier("async".into()))
+            }
             TokenKind::Super => {
                 self.advance();
                 self.expect(TokenKind::Dot, "expected '.' after 'super'")?;

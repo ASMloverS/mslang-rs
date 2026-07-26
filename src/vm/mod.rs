@@ -86,10 +86,55 @@ pub struct PausedCoroutine {
     pub select_entries: Option<Vec<SelectEntry>>,
 }
 
-/// 事件循环。协作式调度，FIFO 就绪队列 + 暂停列表。
+// ---------------------------------------------------------------------------
+// task 61：async stdlib timer 数据结构
+// ---------------------------------------------------------------------------
+
+/// timer 到期后执行的动作。
+enum TimerAction {
+    /// async.sleep 到期：将关联 Future resolve 为 val。
+    Resolve(Object),
+    /// async.timeout 到期：将关联 Future reject 为指定异常，并取消关联子协程。
+    Reject {
+        error_class: &'static str,
+        sub_coro_handle: *mut MsObjHeader,
+    },
+}
+
+/// timer 条目。BinaryHeap 按 deadline 升序排列（Reverse 包裹实现最小堆）。
+pub(crate) struct TimerEntry {
+    deadline: std::time::Instant,
+    future_ptr: *mut MsObjHeader,
+    action: TimerAction,
+}
+
+// Ord/Eq 仅按 (deadline, future_ptr) 比较，忽略 action（Object 不实现 Ord）。
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.future_ptr == other.future_ptr
+    }
+}
+impl Eq for TimerEntry {}
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.deadline
+            .cmp(&other.deadline)
+            .then_with(|| (self.future_ptr as usize).cmp(&(other.future_ptr as usize)))
+    }
+}
+
+/// 事件循环。协作式调度，FIFO 就绪队列 + 暂停列表 + timer 优先队列。
 pub struct EventLoop {
     pub ready_queue: std::collections::VecDeque<Coroutine>,
     pub paused: Vec<PausedCoroutine>,
+    /// task 61：timer 最小堆（按 deadline 升序）。Reverse 包裹使 BinaryHeap
+    /// （默认最大堆）变为最小堆，pop() 取最早到期的 entry。
+    pub(crate) timers: std::collections::BinaryHeap<std::cmp::Reverse<TimerEntry>>,
 }
 
 impl EventLoop {
@@ -97,6 +142,7 @@ impl EventLoop {
         Self {
             ready_queue: std::collections::VecDeque::new(),
             paused: Vec::new(),
+            timers: std::collections::BinaryHeap::new(),
         }
     }
 }
@@ -151,6 +197,8 @@ const EXCEPTION_PARENTS: &[(&str, &str)] = &[
     ("GeneratorExit", "Error"),
     // task 45：ImportError（父类 Error），由 load()/IMPORT handler 抛出。
     ("ImportError", "Error"),
+    // task 61：TimeoutError（父类 Error），由 async.timeout 超时时 reject。
+    ("TimeoutError", "Error"),
 ];
 
 /// 内置异常类名（Error + 子类）。VM::new 时注册为 EXCEPTION_CLASS 全局变量。
@@ -170,6 +218,8 @@ const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "GeneratorExit",
     // task 45：使脚本可 `except ImportError`。
     "ImportError",
+    // task 61：使脚本可 `except TimeoutError`。
+    "TimeoutError",
 ];
 
 pub struct VM {
@@ -383,6 +433,16 @@ impl VM {
         vm.native_arities.insert("mem_alloc".to_string(), 0);
         vm.native_arities.insert("mem_live".to_string(), 0);
 
+        // task 61：注册原生 async 模块 + 模块函数 arity。
+        // sleep arity=1 与 time.sleep 同名同值，native_arities 共享无歧义
+        //（实际分派按栈上的函数对象，非 name 查表）。
+        let async_ptr = stdlib::register_async_module();
+        vm.module_resolver
+            .native_modules
+            .insert("async".to_string(), async_ptr);
+        vm.native_arities.insert("sleep".to_string(), 1);
+        vm.native_arities.insert("timeout".to_string(), 2);
+
         vm
     }
 
@@ -453,6 +513,154 @@ impl VM {
             }
         }
         self.event_loop.paused = still_paused;
+    }
+
+    // ---- task 61：async stdlib timer / sub-coroutine 支持 ----
+
+    /// 注册 async.sleep timer：到时将 Future resolve 为 Nil。
+    /// `ms` 须已校验为非负且 ≤ 86_400_000（调用方负责）。
+    pub(crate) fn push_sleep_timer(&mut self, future_ptr: *mut MsObjHeader, ms: i64) {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        self.event_loop.timers.push(std::cmp::Reverse(TimerEntry {
+            deadline,
+            future_ptr,
+            action: TimerAction::Resolve(Object::Nil),
+        }));
+    }
+
+    /// 注册 async.timeout 竞争 timer：到时将 Future reject 为 TimeoutError，
+    /// 并标记关联子协程 cancel_requested。返回子协程的 JoinHandle 指针。
+    pub(crate) fn push_timeout_timer(
+        &mut self,
+        future_ptr: *mut MsObjHeader,
+        ms: i64,
+        sub_coro_handle: *mut MsObjHeader,
+    ) {
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        self.event_loop.timers.push(std::cmp::Reverse(TimerEntry {
+            deadline,
+            future_ptr,
+            action: TimerAction::Reject {
+                error_class: "TimeoutError",
+                sub_coro_handle,
+            },
+        }));
+    }
+
+    /// 创建 timeout 子协程：包装 fn 为带 outer Future 关联 + JoinHandle 的协程。
+    /// 子协程完成（正常/异常）时 EventLoop 通过 future 字段 resolve/reject outer Future。
+    /// JoinHandle 用于超时时 cancel 子协程。
+    pub(crate) fn spawn_timeout_subcoroutine(
+        &mut self,
+        fn_ptr: *mut MsObjHeader,
+        outer_ptr: *mut MsObjHeader,
+    ) -> Coroutine {
+        // 关闭 fn 闭包捕获的开放上值（与 GO 指令一致：子协程运行在独立栈上，
+        // 开放上值指向当前协程栈槽，切换后失效）。
+        let tag = unsafe { (*fn_ptr).type_tag };
+        if tag == TypeTag::CLOSURE as u8 {
+            let closure = unsafe { read_closure(fn_ptr) };
+            for &uv_ptr in closure.upvalues.iter() {
+                let uv = unsafe { read_upvalue(uv_ptr) };
+                if uv.closed.is_none() {
+                    uv.close(&self.stack);
+                }
+            }
+        }
+        // 分配 JoinHandle（用于 cancel 子协程）
+        let handle_obj = alloc_join_handle();
+        let Object::Ref(handle_ptr) = handle_obj else {
+            unreachable!()
+        };
+        let frame = CallFrame::new(fn_ptr, 0, 0);
+        Coroutine {
+            call_stack: vec![frame],
+            stack: vec![Object::Ref(fn_ptr)],
+            defer_stack: Vec::new(),
+            open_upvalues: Vec::new(),
+            exception_handlers: Vec::new(),
+            pending_unwind: None,
+            future: Some(outer_ptr),
+            handle: Some(handle_ptr),
+        }
+    }
+
+    /// 弹出到期 timer 并执行 action（resolve/reject + wake waiters）。
+    /// 借用分离：先收集到期 entries（持有 &mut timers），再迭代处理（持有 &mut self）。
+    fn check_timers(&mut self) {
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        while let Some(std::cmp::Reverse(entry)) = self.event_loop.timers.peek() {
+            if entry.deadline > now {
+                break;
+            }
+            let std::cmp::Reverse(entry) = self.event_loop.timers.pop().unwrap();
+            due.push(entry);
+        }
+        for entry in due {
+            let fp = entry.future_ptr;
+            // already_settled：子协程可能先完成，Future 已 Resolved/Rejected → 跳过
+            let already_settled = {
+                let f = unsafe { read_future(fp) };
+                !matches!(*f.state.borrow(), FutureState::Pending)
+            };
+            if already_settled {
+                continue;
+            }
+            match entry.action {
+                TimerAction::Resolve(val) => {
+                    let f = unsafe { read_future(fp) };
+                    *f.state.borrow_mut() = FutureState::Resolved(val);
+                }
+                TimerAction::Reject {
+                    error_class,
+                    sub_coro_handle,
+                } => {
+                    let exc = alloc_exception(
+                        error_class,
+                        alloc_string("timeout after deadline"),
+                        alloc_string(""),
+                        Object::Nil,
+                    );
+                    let f = unsafe { read_future(fp) };
+                    *f.state.borrow_mut() = FutureState::Rejected(exc);
+                    // 标记子协程 cancel_requested
+                    let handle = unsafe { read_join_handle(sub_coro_handle) };
+                    *handle.cancel_requested.borrow_mut() = true;
+                    // 唤醒子协程使其在下次安全点检测 cancel 并终止
+                    self.wake_cancelled_subcoroutine(sub_coro_handle);
+                }
+            }
+            self.wake_waiters(fp);
+        }
+    }
+
+    /// 返回下一个 timer 的 deadline（无 timer 返回 None）。供主循环 sleep_until 使用。
+    fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        self.event_loop
+            .timers
+            .peek()
+            .map(|std::cmp::Reverse(e)| e.deadline)
+    }
+
+    /// 将指定 JoinHandle 关联的暂停子协程从 paused 移至 ready_queue，
+    /// 使其在下次 AWAIT 安全点检测 cancel 并终止。
+    fn wake_cancelled_subcoroutine(&mut self, handle_ptr: *mut MsObjHeader) {
+        let mut still_paused = Vec::new();
+        let mut woken = Vec::new();
+        for paused in self.event_loop.paused.drain(..) {
+            if paused.coroutine.handle == Some(handle_ptr) {
+                woken.push(paused.coroutine);
+            } else {
+                still_paused.push(paused);
+            }
+        }
+        self.event_loop.paused = still_paused;
+        for coro in woken {
+            self.event_loop.ready_queue.push_back(coro);
+        }
     }
 
     /// task 55：安全点 cancel 检查（AWAIT/SEND/RECEIVE）。若当前协程的 JoinHandle
@@ -607,6 +815,9 @@ impl VM {
         let mut main_result = Object::Nil;
 
         while !self.event_loop.ready_queue.is_empty() || !self.event_loop.paused.is_empty() {
+            // task 61：每轮先推进 timer（resolve/reject 到期 Future + wake waiters）
+            self.check_timers();
+
             let coro = match self.event_loop.ready_queue.pop_front() {
                 Some(c) => c,
                 None => {
@@ -624,7 +835,15 @@ impl VM {
                         // 空 select{} 永久阻塞（与 Go 一致），不报 deadlock
                         return Ok(Object::Nil);
                     }
-                    // 无 select 可唤醒且非全空 select → 死锁
+                    // task 61：仍有 timer 等待时 sleep_until 下个 deadline（防忙等）
+                    if let Some(deadline) = self.next_timer_deadline() {
+                        let now = std::time::Instant::now();
+                        if deadline > now {
+                            std::thread::sleep(deadline - now);
+                        }
+                        continue;
+                    }
+                    // 无 select 可唤醒、无 timer、非全空 select → 死锁
                     return Err("deadlock: all coroutines paused".to_string());
                 }
             };
@@ -695,10 +914,16 @@ impl VM {
                 match result {
                     Ok(val) => {
                         if let Some(fp) = coro_future {
-                            // async fn 协程：resolve Future
-                            let f = unsafe { read_future(fp) };
-                            *f.state.borrow_mut() = FutureState::Resolved(val.clone());
-                            self.wake_waiters(fp);
+                            // task 61：timeout 子协程可能已被 timer reject（already_settled）
+                            let already_settled = {
+                                let f = unsafe { read_future(fp) };
+                                !matches!(*f.state.borrow(), FutureState::Pending)
+                            };
+                            if !already_settled {
+                                let f = unsafe { read_future(fp) };
+                                *f.state.borrow_mut() = FutureState::Resolved(val.clone());
+                                self.wake_waiters(fp);
+                            }
                         }
                         if let Some(hp) = coro_handle {
                             // task 55：go 协程完成——填充 JoinHandle
@@ -713,18 +938,25 @@ impl VM {
                     }
                     Err(msg) => {
                         if let Some(fp) = coro_future {
-                            // async fn 协程异常：reject Future
-                            let exc = self.last_uncaught_exception.take().unwrap_or_else(|| {
-                                alloc_exception(
-                                    "Error",
-                                    alloc_string(&msg),
-                                    alloc_string(""),
-                                    Object::Nil,
-                                )
-                            });
-                            let f = unsafe { read_future(fp) };
-                            *f.state.borrow_mut() = FutureState::Rejected(exc);
-                            self.wake_waiters(fp);
+                            // task 61：timeout 子协程可能已被 timer reject（already_settled）
+                            let already_settled = {
+                                let f = unsafe { read_future(fp) };
+                                !matches!(*f.state.borrow(), FutureState::Pending)
+                            };
+                            if !already_settled {
+                                // async fn 协程异常：reject Future
+                                let exc = self.last_uncaught_exception.take().unwrap_or_else(|| {
+                                    alloc_exception(
+                                        "Error",
+                                        alloc_string(&msg),
+                                        alloc_string(""),
+                                        Object::Nil,
+                                    )
+                                });
+                                let f = unsafe { read_future(fp) };
+                                *f.state.borrow_mut() = FutureState::Rejected(exc);
+                                self.wake_waiters(fp);
+                            }
                         } else if let Some(hp) = coro_handle {
                             // task 55：go 协程异常——存入 JoinHandle.error，不传播
                             let exc = self.last_uncaught_exception.take().unwrap_or_else(|| {
@@ -11573,6 +11805,171 @@ assert(make() == 111)
                     assert(false)
                 }
             }
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    // ---- task 61：async stdlib（sleep / timeout）----
+
+    #[test]
+    fn test_async_sleep_basic() {
+        let result = compile_and_run(
+            r#"
+            import async
+            async fn test_sleep() {
+                await async.sleep(50)
+                return "done"
+            }
+            result = await test_sleep()
+            assert(result == "done")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_sleep_zero() {
+        // sleep(0) 让出执行权：yielder 暂停后 other 先运行，A2 最后。
+        let result = compile_and_run(
+            r#"
+            import async
+            results = []
+            async fn yielder(lst) {
+                lst.push("A1")
+                await async.sleep(0)
+                lst.push("A2")
+            }
+            async fn other(lst) {
+                lst.push("B")
+            }
+            f1 = yielder(results)
+            f2 = other(results)
+            await f1
+            await f2
+            assert(results[0] == "A1" and results[1] == "B" and results[2] == "A2", "order wrong")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_sleep_order() {
+        // 多 timer 按 deadline 顺序唤醒（短 sleep 先恢复）。
+        let result = compile_and_run(
+            r#"
+            import async
+            results = []
+            async fn sleeper(lst, name, ms) {
+                await async.sleep(ms)
+                lst.push(name)
+            }
+            f1 = sleeper(results, "long", 200)
+            f2 = sleeper(results, "short", 50)
+            f3 = sleeper(results, "mid", 100)
+            await f1
+            await f2
+            await f3
+            assert(results[0] == "short" and results[1] == "mid" and results[2] == "long", "order wrong")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_timeout_success() {
+        // timeout 在函数正常完成时返回结果。
+        let result = compile_and_run(
+            r#"
+            import async
+            async fn compute() {
+                await async.sleep(20)
+                return 42
+            }
+            async fn wrapper() {
+                return await compute()
+            }
+            result = await async.timeout(wrapper, 5000)
+            assert(result == 42)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_timeout_fires() {
+        // timeout 超时时抛出 TimeoutError。
+        let result = compile_and_run(
+            r#"
+            import async
+            async fn slow_fn() {
+                await async.sleep(10000)
+            }
+            try {
+                await async.timeout(slow_fn, 50)
+                assert(false, "should have timed out")
+            } except TimeoutError {
+                assert(true)
+            }
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_timeout_fn_exception() {
+        // fn 内部异常优先于 timeout（不被超时吞掉）。
+        let result = compile_and_run(
+            r#"
+            import async
+            async fn bad_fn() {
+                throw ValueError("bad input")
+            }
+            try {
+                await async.timeout(bad_fn, 5000)
+                assert(false, "should have thrown")
+            } except ValueError {
+                assert(true)
+            } except TimeoutError {
+                assert(false, "should not be TimeoutError")
+            }
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_sleep_negative() {
+        // sleep(-1) 抛 TypeError（经 Rejected Future → AWAIT throw 路径）。
+        let result = compile_and_run(
+            r#"
+            import async
+            try {
+                await async.sleep(-1)
+                assert(false, "should have thrown")
+            } except TypeError {
+                assert(true)
+            }
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_async_sleep_no_busy_loop() {
+        // EventLoop 空闲时 sleep_until 而非忙等；sleep 时长近似实际等待。
+        let result = compile_and_run(
+            r#"
+            import async
+            import time
+            start = time.now()
+            async fn waiter() {
+                await async.sleep(100)
+            }
+            await waiter()
+            elapsed = (time.now() - start) * 1000
+            assert(elapsed >= 100)
+            assert(elapsed < 500)
         "#,
         );
         assert!(result.is_ok(), "expected ok, got err: {:?}", result);

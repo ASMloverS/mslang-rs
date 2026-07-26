@@ -105,7 +105,12 @@ impl Parser {
             self.parse_var_decl()
         } else if self.check(&TokenKind::Const) {
             self.parse_const_decl()
-        } else if self.check(&TokenKind::Async) {
+        } else if self.check(&TokenKind::Async)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|t| t.kind == TokenKind::Fn)
+        {
             self.parse_async_fn()
         } else if self.check(&TokenKind::Fn) {
             self.parse_fn_or_expr()
