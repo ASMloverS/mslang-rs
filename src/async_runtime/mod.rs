@@ -5,8 +5,11 @@
 //! 紧耦合。Future 对象定义于 `vm/object.rs`。
 //!
 //! task 54：Channel 通信对象定义于 `channel` 子模块。
+//! task 55：JoinHandle 对象定义于 `join_handle` 子模块。
 
 pub mod channel;
+pub mod join_handle;
 
 pub use crate::vm::{Coroutine, EventLoop, PausedCoroutine};
 pub use channel::{alloc_channel, read_channel, ChannelState, MsChannel, WaitingReceiver, WaitingSender};
+pub use join_handle::{alloc_join_handle, read_join_handle, MsJoinHandle};

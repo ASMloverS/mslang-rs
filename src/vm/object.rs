@@ -1310,6 +1310,8 @@ impl Object {
                     "file"
                 } else if tag == TypeTag::CHANNEL as u8 {
                     "channel"
+                } else if tag == TypeTag::JOIN_HANDLE as u8 {
+                    "JoinHandle"
                 } else {
                     "object"
                 }

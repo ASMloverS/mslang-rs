@@ -851,6 +851,39 @@ static CHANNEL_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<crate::async_runtime::channel::MsChannel>(),
 };
 
+// task 55：JOIN_HANDLE。Box 分配（alloc_join_handle），当前未接入 GC 堆，故
+// copy/forward/free 为占位 noop。trace 遍历 result/error 中的 Object::Ref（14-gc.md § 根集扩展）。
+fn trace_join_handle(obj: *mut MsObjHeader, cb: &mut dyn FnMut(*mut MsObjHeader)) {
+    use crate::async_runtime::join_handle::read_join_handle;
+    // SAFETY: obj 由 alloc_join_handle 分配，type_tag = JOIN_HANDLE。
+    let handle = unsafe { read_join_handle(obj) };
+
+    // result 中的 Ref
+    if let Ok(result) = handle.result.try_borrow() {
+        if let Some(Object::Ref(r)) = result.as_ref() {
+            cb(*r);
+        }
+    }
+
+    // error 中的 Ref（异常实例）
+    if let Ok(error) = handle.error.try_borrow() {
+        if let Some(Object::Ref(r)) = error.as_ref() {
+            cb(*r);
+        }
+    }
+}
+
+static JOIN_HANDLE_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::JOIN_HANDLE,
+    name: "join_handle",
+    trace: trace_join_handle,
+    copy_for_gc: copy_placeholder,
+    forward_fields: forward_noop,
+    free: free_placeholder,
+    finalize: None,
+    size_base: std::mem::size_of::<crate::async_runtime::join_handle::MsJoinHandle>(),
+};
+
 /// 类型描述表查找：为每个 TypeTag 返回对应的 TypeDescriptor。
 /// 参照 14-gc.md — 所有 TypeTag 必须覆盖。当前仅 STRING/LIST/DICT/TUPLE/SET
 /// 由 GC 托管；FUNCTION..EXCEPTION_CLASS(6..=19) 与 LARGE_OBJECT(0xFF) 以占位 noop
@@ -875,6 +908,8 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::NATIVE_C_FUNCTION as u8 => &NATIVE_C_FUNCTION_DESC,
         // task 54：CHANNEL（Box 分配，未接入 GC 堆）→ 真实 trace，其余占位。
         t if t == TypeTag::CHANNEL as u8 => &CHANNEL_DESC,
+        // task 55：JOIN_HANDLE（Box 分配，未接入 GC 堆）→ 真实 trace，其余占位。
+        t if t == TypeTag::JOIN_HANDLE as u8 => &JOIN_HANDLE_DESC,
         // 合法但当前未托管 TypeTag（6..=19 除 MODULE，与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。
@@ -882,7 +917,7 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         // TODO task 52/26: ITERATOR。
         // task 39: GENERATOR — Box 分配（alloc_generator），当前不经 gc_alloc，
         // trace/finalize 不被调用；GC 接管后需 trace stack_snapshot + receiver。
-        // TODO task 53: FUTURE/CHANNEL/JOIN_HANDLE。
+        // TODO task 53: FUTURE。
         // [task 38 回填] current_exc 作根集已在 minor_gc/major_gc 扫描（见上方 frames 参数）；
         //   exception_handlers 仅持元数据（无 Object 引用），不需扫描。
         t if (TypeTag::FUNCTION as u8..=TypeTag::EXCEPTION_CLASS as u8).contains(&t)

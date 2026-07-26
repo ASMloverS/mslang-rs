@@ -128,7 +128,7 @@ impl Compiler {
                 self.emit_byte(OpCode::Await as u8, line);
                 Ok(())
             }
-            Expr::Go { .. } => Err("go compilation not yet implemented (task 55)".to_string()),
+            Expr::Go { expr } => self.compile_go(expr, line),
             // task 54：channel 发送 `ch <- value` → value + channel + SEND
             Expr::ChannelSend { channel, value } => {
                 self.compile_expression(value, line)?;
@@ -137,6 +137,42 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+
+    /// task 55：编译 `go expression`。
+    ///
+    /// GO 指令无操作数（11-bytecode-vm.md:189），弹出栈顶零参数可调用对象创建协程。
+    /// - `go fn() { ... }` — 零参数 lambda → 直接编译 lambda，发 GO
+    /// - `go fn() { ... }()` — 零参数 lambda 的冗余调用 → 编译 lambda，发 GO
+    /// - `go fn(x) { ... }(arg)` / `go my_func(args)` — 包装为零参数 thunk 闭包
+    ///   `fn() { <expr> }`，thunk 捕获外层变量，发 GO
+    fn compile_go(&mut self, expr: &Expr, line: usize) -> Result<(), String> {
+        match expr {
+            // go <零参数 lambda> — 直接编译 lambda
+            Expr::FnLiteral { params, body } if params.is_empty() => {
+                self.compile_fn_literal(params, body, line)?;
+            }
+            // go <零参数 lambda>() — 冗余调用，直接编译 lambda
+            Expr::Call { callee, args }
+                if args.is_empty()
+                    && matches!(callee.as_ref(), Expr::FnLiteral { ref params, .. } if params.is_empty()) =>
+            {
+                let Expr::FnLiteral { params, body } = callee.as_ref() else {
+                    unreachable!()
+                };
+                self.compile_fn_literal(params, body, line)?;
+            }
+            // 其余情况（带参数调用等）：包装为零参数 thunk 闭包
+            _ => {
+                let thunk = Expr::FnLiteral {
+                    params: vec![],
+                    body: vec![Stmt::ExprStmt { expr: expr.clone() }],
+                };
+                self.compile_expression(&thunk, line)?;
+            }
+        }
+        self.emit_byte(OpCode::Go as u8, line);
+        Ok(())
     }
 }
 
