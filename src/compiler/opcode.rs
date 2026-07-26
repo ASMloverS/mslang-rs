@@ -122,6 +122,8 @@ pub enum OpCode {
     Receive,
     Go,
     Await,
+    // task 59：select 多路复用（可变长度操作数，由 handler 内部解析）
+    Select,
     Halt,
 }
 
@@ -415,6 +417,7 @@ mod tests {
             OpCode::Receive,
             OpCode::Go,
             OpCode::Await,
+            OpCode::Select,
             OpCode::Halt,
         ];
         for op in &opcodes {

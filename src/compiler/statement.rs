@@ -5,7 +5,7 @@
 //!
 //! 参照 [19-compile-statements](../../../docs/mslang/tasks/19-compile-statements.md)。
 
-use crate::ast::node::{AssignOp, BinaryOp, ExceptClause, Expr, Stmt, UnaryOp};
+use crate::ast::node::{AssignOp, BinaryOp, ExceptClause, Expr, SelectCase, SelectOp, Stmt, UnaryOp};
 use crate::vm::object::{alloc_function, alloc_string, Function};
 
 use super::{CompilationUnit, Compiler, Local, OpCode};
@@ -77,6 +77,10 @@ impl Compiler {
             Stmt::Decorated { decorators, target } => {
                 self.compile_decorated(decorators, target, line)
             }
+            Stmt::Select {
+                cases,
+                default_block,
+            } => self.compile_select(cases, default_block, line),
         }
     }
 }
@@ -1269,6 +1273,145 @@ impl Compiler {
         let back = self.emit_jump(OpCode::Continue, line);
         self.patch_jump_back(back, loop_start)?;
         Ok(())
+    }
+}
+
+// ---- task 59：select 语句编译 ----
+
+impl Compiler {
+    /// 编译 select 语句。按 case 源代码顺序预求值所有 channel 和 send value，
+    /// 然后 SELECT 指令按 case 描述表进行多路复用。
+    fn compile_select(
+        &mut self,
+        cases: &[SelectCase],
+        default_block: &Option<Vec<Stmt>>,
+        line: usize,
+    ) -> Result<(), String> {
+        if cases.len() > 255 {
+            return Err("'select' case count exceeds 255".to_string());
+        }
+
+        // 1. 预求值：将 channel 和 send value 存入临时局部槽
+        struct CaseDesc {
+            kind: u8,
+            channel_slot: u8,
+            value_slot: u8,
+            target_slot: u8,
+        }
+
+        let mut descs = Vec::with_capacity(cases.len());
+        for (i, case) in cases.iter().enumerate() {
+            match &case.operation {
+                SelectOp::Receive { channel, target } => {
+                    let ch_slot = self.resolve_or_emit_channel_slot(channel, line)?;
+                    let tgt_slot = self.resolve_or_declare_target(target, line)?;
+                    descs.push(CaseDesc {
+                        kind: 0,
+                        channel_slot: ch_slot,
+                        value_slot: 0xFF,
+                        target_slot: tgt_slot,
+                    });
+                }
+                SelectOp::Send { channel, value } => {
+                    let ch_slot = self.resolve_or_emit_channel_slot(channel, line)?;
+                    self.compile_expression(value, line)?;
+                    let val_name = format!("__sel_val_{}", i);
+                    self.declare_local(&val_name, line)?;
+                    let val_slot = (self.unit.locals.len() - 1) as u8;
+                    self.emit_byte(OpCode::StoreLocal as u8, line);
+                    self.emit_byte(val_slot, line);
+                    descs.push(CaseDesc {
+                        kind: 1,
+                        channel_slot: ch_slot,
+                        value_slot: val_slot,
+                        target_slot: 0xFF,
+                    });
+                }
+            }
+        }
+
+        // 2. 发射 SELECT 指令
+        let select_pc = self.unit.chunk.code.len();
+        self.emit_byte(OpCode::Select as u8, line);
+        self.emit_byte(cases.len() as u8, line);
+        self.emit_byte(if default_block.is_some() { 1 } else { 0 }, line);
+
+        // 3. 发射 case 描述表（每条 6 字节，body_offset 先占位）
+        let table_start = self.unit.chunk.code.len();
+        for desc in &descs {
+            self.emit_byte(desc.kind, line);
+            self.emit_byte(desc.channel_slot, line);
+            self.emit_byte(desc.value_slot, line);
+            self.emit_byte(desc.target_slot, line);
+            self.emit_byte(0, line); // body_offset 高字节占位
+            self.emit_byte(0, line); // body_offset 低字节占位
+        }
+
+        // 4. default_offset 占位
+        let default_off_pos = self.unit.chunk.code.len();
+        self.emit_byte(0, line);
+        self.emit_byte(0, line);
+
+        // 5. 依次编译 body，回填 body_offset
+        let mut end_jumps = Vec::new();
+        for (i, case) in cases.iter().enumerate() {
+            let body_pc = self.unit.chunk.code.len();
+            let offset = body_pc as i64 - select_pc as i64;
+            if !(-32768..=32767).contains(&offset) {
+                return Err("'select' body offset exceeds 32KB".to_string());
+            }
+            let off_bytes = (offset as i16).to_be_bytes();
+            let patch_pos = table_start + i * 6 + 4;
+            self.unit.chunk.code[patch_pos] = off_bytes[0];
+            self.unit.chunk.code[patch_pos + 1] = off_bytes[1];
+
+            self.compile_block(&case.body, line)?;
+            end_jumps.push(self.emit_jump(OpCode::Jump, line));
+        }
+
+        // 6. default body
+        if let Some(db) = default_block {
+            let d_pc = self.unit.chunk.code.len();
+            let offset = d_pc as i64 - select_pc as i64;
+            let off_bytes = (offset as i16).to_be_bytes();
+            self.unit.chunk.code[default_off_pos] = off_bytes[0];
+            self.unit.chunk.code[default_off_pos + 1] = off_bytes[1];
+            self.compile_block(db, line)?;
+            end_jumps.push(self.emit_jump(OpCode::Jump, line));
+        }
+
+        // 7. 回填所有 end jump → end_select
+        for jmp in &end_jumps {
+            self.patch_jump(*jmp)?;
+        }
+
+        Ok(())
+    }
+
+    /// 将 channel 名解析为局部槽索引。若已是局部变量则直接返回其槽；
+    /// 若为全局/上值则发 LOAD 指令将其存入临时局部槽。
+    fn resolve_or_emit_channel_slot(&mut self, name: &str, line: usize) -> Result<u8, String> {
+        if let Some(slot) = self.resolve_local(name) {
+            u8::try_from(slot).map_err(|_| "local slot exceeds 255".to_string())
+        } else {
+            self.emit_load_name(name, line)?;
+            let temp = format!("__sel_ch_{}", self.unit.locals.len());
+            self.declare_local(&temp, line)?;
+            let slot = (self.unit.locals.len() - 1) as u8;
+            self.emit_byte(OpCode::StoreLocal as u8, line);
+            self.emit_byte(slot, line);
+            Ok(slot)
+        }
+    }
+
+    /// 解析 receive 目标变量槽。若已是局部则返回其槽；否则声明新局部。
+    fn resolve_or_declare_target(&mut self, name: &str, line: usize) -> Result<u8, String> {
+        if let Some(slot) = self.resolve_local(name) {
+            u8::try_from(slot).map_err(|_| "local slot exceeds 255".to_string())
+        } else {
+            self.declare_local(name, line)?;
+            Ok((self.unit.locals.len() - 1) as u8)
+        }
     }
 }
 

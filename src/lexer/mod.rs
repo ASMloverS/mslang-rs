@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn test_all_reserved_words_error() {
-        for word in &["select", "default", "case", "export", "match"] {
+        for word in &["export", "match"] {
             let result = Lexer::new(&format!("{} = 1\n", word)).tokenize_all();
             assert!(result.is_err(), "reserved word '{}' should error", word);
         }
@@ -877,6 +877,15 @@ mod tests {
         assert!(tokens
             .iter()
             .any(|t| matches!(&t.kind, TokenKind::Identifier(s) if s == "returnx")));
+    }
+
+    #[test]
+    fn test_select_case_default_keywords() {
+        // task 59：select/case/default 升级为关键字后应正确识别
+        let tokens = tokenize("select { case default }\n");
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Select));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Case));
+        assert!(tokens.iter().any(|t| t.kind == TokenKind::Default));
     }
 
     #[test]

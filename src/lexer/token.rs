@@ -12,7 +12,7 @@ pub enum TokenKind {
     // 标识符
     Identifier(String),
 
-    // 36 个关键字
+    // 39 个关键字 + is（双重角色）+ select/case/default（task 59）
     Var,
     Const,
     Fn,
@@ -49,6 +49,10 @@ pub enum TokenKind {
     Yield,
     Nonlocal,
     Global,
+    // task 59：select 语句关键字（从保留字升级）
+    Select,
+    Case,
+    Default,
 
     // 算术运算符 (+ - * / // % **)
     Plus,
@@ -186,6 +190,9 @@ impl fmt::Display for TokenKind {
             TokenKind::Yield => write!(f, "yield"),
             TokenKind::Nonlocal => write!(f, "nonlocal"),
             TokenKind::Global => write!(f, "global"),
+            TokenKind::Select => write!(f, "select"),
+            TokenKind::Case => write!(f, "case"),
+            TokenKind::Default => write!(f, "default"),
             TokenKind::Is => write!(f, "is"),
             // 算术运算符
             TokenKind::Plus => write!(f, "+"),
@@ -261,7 +268,7 @@ impl fmt::Display for Token {
 }
 
 /// 关键字查找表：词法分析阶段用于将标识符区分为关键字。
-/// 包含 36 个关键字 + `is`（身份比较，双重角色），共 37 个条目。
+/// 包含 39 个关键字 + `is`（身份比较，双重角色），共 40 个条目。
 pub fn keyword_table() -> HashMap<&'static str, TokenKind> {
     let mut m = HashMap::new();
     m.insert("var", TokenKind::Var);
@@ -300,13 +307,16 @@ pub fn keyword_table() -> HashMap<&'static str, TokenKind> {
     m.insert("yield", TokenKind::Yield);
     m.insert("nonlocal", TokenKind::Nonlocal);
     m.insert("global", TokenKind::Global);
+    m.insert("select", TokenKind::Select);
+    m.insert("case", TokenKind::Case);
+    m.insert("default", TokenKind::Default);
     m.insert("is", TokenKind::Is);
     m
 }
 
 /// 保留字集合：不可用作标识符，但当前版本尚无语义（预留未来使用）。
 pub fn reserved_words() -> &'static [&'static str] {
-    &["select", "default", "case", "export", "match"]
+    &["export", "match"]
 }
 
 #[cfg(test)]
@@ -338,13 +348,13 @@ mod tests {
     #[test]
     fn test_keyword_count() {
         let kw = keyword_table();
-        assert_eq!(kw.len(), 37);
+        assert_eq!(kw.len(), 40);
     }
 
     #[test]
     fn test_reserved_words() {
         let reserved = reserved_words();
-        assert!(reserved.contains(&"select"));
+        assert!(!reserved.contains(&"select"));
         assert!(reserved.contains(&"match"));
     }
 

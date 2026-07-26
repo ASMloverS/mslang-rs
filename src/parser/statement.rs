@@ -5,7 +5,7 @@
 //! 分发目标方法（parse_var_decl 等供 parse_statement 调用）声明为 pub(super)；
 //! 内部辅助方法保持私有。is_fn_literal 由 task 12（expression.rs）提供，此处复用。
 
-use crate::ast::{AssignOp, ExceptClause, Expr, Param, Stmt};
+use crate::ast::{AssignOp, ExceptClause, Expr, Param, SelectCase, SelectOp, Stmt};
 use crate::error::{MspError, Result};
 use crate::lexer::token::TokenKind;
 
@@ -639,6 +639,72 @@ impl Parser {
         }
         Ok(path)
     }
+
+    // ---- task 59：select 语句 ----
+
+    pub(super) fn parse_select(&mut self) -> Result<Stmt> {
+        self.advance(); // consume 'select'
+        self.expect(TokenKind::LeftBrace, "expected '{' after 'select'")?;
+        self.skip_newlines();
+
+        let mut cases = Vec::new();
+        let mut default_block = None;
+
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            if self.check(&TokenKind::Case) {
+                self.advance();
+                let op = self.parse_select_op()?;
+                let body = self.parse_block()?;
+                cases.push(SelectCase {
+                    operation: op,
+                    body,
+                });
+            } else if self.check(&TokenKind::Default) {
+                self.advance();
+                default_block = Some(self.parse_block()?);
+            } else {
+                let tok = self.peek();
+                return Err(MspError::ParseError {
+                    line: tok.span.start.line,
+                    column: tok.span.start.column,
+                    message: "expected 'case' or 'default' in select".into(),
+                });
+            }
+            self.skip_newlines();
+        }
+
+        self.expect(TokenKind::RightBrace, "expected '}' after select")?;
+        Ok(Stmt::Select {
+            cases,
+            default_block,
+        })
+    }
+
+    fn parse_select_op(&mut self) -> Result<SelectOp> {
+        let name_tok = self.peek().clone();
+        let name = self.expect_identifier("expected identifier in case")?;
+
+        if self.match_token(&[TokenKind::Equal]) {
+            self.expect(TokenKind::LeftArrow, "expected '<-' in receive case")?;
+            let channel = self.expect_identifier("expected channel name")?;
+            Ok(SelectOp::Receive {
+                channel,
+                target: name,
+            })
+        } else if self.match_token(&[TokenKind::LeftArrow]) {
+            let value = self.parse_expression()?;
+            Ok(SelectOp::Send {
+                channel: name,
+                value,
+            })
+        } else {
+            Err(MspError::ParseError {
+                line: name_tok.span.start.line,
+                column: name_tok.span.start.column,
+                message: "expected '=' or '<-' in select case".into(),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1215,6 +1281,64 @@ mod tests {
                 ));
             }
             _ => panic!("expected outer fn"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_receive() {
+        let prog = parse(
+            "select {\n case v = <-ch {\n assert(v == 1)\n }\n default {\n assert(false)\n }\n}\n",
+        )
+        .unwrap();
+        match &prog.statements[0] {
+            Stmt::Select {
+                cases,
+                default_block,
+            } => {
+                assert_eq!(cases.len(), 1);
+                assert!(matches!(
+                    &cases[0].operation,
+                    crate::ast::SelectOp::Receive { channel, target }
+                        if channel == "ch" && target == "v"
+                ));
+                assert!(default_block.is_some());
+            }
+            _ => panic!("expected Select stmt"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_send() {
+        let prog = parse("select {\n case ch <- 42 {\n }\n}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Select {
+                cases,
+                default_block,
+            } => {
+                assert_eq!(cases.len(), 1);
+                assert!(matches!(
+                    &cases[0].operation,
+                    crate::ast::SelectOp::Send { channel, .. }
+                        if channel == "ch"
+                ));
+                assert!(default_block.is_none());
+            }
+            _ => panic!("expected Select stmt"),
+        }
+    }
+
+    #[test]
+    fn test_parse_select_empty() {
+        let prog = parse("select {}\n").unwrap();
+        match &prog.statements[0] {
+            Stmt::Select {
+                cases,
+                default_block,
+            } => {
+                assert!(cases.is_empty());
+                assert!(default_block.is_none());
+            }
+            _ => panic!("expected Select stmt"),
         }
     }
 }

@@ -170,6 +170,33 @@ pub enum Stmt {
         decorators: Vec<Expr>,
         target: Box<Stmt>,
     },
+    /// task 59：select 语句（多 channel 复用）。
+    Select {
+        cases: Vec<SelectCase>,
+        default_block: Option<Vec<Stmt>>,
+    },
+}
+
+/// task 59：select 的单个 case 分支。
+#[derive(Debug, Clone)]
+pub struct SelectCase {
+    pub operation: SelectOp,
+    pub body: Vec<Stmt>,
+}
+
+/// task 59：select case 的 channel 操作。
+#[derive(Debug, Clone)]
+pub enum SelectOp {
+    /// 接收：`target = <-channel`
+    Receive {
+        channel: String,
+        target: String,
+    },
+    /// 发送：`channel <- value`
+    Send {
+        channel: String,
+        value: Expr,
+    },
 }
 
 impl Stmt {
@@ -642,6 +669,34 @@ impl std::fmt::Display for Stmt {
                     writeln!(f, "@{}", dec)?;
                 }
                 write!(f, "{}", target)
+            }
+            Stmt::Select {
+                cases,
+                default_block,
+            } => {
+                write!(f, "select {{\n")?;
+                for case in cases {
+                    match &case.operation {
+                        SelectOp::Receive { channel, target } => {
+                            write!(f, "    case {} = <-{} {{\n", target, channel)?;
+                        }
+                        SelectOp::Send { channel, value } => {
+                            write!(f, "    case {} <- {} {{\n", channel, value)?;
+                        }
+                    }
+                    for s in &case.body {
+                        write!(f, "        {}\n", s)?;
+                    }
+                    write!(f, "    }}\n")?;
+                }
+                if let Some(db) = default_block {
+                    write!(f, "    default {{\n")?;
+                    for s in db {
+                        write!(f, "        {}\n", s)?;
+                    }
+                    write!(f, "    }}\n")?;
+                }
+                write!(f, "}}")
             }
         }
     }

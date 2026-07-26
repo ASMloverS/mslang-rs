@@ -81,6 +81,9 @@ pub struct Coroutine {
 pub struct PausedCoroutine {
     pub coroutine: Coroutine,
     pub waiting_on: *mut MsObjHeader,
+    /// task 59：select 暂停时的通道列表。None = 非 select（await/join）；
+    /// Some(vec) = select 暂停（vec 为空表示空 select{}）。
+    pub select_entries: Option<Vec<SelectEntry>>,
 }
 
 /// 事件循环。协作式调度，FIFO 就绪队列 + 暂停列表。
@@ -116,6 +119,19 @@ enum ChannelYield {
     Recv {
         channel: *mut MsObjHeader,
     },
+    /// task 59：select 阻塞——协程存入 paused，EventLoop 轮询检查 case 就绪状态。
+    Select {
+        entries: Vec<SelectEntry>,
+    },
+    /// task 59：空 select{} 永久阻塞——协程存入 paused 但不挂到任何 channel。
+    EmptySelect,
+}
+
+/// task 59：select 暂停时的通道信息（用于就绪轮询）。
+pub struct SelectEntry {
+    channel_ptr: *mut MsObjHeader,
+    /// 0 = Receive, 1 = Send
+    kind: u8,
 }
 
 /// 内置异常层级（父类链）。父类一律为 Error。Phase 5 升级为正式 Class 后此表废弃。
@@ -463,6 +479,128 @@ impl VM {
         Ok(false)
     }
 
+    /// task 59：轮询检查所有 select 暂停的协程，将任一 case 就绪的协程移至 ready_queue。
+    /// 返回 true 表示至少唤醒了一个协程。
+    fn try_wake_selects(&mut self) -> bool {
+        use crate::async_runtime::channel::read_channel;
+
+        let mut woken = Vec::new();
+        let mut still_paused = Vec::new();
+
+        for paused in self.event_loop.paused.drain(..) {
+            if let Some(ref entries) = paused.select_entries {
+                if entries.is_empty() {
+                    // 空 select{} → 永不唤醒
+                    still_paused.push(paused);
+                    continue;
+                }
+                let any_ready = entries.iter().any(|e| {
+                    let ch = unsafe { read_channel(e.channel_ptr) };
+                    if e.kind == 0 {
+                        // Receive 就绪：缓冲区有数据 / 已关闭 / 有等待发送者
+                        ch.buffer.borrow().front().is_some()
+                            || ch.is_closed()
+                            || !ch.waiting_senders.borrow().is_empty()
+                    } else {
+                        // Send 就绪：未关闭且（有等待接收者 / 缓冲区有空位）
+                        !ch.is_closed()
+                            && (!ch.waiting_receivers.borrow().is_empty()
+                                || ch.buffer.borrow().len() < ch.capacity)
+                    }
+                });
+                if any_ready {
+                    woken.push(paused.coroutine);
+                } else {
+                    still_paused.push(paused);
+                }
+            } else {
+                still_paused.push(paused);
+            }
+        }
+
+        self.event_loop.paused = still_paused;
+        for coro in woken {
+            self.event_loop.ready_queue.push_back(coro);
+        }
+
+        // 借用检查需要——返回是否有唤醒
+        !self.event_loop.ready_queue.is_empty()
+    }
+
+    /// task 59：将局部变量槽号转换为值栈绝对索引。
+    fn slot_to_stack_idx(&self, slot: usize) -> Result<usize, String> {
+        let frame = self.call_stack.last().ok_or("no call frame")?;
+        frame
+            .stack_base
+            .checked_add(slot)
+            .ok_or_else(|| "local slot overflow".to_string())
+    }
+
+    /// task 59：select 选中 receive case 时执行非阻塞接收。
+    /// 复用 RECEIVE 指令的核心逻辑（缓冲区取值 / 等待发送者交接 / 已关闭返回 nil）。
+    fn select_do_receive(&mut self, channel_ptr: *mut MsObjHeader) -> Result<Object, String> {
+        let ch = unsafe { read_channel(channel_ptr) };
+
+        // 1. 从缓冲区取值
+        let from_buffer = {
+            ch.buffer.borrow_mut().pop_front()
+        };
+        if let Some(val) = from_buffer {
+            // 缓冲区腾位：唤醒等待发送者
+            let woken = {
+                ch.waiting_senders.borrow_mut().pop_front()
+            };
+            if let Some(sender) = woken {
+                let mut buffer = ch.buffer.borrow_mut();
+                buffer.push_back(sender.value);
+                drop(buffer);
+                let mut coro = sender.coroutine;
+                coro.stack.push(Object::Nil);
+                self.event_loop.ready_queue.push_back(coro);
+            }
+            return Ok(val);
+        }
+
+        // 2. 从等待发送者交接（rendezvous）
+        let woken = {
+            ch.waiting_senders.borrow_mut().pop_front()
+        };
+        if let Some(sender) = woken {
+            let mut coro = sender.coroutine;
+            coro.stack.push(Object::Nil);
+            self.event_loop.ready_queue.push_back(coro);
+            return Ok(sender.value);
+        }
+
+        // 3. 已关闭 → nil
+        Ok(Object::Nil)
+    }
+
+    /// task 59：select 选中 send case 时执行非阻塞发送。
+    /// 直接交付给等待接收者或推入缓冲区（已在就绪判定中确认可投递）。
+    fn select_do_send(
+        &mut self,
+        channel_ptr: *mut MsObjHeader,
+        value: Object,
+    ) -> Result<(), String> {
+        let ch = unsafe { read_channel(channel_ptr) };
+
+        // 1. 交付给等待接收者
+        let woken = {
+            ch.waiting_receivers.borrow_mut().pop_front()
+        };
+        if let Some(receiver) = woken {
+            let mut coro = receiver.coroutine;
+            coro.stack.push(value);
+            self.event_loop.ready_queue.push_back(coro);
+            return Ok(());
+        }
+
+        // 2. 推入缓冲区
+        ch.buffer.borrow_mut().push_back(value);
+        Ok(())
+    }
+
     /// 事件循环主方法。协作式调度：从 ready_queue 取协程 → 恢复 → run_loop →
     /// 根据 yield/complete/error 结果调度。所有协程完成后返回主协程结果。
     fn event_loop_run(&mut self) -> Result<Object, String> {
@@ -472,7 +610,21 @@ impl VM {
             let coro = match self.event_loop.ready_queue.pop_front() {
                 Some(c) => c,
                 None => {
-                    // 无就绪协程但有暂停协程 → 死锁
+                    // task 59：无就绪协程但有暂停协程——先尝试唤醒就绪的 select
+                    if self.try_wake_selects() {
+                        continue;
+                    }
+                    // 检查是否全部为空 select{}（永久阻塞，非死锁）
+                    let all_empty_select = self.event_loop.paused.iter().all(|p| {
+                        p.select_entries
+                            .as_ref()
+                            .is_some_and(|e| e.is_empty())
+                    });
+                    if all_empty_select && !self.event_loop.paused.is_empty() {
+                        // 空 select{} 永久阻塞（与 Go 一致），不报 deadlock
+                        return Ok(Object::Nil);
+                    }
+                    // 无 select 可唤醒且非全空 select → 死锁
                     return Err("deadlock: all coroutines paused".to_string());
                 }
             };
@@ -494,6 +646,7 @@ impl VM {
                 self.event_loop.paused.push(PausedCoroutine {
                     coroutine: coro,
                     waiting_on: fp,
+                    select_entries: None,
                 });
             } else if let Some(hp) = self.yield_join.take() {
                 // task 55：协程因 await join() 暂停——保存到 paused，waiting_on = handle_ptr。
@@ -502,6 +655,7 @@ impl VM {
                 self.event_loop.paused.push(PausedCoroutine {
                     coroutine: coro,
                     waiting_on: hp,
+                    select_entries: None,
                 });
             } else if let Some(cy) = self.yield_channel.take() {
                 // task 54：协程因 channel SEND/RECEIVE 阻塞——快照存入 channel 等待列表
@@ -518,6 +672,22 @@ impl VM {
                         ch.waiting_receivers
                             .borrow_mut()
                             .push_back(WaitingReceiver { coroutine: coro });
+                    }
+                    // task 59：select 阻塞——协程存入 paused，EventLoop 轮询检查就绪
+                    ChannelYield::Select { entries } => {
+                        self.event_loop.paused.push(PausedCoroutine {
+                            coroutine: coro,
+                            waiting_on: std::ptr::null_mut(),
+                            select_entries: Some(entries),
+                        });
+                    }
+                    // task 59：空 select{} 永久阻塞——存入 paused 但不挂任何 channel
+                    ChannelYield::EmptySelect => {
+                        self.event_loop.paused.push(PausedCoroutine {
+                            coroutine: coro,
+                            waiting_on: std::ptr::null_mut(),
+                            select_entries: Some(Vec::new()),
+                        });
                     }
                 }
             } else {
@@ -4018,6 +4188,148 @@ impl VM {
                     self.yield_channel = Some(ChannelYield::Recv {
                         channel: channel_ptr,
                     });
+                    return Ok(Object::Nil);
+                }
+
+                // SELECT（task 59）：select 多路复用。
+                // 字节码布局：SELECT case_count(1) has_default(1) case_table(6*N) default_offset(2)
+                OpCode::Select => {
+                    // 安全点 cancel 检查（SELECT 是阻塞指令，按 safepoint 语义）
+                    if self.check_cancel_safepoint()? {
+                        continue;
+                    }
+
+                    // SELECT opcode 起始位置（已由 read_byte 消费 opcode，ip 指向操作数）
+                    let select_ip = {
+                        let frame = self.call_stack.last().unwrap();
+                        frame.ip - 1
+                    };
+
+                    let case_count = self.read_byte()? as usize;
+                    let has_default = self.read_byte()? != 0;
+
+                    // 读取 case 描述表
+                    let mut vm_cases: Vec<(u8, u8, u8, u8, u16)> =
+                        Vec::with_capacity(case_count);
+                    for _ in 0..case_count {
+                        let kind = self.read_byte()?;
+                        let ch_slot = self.read_byte()?;
+                        let val_slot = self.read_byte()?;
+                        let tgt_slot = self.read_byte()?;
+                        let body_off = self.read_u16()?;
+                        vm_cases.push((kind, ch_slot, val_slot, tgt_slot, body_off));
+                    }
+                    let default_offset = self.read_u16()?;
+
+                    // 空 select{} 处理
+                    if case_count == 0 {
+                        if has_default {
+                            let frame = self.call_stack.last_mut().unwrap();
+                            frame.ip = (select_ip as i64 + default_offset as i64) as usize;
+                            continue;
+                        }
+                        // 永久阻塞
+                        let frame = self.call_stack.last_mut().unwrap();
+                        frame.ip = select_ip;
+                        self.yield_channel = Some(ChannelYield::EmptySelect);
+                        return Ok(Object::Nil);
+                    }
+
+                    // 非阻塞扫描：收集就绪 case 索引
+                    let mut ready_indices: Vec<usize> = Vec::new();
+                    for (i, &(kind, ch_slot, _, _, _)) in vm_cases.iter().enumerate() {
+                        let ch_idx = self.slot_to_stack_idx(ch_slot as usize)?;
+                        let channel_obj =
+                            self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
+                        let channel_ptr = expect_channel(&channel_obj)?;
+                        let ch = unsafe { read_channel(channel_ptr) };
+
+                        if kind == 0 {
+                            // Receive 就绪：缓冲区有值 / 已关闭 / 有等待发送者
+                            let ready = {
+                                ch.buffer.borrow().front().is_some()
+                                    || ch.is_closed()
+                                    || !ch.waiting_senders.borrow().is_empty()
+                            };
+                            if ready {
+                                ready_indices.push(i);
+                            }
+                        } else {
+                            // Send 目标已关闭 → 静默跳过
+                            if ch.is_closed() {
+                                continue;
+                            }
+                            let ready = {
+                                !ch.waiting_receivers.borrow().is_empty()
+                                    || ch.buffer.borrow().len() < ch.capacity
+                            };
+                            if ready {
+                                ready_indices.push(i);
+                            }
+                        }
+                    }
+
+                    if !ready_indices.is_empty() {
+                        // 无偏随机选择（08-concurrency.md:259）
+                        let chosen = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(0..ready_indices.len())
+                        };
+                        let (kind, ch_slot, val_slot, tgt_slot, body_off) =
+                            vm_cases[ready_indices[chosen]];
+
+                        let ch_idx = self.slot_to_stack_idx(ch_slot as usize)?;
+                        let channel_obj =
+                            self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
+                        let channel_ptr = expect_channel(&channel_obj)?;
+
+                        if kind == 0 {
+                            // 执行 Receive
+                            let val = self.select_do_receive(channel_ptr)?;
+                            let tgt_idx = self.slot_to_stack_idx(tgt_slot as usize)?;
+                            while self.stack.len() <= tgt_idx {
+                                self.stack.push(Object::Nil);
+                            }
+                            self.stack[tgt_idx] = val;
+                        } else {
+                            // 执行 Send
+                            let val_idx = self.slot_to_stack_idx(val_slot as usize)?;
+                            let val =
+                                self.stack.get(val_idx).cloned().unwrap_or(Object::Nil);
+                            self.select_do_send(channel_ptr, val)?;
+                        }
+
+                        // 跳转到选中 case 的 body
+                        let frame = self.call_stack.last_mut().unwrap();
+                        frame.ip = (select_ip as i64 + body_off as i64) as usize;
+                        continue;
+                    }
+
+                    // 无就绪 case，检查 default
+                    if has_default {
+                        let frame = self.call_stack.last_mut().unwrap();
+                        frame.ip = (select_ip as i64 + default_offset as i64) as usize;
+                        continue;
+                    }
+
+                    // 全部未就绪且无 default → 暂停协程
+                    let frame = self.call_stack.last_mut().unwrap();
+                    frame.ip = select_ip; // 恢复时重新执行 SELECT
+
+                    // 收集 channel 信息用于就绪轮询
+                    let mut entries = Vec::with_capacity(vm_cases.len());
+                    for &(kind, ch_slot, _, _, _) in &vm_cases {
+                        let ch_idx = self.slot_to_stack_idx(ch_slot as usize)?;
+                        let obj =
+                            self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
+                        let ptr = expect_channel(&obj)?;
+                        entries.push(SelectEntry {
+                            channel_ptr: ptr,
+                            kind,
+                        });
+                    }
+
+                    self.yield_channel = Some(ChannelYield::Select { entries });
                     return Ok(Object::Nil);
                 }
 
@@ -10997,6 +11309,272 @@ assert(make() == 111)
         "#,
         );
         // 只要不死锁或崩溃即可（cancel 语义为尽力而为）
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // task 59：select 语句（多 channel 复用）测试
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_select_send() {
+        // 标准 3：send case 在缓冲区有空位时立即就绪并执行其 body。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            select {
+                case ch <- 42 {
+                    var sent = true
+                    assert(sent)
+                }
+            }
+            assert(<-ch == 42)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_default() {
+        // 标准 4：default 在无就绪分支时立即执行（非阻塞）。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            var hit = "none"
+            select {
+                case v = <-ch {
+                    hit = "recv"
+                }
+                default {
+                    hit = "default"
+                }
+            }
+            assert(hit == "default")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_closed_channel() {
+        // 标准 8：receive case 目标 channel 已关闭且缓冲区空时立即返回 nil。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            ch.close()
+            var got = "nothing"
+            select {
+                case v = <-ch {
+                    got = str(v)
+                }
+            }
+            assert(got == "nil")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_send_on_closed() {
+        // 标准 7：send case 目标 channel 已关闭时静默跳过（不抛错）。
+        let result = compile_and_run(
+            r#"
+            ch1 = channel(1)
+            ch2 = channel(1)
+            ch1.close()
+            var hit = "none"
+            select {
+                case ch1 <- "x" {
+                    hit = "sent"
+                }
+                case v = <-ch2 {
+                    hit = "recv"
+                }
+                default {
+                    hit = "default"
+                }
+            }
+            assert(hit == "default")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_random() {
+        // 标准 2：多 case 同时就绪时无偏随机选择（统计分布近似均匀）。
+        let result = compile_and_run(
+            r#"
+            var count_a = 0
+            var count_b = 0
+            for i in range(200) {
+                ch_a = channel(1)
+                ch_b = channel(1)
+                ch_a <- "a"
+                ch_b <- "b"
+                select {
+                    case v = <-ch_a {
+                        count_a = count_a + 1
+                    }
+                    case v = <-ch_b {
+                        count_b = count_b + 1
+                    }
+                }
+            }
+            assert(count_a > 60)
+            assert(count_b > 60)
+            assert(count_a + count_b == 200)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_block() {
+        // 标准 5：无 default 时阻塞直到有 case 就绪（配合 go 发送方协程）。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            go fn() {
+                ch <- "delayed"
+            }()
+            var got = "nothing"
+            select {
+                case v = <-ch {
+                    got = v
+                }
+            }
+            assert(got == "delayed")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_value_eval_once() {
+        // 标准 11：send value 表达式仅求值一次（即使 select 重试多次）。
+        // 使用 list 追踪调用次数，避免顶层全局变量在函数内的已知限制。
+        let result = compile_and_run(
+            r#"
+            calls = []
+            fn get_val() {
+                calls.push("called")
+                return 42
+            }
+            ch = channel(1)
+            ch.close()
+            hit = "none"
+            select {
+                case ch <- get_val() {
+                    hit = "sent"
+                }
+                default {
+                    hit = "default"
+                }
+            }
+            assert(hit == "default")
+            assert(calls.length() == 1)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_empty() {
+        // 标准 6：空 select{} 不触发 deadlock 错误（永久阻塞或安全返回）。
+        let result = compile_and_run("select {}");
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_multiple_recv() {
+        // 多个 receive case 指向不同 channel，验证选择正确通道。
+        let result = compile_and_run(
+            r#"
+            ch1 = channel(1)
+            ch2 = channel(1)
+            ch1 <- "from1"
+            var got = "nothing"
+            select {
+                case v = <-ch1 {
+                    got = v
+                }
+                case v = <-ch2 {
+                    got = v
+                }
+            }
+            assert(got == "from1")
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_go_recv_both() {
+        // 两个 go 协程分别发送到不同 channel，select 阻塞等待。
+        let result = compile_and_run(
+            r#"
+            ch1 = channel(1)
+            ch2 = channel(1)
+            go fn() {
+                ch1 <- "a"
+            }()
+            go fn() {
+                ch2 <- "b"
+            }()
+            var results = []
+            for i in range(2) {
+                select {
+                    case v = <-ch1 {
+                        results.push(v)
+                    }
+                    case v = <-ch2 {
+                        results.push(v)
+                    }
+                }
+            }
+            assert(results.length() == 2)
+        "#,
+        );
+        assert!(result.is_ok(), "expected ok, got err: {:?}", result);
+    }
+
+    #[test]
+    fn test_select_case_count_exceeds_255() {
+        // 标准 14：case 数超过 255 时编译器报错。
+        let mut cases = String::new();
+        for _ in 0..256 {
+            cases.push_str("case v = <-ch {}\n");
+        }
+        let src = format!(
+            "ch = channel(1)\nselect {{\n{}\n}}\n",
+            cases
+        );
+        let result = compile_result(&src);
+        assert!(
+            result.is_err(),
+            "expected compile error for > 255 cases"
+        );
+        assert!(result.unwrap_err().contains("exceeds 255"));
+    }
+
+    #[test]
+    fn test_select_keywords_not_reserved() {
+        // 标准 15：select/case/default 不再被词法器拒绝。
+        let result = compile_and_run(
+            r#"
+            ch = channel(1)
+            ch <- 1
+            select {
+                case v = <-ch {
+                    assert(v == 1)
+                }
+                default {
+                    assert(false)
+                }
+            }
+        "#,
+        );
         assert!(result.is_ok(), "expected ok, got err: {:?}", result);
     }
 }

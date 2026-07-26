@@ -143,6 +143,8 @@ impl Parser {
             self.parse_with()
         } else if self.check(&TokenKind::Throw) {
             self.parse_throw()
+        } else if self.check(&TokenKind::Select) {
+            self.parse_select()
         } else {
             self.parse_expr_or_assignment()
         }
@@ -203,7 +205,8 @@ impl Parser {
                 | TokenKind::Defer
                 | TokenKind::Break
                 | TokenKind::Continue
-                | TokenKind::Throw => return,
+                | TokenKind::Throw
+                | TokenKind::Select => return,
                 _ => {}
             }
 
