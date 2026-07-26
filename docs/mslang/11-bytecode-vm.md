@@ -188,7 +188,19 @@ mslang 采用**编译到字节码 + 栈式虚拟机**的执行模型：
 | `RECEIVE` | — | channel 接收 |
 | `GO` | — | 启动协程，返回 JoinHandle |
 | `AWAIT` | — | await Future |
+| `SELECT` | `case_count(1)`, `has_default(1)`, `case_table(6*N)`, `default_offset(2)` | select 多 channel 复用（task 59 / Phase 7.3） |
 | `HALT` | — | 程序结束 |
+
+> **SELECT 操作数布局**（task 59）：
+> - `case_count(1)`：case 数量，上限 255
+> - `has_default(1)`：0 = 无 default 分支，1 = 有
+> - `case_table`：每条 case 描述符 6 字节
+>   - `kind(1)`：0 = Receive，1 = Send
+>   - `channel_slot(1)`：channel 引用所在局部变量槽
+>   - `value_slot(1)`：Send 的值槽（Receive 时为 0xFF 占位）
+>   - `target_slot(1)`：Receive 的目标槽（Send 时为 0xFF 占位）
+>   - `body_offset(2)`：该 case body 字节码相对 SELECT 起点的有符号偏移（±32KB，同 JUMP）
+> - `default_offset(2)`：default body 偏移（`has_default=0` 时为 0x0000）
 
 ## 编译单元 (CompilationUnit)
 
