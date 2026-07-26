@@ -777,6 +777,41 @@ static NATIVE_C_FUNCTION_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<MsObjHeader>(),
 };
 
+// task 76：NATIVE_ASYNC_FUNCTION。Box 分配（alloc_native_async_function），未接入 GC 堆。
+// trace 为 noop（name/func/arity 为原始类型，无 Object 引用）。
+// free 回收 NativeAsyncFunction 主体（String name 由 Drop 自动释放）。
+#[cfg(feature = "capi")]
+fn free_native_async_function(obj: *mut MsObjHeader) {
+    use crate::vm::object::NativeAsyncFunction;
+    unsafe {
+        let _ = Box::from_raw(obj as *mut NativeAsyncFunction);
+    }
+}
+
+#[cfg(feature = "capi")]
+static NATIVE_ASYNC_FUNCTION_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::NATIVE_ASYNC_FUNCTION,
+    name: "native_async_function",
+    trace: trace_noop,
+    copy_for_gc: copy_placeholder,
+    forward_fields: forward_noop,
+    free: free_native_async_function,
+    finalize: None,
+    size_base: std::mem::size_of::<crate::vm::object::NativeAsyncFunction>(),
+};
+
+#[cfg(not(feature = "capi"))]
+static NATIVE_ASYNC_FUNCTION_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::NATIVE_ASYNC_FUNCTION,
+    name: "native_async_function",
+    trace: trace_noop,
+    copy_for_gc: copy_placeholder,
+    forward_fields: forward_noop,
+    free: free_placeholder,
+    finalize: None,
+    size_base: std::mem::size_of::<MsObjHeader>(),
+};
+
 // FUNCTION/CLOSURE/ITERATOR/GENERATOR/FUTURE/CHANNEL/JOIN_HANDLE 在当前 Phase 2.5
 static PLACEHOLDER_DESC: TypeDescriptor = TypeDescriptor {
     type_tag: TypeTag::FUNCTION, // 占位 tag，实际查找不依赖此字段
@@ -906,6 +941,8 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::FILE_HANDLE as u8 => &FILE_HANDLE_DESC,
         // task 70：NATIVE_C_FUNCTION（Box 分配，未接入 GC 堆）→ 占位 noop。
         t if t == TypeTag::NATIVE_C_FUNCTION as u8 => &NATIVE_C_FUNCTION_DESC,
+        // task 76：NATIVE_ASYNC_FUNCTION（Box 分配，未接入 GC 堆）→ 占位 noop。
+        t if t == TypeTag::NATIVE_ASYNC_FUNCTION as u8 => &NATIVE_ASYNC_FUNCTION_DESC,
         // task 54：CHANNEL（Box 分配，未接入 GC 堆）→ 真实 trace，其余占位。
         t if t == TypeTag::CHANNEL as u8 => &CHANNEL_DESC,
         // task 55：JOIN_HANDLE（Box 分配，未接入 GC 堆）→ 真实 trace，其余占位。

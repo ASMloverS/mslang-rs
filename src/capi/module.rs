@@ -16,7 +16,7 @@ use crate::capi::types::{MsAsyncFunction, MsCFunction, MsStatus, MsValue};
 use crate::capi::vm::{lock_vm, MsVM};
 use crate::vm::builtins::alloc_c_native_function;
 use crate::vm::object::{
-    alloc_module, read_module, read_module_mut, Object, TypeTag,
+    alloc_module, alloc_native_async_function, read_module, read_module_mut, Object, TypeTag,
 };
 
 // ---------------------------------------------------------------------------
@@ -200,20 +200,44 @@ pub extern "C" fn msModuleAddFunc(
 }
 
 // ---------------------------------------------------------------------------
-// msModuleAddAsyncFunc — 占位（task 76 实现）
+// msModuleAddAsyncFunc — 向模块添加 C 异步函数（task 76 实现）
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn msModuleAddAsyncFunc(
     vm: *mut MsVM,
-    _mod_val: *mut MsValue,
-    _name: *const c_char,
-    _fn: MsAsyncFunction,
+    mod_val: *mut MsValue,
+    name: *const c_char,
+    fn_ptr: MsAsyncFunction,
 ) -> MsStatus {
-    if vm.is_null() {
+    if vm.is_null() || mod_val.is_null() || name.is_null() {
         return MsStatus::MS_ERROR;
     }
-    MsStatus::MS_ERROR
+
+    let func_name = unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
+
+    let guard = lock_vm(vm);
+    let inner = unsafe { &mut *guard.get() };
+    let _ = inner;
+
+    match &unsafe { &*mod_val }.inner {
+        Object::Ref(ptr_)
+            if unsafe { (**ptr_).type_tag } == TypeTag::MODULE as u8 =>
+        {
+            let func = match fn_ptr {
+                Some(f) => f,
+                None => return MsStatus::MS_ERROR,
+            };
+            let async_fn = alloc_native_async_function(&func_name, Some(func), -1);
+            unsafe { read_module_mut(*ptr_) }
+                .exports
+                .insert(func_name, async_fn);
+            MsStatus::MS_OK
+        }
+        _ => MsStatus::MS_ERROR,
+    }
 }
 
 // ---------------------------------------------------------------------------

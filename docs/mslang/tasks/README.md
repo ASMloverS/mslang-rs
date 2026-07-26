@@ -122,7 +122,7 @@
 
 | # | 任务 | 状态 |
 |---|---|---|
-| 76 | [C API — Async/Channel/Generator](76-capi-async-channel.md) | ⬜ |
+| 76 | [C API — Async/Channel/Generator](76-capi-async-channel.md) | ✅ |
 
 > 设计规格见 [13-capi](../13-capi.md) § call.h（异步部分）。依赖 Phase 7 并发特性（task 53-55）。
 

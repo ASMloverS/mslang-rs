@@ -29,6 +29,16 @@ pub enum MsStatus {
     MS_YIELD = 1,
 }
 
+/// C API Future 状态（与 types.h 中 MsFutureState 对应）。task 76。
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub enum MsFutureState {
+    MS_FUTURE_PENDING = 0,
+    MS_FUTURE_RESOLVED = 1,
+    MS_FUTURE_REJECTED = 2,
+}
+
 /// C API 类型标签（与 types.h 中 MsType 对应）。
 ///
 /// 注意：此枚举与内部 TypeTag（14-gc.md:89-112）不同——MsType 包含

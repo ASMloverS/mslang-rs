@@ -50,6 +50,10 @@ pub enum TypeTag {
     /// 持 Rust 资源（std::fs::File），Immortal 代 + has_finalizer。
     FILE_HANDLE = 20,
     NATIVE_C_FUNCTION = 21,
+    /// task 76：C 异步函数（与 MsAsyncFunction 配套）。CALL 时创建 Future +
+    /// 调用 C 函数，C 函数负责异步完成时调用 msFutureResolve/msFutureReject。
+    /// trace noop：字段（name + func + arity）无 Ref 引用。
+    NATIVE_ASYNC_FUNCTION = 22,
     LARGE_OBJECT = 0xFF,
 }
 
@@ -2441,6 +2445,65 @@ fn hash_f64_normalized<H: Hasher>(f: f64, state: &mut H) {
         f.to_bits()
     };
     bits.hash(state);
+}
+
+// ---------------------------------------------------------------------------
+// task 76：C 异步函数堆对象（NATIVE_ASYNC_FUNCTION = 22）
+// ---------------------------------------------------------------------------
+
+/// C 异步函数堆对象（TypeTag::NATIVE_ASYNC_FUNCTION）。
+///
+/// 与 `MsCNativeFunction`（同步）分离：C async 函数签名多一个 `future` 参数，
+/// 由 CALL 处理器创建并传入。C 函数负责在异步操作完成后调用
+/// `msFutureResolve`/`msFutureReject`。trace noop：字段（name + func + arity）
+/// 无 Ref 引用。
+#[cfg(feature = "capi")]
+#[repr(C)]
+pub struct NativeAsyncFunction {
+    pub header: MsObjHeader,
+    pub name: String,
+    pub func: crate::capi::types::MsAsyncFunction,
+    pub arity: std::os::raw::c_int,
+}
+
+/// 分配 NativeAsyncFunction 堆对象（TypeTag::NATIVE_ASYNC_FUNCTION），返回 Object::Ref。
+/// MVP：Box 分配（与 alloc_c_native_function 一致，未接入 GC 堆）。
+#[cfg(feature = "capi")]
+pub fn alloc_native_async_function(
+    name: &str,
+    func: crate::capi::types::MsAsyncFunction,
+    arity: std::os::raw::c_int,
+) -> Object {
+    let obj = Box::new(NativeAsyncFunction {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::NATIVE_ASYNC_FUNCTION as u8,
+            size: std::mem::size_of::<NativeAsyncFunction>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        name: name.to_string(),
+        func,
+        arity,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 NativeAsyncFunction（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_native_async_function` 分配的、在 `'a` 期间有效的
+/// `NativeAsyncFunction`。
+#[cfg(feature = "capi")]
+pub unsafe fn read_native_async_function<'a>(
+    ptr: *mut MsObjHeader,
+) -> &'a NativeAsyncFunction {
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::NATIVE_ASYNC_FUNCTION as u8,
+        "read_native_async_function on non-NATIVE_ASYNC_FUNCTION"
+    );
+    &*(ptr as *const NativeAsyncFunction)
 }
 
 #[cfg(test)]

@@ -135,7 +135,17 @@ pub struct EventLoop {
     /// task 61：timer 最小堆（按 deadline 升序）。Reverse 包裹使 BinaryHeap
     /// （默认最大堆）变为最小堆，pop() 取最早到期的 entry。
     pub(crate) timers: std::collections::BinaryHeap<std::cmp::Reverse<TimerEntry>>,
+    /// task 76：Future 指针 → 等待此 Future 的 C 线程信号列表。
+    /// C API msAwait 注册 ThreadSignal 后阻塞；msFutureResolve/msFutureReject
+    /// 取出全部 signals 并 notify。GC forwarding 时同步更新 key。
+    /// Arc 内部状态（Mutex+Condvar）不参与 GC trace（与 mslang 对象图无关）。
+    pub(crate) thread_waiters:
+        std::collections::HashMap<*mut MsObjHeader, Vec<ThreadSignal>>,
 }
+
+/// task 76：线程级等待信号（C API msAwait 使用）。
+/// Arc 共享：side-table 持一份，C 调用线程持一份。
+pub type ThreadSignal = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 
 impl EventLoop {
     pub fn new() -> Self {
@@ -143,6 +153,7 @@ impl EventLoop {
             ready_queue: std::collections::VecDeque::new(),
             paused: Vec::new(),
             timers: std::collections::BinaryHeap::new(),
+            thread_waiters: std::collections::HashMap::new(),
         }
     }
 }
@@ -503,7 +514,7 @@ impl VM {
     }
 
     /// 唤醒等待指定 Future/JoinHandle 的暂停协程，将它们从 paused 移至 ready_queue。
-    fn wake_waiters(&mut self, resolved_ptr: *mut MsObjHeader) {
+    pub(crate) fn wake_waiters(&mut self, resolved_ptr: *mut MsObjHeader) {
         let mut still_paused = Vec::new();
         for paused in self.event_loop.paused.drain(..) {
             if paused.waiting_on == resolved_ptr {
@@ -1819,6 +1830,14 @@ impl VM {
             {
                 self.call_c_native(*ptr, argc, callee_idx)?;
             }
+            // task 76：C 异步函数（NATIVE_ASYNC_FUNCTION）— 创建 Future +
+            // 调用 C 函数，C 函数负责异步完成时 resolve/reject Future。
+            #[cfg(feature = "capi")]
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag }
+                == TypeTag::NATIVE_ASYNC_FUNCTION as u8 =>
+            {
+                self.call_c_async_native(*ptr, argc, callee_idx)?;
+            }
             // task 40：用户类对象（CLASS）— `ClassName(args)` 构造实例并调用 __init__。
             Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CLASS as u8 => {
                 self.call_class(*ptr, argc)?;
@@ -1940,6 +1959,89 @@ impl VM {
         self.pop()
     }
 
+    // ---- task 76：C API 异步/Generator 支持 ----
+
+    /// task 76：包装 callable + args + future_ptr 为 Coroutine。
+    /// 供 msCallAsync 使用（参照 async fn CALL 路径 + GO 指令）。
+    /// 关闭闭包捕获的开放上值（协程运行在独立栈上）。
+    pub(crate) fn spawn_async_call_coroutine(
+        &mut self,
+        callable: Object,
+        args: Vec<Object>,
+        future_ptr: *mut MsObjHeader,
+    ) -> Coroutine {
+        // 关闭闭包捕获的开放上值（与 GO 指令 / spawn_timeout_subcoroutine 一致）。
+        if let Object::Ref(ptr) = &callable {
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::CLOSURE as u8 {
+                let closure = unsafe { read_closure(*ptr) };
+                for &uv_ptr in closure.upvalues.iter() {
+                    let uv = unsafe { read_upvalue(uv_ptr) };
+                    if uv.closed.is_none() {
+                        uv.close(&self.stack);
+                    }
+                }
+            }
+        }
+        // 构造独立值栈：slot 0 = callee，slot 1.. = args。
+        let mut stack = Vec::with_capacity(1 + args.len());
+        stack.push(callable);
+        stack.extend(args);
+        // 从 callee 提取 closure 指针构造 CallFrame。frame.closure 须指向 CLOSURE。
+        let closure_ptr = match stack.first() {
+            Some(Object::Ref(p)) => {
+                let tag = unsafe { (**p).type_tag };
+                if tag == TypeTag::CLOSURE as u8 {
+                    *p
+                } else if tag == TypeTag::FUNCTION as u8 {
+                    // FUNCTION 须包裹为空 CLOSURE（frame.closure 须指向 MsClosure）。
+                    let func_obj = stack[0].clone();
+                    let closure_obj = alloc_closure(func_obj, Vec::new());
+                    let Object::Ref(cp) = closure_obj else {
+                        unreachable!()
+                    };
+                    stack[0] = Object::Ref(cp);
+                    cp
+                } else {
+                    // 非函数类型（BOUND_METHOD/NATIVE_*/CLASS）：传 null，EventLoop
+                    // 会因无法执行而报错。这是调用者责任（msCallAsync 已校验可调用性）。
+                    std::ptr::null_mut()
+                }
+            }
+            _ => std::ptr::null_mut(),
+        };
+        let frame = CallFrame::new(closure_ptr, 0, 0);
+        Coroutine {
+            call_stack: vec![frame],
+            stack,
+            defer_stack: Vec::new(),
+            open_upvalues: Vec::new(),
+            exception_handlers: Vec::new(),
+            pending_unwind: None,
+            future: Some(future_ptr),
+            handle: None,
+        }
+    }
+
+    /// task 76：驱动 EventLoop 前进（供 msCallAsync/msAwait 使用）。
+    /// 忽略 deadlock 错误——调用方通过检查 Future 状态判断结果。
+    pub(crate) fn pump_event_loop(&mut self) {
+        let _ = self.event_loop_run();
+    }
+
+    /// task 76：从 C API 恢复 Generator 执行。
+    /// Ok(value) = 成功 yield 一个值；Err("StopIteration") = 迭代结束（无异常）；
+    /// Err(msg) = 运行时错误。
+    pub(crate) fn resume_generator_from_capi(
+        &mut self,
+        gen_ptr: *mut MsObjHeader,
+    ) -> Result<Object, String> {
+        match self.resume_generator(gen_ptr)? {
+            Some(value) => Ok(value),
+            None => Err("StopIteration".to_string()),
+        }
+    }
+
     /// task 51：调用任意 callable Object（CLOSURE/FUNCTION/BOUND_METHOD）并返回结果。
     /// 供 List.map/filter/reduce 等原生方法调用用户回调。
     /// 压栈 callee + args，call_value 后 run_loop 至返回，弹出结果。
@@ -2027,6 +2129,80 @@ impl VM {
             drop(Box::from_raw(result_ptr));
         }
         self.push(result)?;
+        Ok(())
+    }
+
+    /// task 76：调用 C 异步函数（NATIVE_ASYNC_FUNCTION）。
+    /// 分配 Pending Future，构建参数 MsValue* 数组，调用 C async 函数。
+    /// C 函数负责后续异步完成时调用 msFutureResolve/msFutureReject。
+    /// 未 rooted 的 MsValue* 在 C 函数返回后释放（C 侧需 msRoot 保存 future/args）。
+    #[cfg(feature = "capi")]
+    fn call_c_async_native(
+        &mut self,
+        ptr: *mut MsObjHeader,
+        argc: usize,
+        callee_idx: usize,
+    ) -> Result<(), String> {
+        use crate::capi::types::MsValue;
+        use crate::capi::vm::MsVM;
+        use crate::vm::object::read_native_async_function;
+
+        let (c_fn, arity, name) = {
+            let naf = unsafe { read_native_async_function(ptr) };
+            (naf.func, naf.arity, naf.name.clone())
+        };
+
+        // 1. arity 校验。
+        if arity >= 0 && arity as usize != argc {
+            return Err(format!(
+                "TypeError: {}() takes exactly {} argument{} but {} were given",
+                name,
+                arity,
+                if arity == 1 { "" } else { "s" },
+                argc,
+            ));
+        }
+
+        // 2. 分配 Pending Future。
+        let future_obj = alloc_future(FutureState::Pending);
+
+        // 3. 包装 Future 为 MsValue*（C 侧接收）。
+        let future_msvalue = Box::into_raw(Box::new(MsValue {
+            inner: future_obj.clone(),
+        }));
+
+        // 4. 构建参数 MsValue* 数组。
+        let arg_vals: Vec<Box<MsValue>> = self.stack[self.stack.len() - argc..]
+            .iter()
+            .map(|obj| Box::new(MsValue { inner: obj.clone() }))
+            .collect();
+        let arg_ptrs: Vec<*mut MsValue> = arg_vals
+            .iter()
+            .map(|b| b.as_ref() as *const MsValue as *mut MsValue)
+            .collect();
+
+        // 5. 清理栈（callee + args）。
+        self.stack.truncate(callee_idx);
+
+        // 6. 调用 C async 函数（不阻塞）。
+        let c_fn = c_fn.ok_or("TypeError: null C async function pointer")?;
+        let capi_vm_ptr = if self.capi_vm_ptr.is_null() {
+            // 非 C API 上下文（纯 Rust 测试）：无 MsVM 可传。仍允许调用但传 null。
+            std::ptr::null_mut()
+        } else {
+            self.capi_vm_ptr as *mut MsVM
+        };
+        c_fn(capi_vm_ptr, arg_ptrs.as_ptr(), argc as i32, future_msvalue);
+
+        // 7. 释放临时 MsValue*（C 函数已返回；若 C 需要保存 future/args，应已 msRoot）。
+        drop(arg_vals);
+        // future_msvalue：未 rooted 则释放。C async 函数文档强制要求 future 必须 msRoot。
+        unsafe {
+            drop(Box::from_raw(future_msvalue));
+        }
+
+        // 8. 压入 Future。
+        self.push(future_obj)?;
         Ok(())
     }
 

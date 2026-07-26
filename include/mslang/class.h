@@ -716,6 +716,102 @@ MS_API MsValue *msMakeCFunction(MsVM *vm, const char *name, MsCFunction func, in
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 异步调用：包装 func 为协程，立即返回 Future（Pending 或 Resolved 状态）。
+ * 协程在 EventLoop 中执行；func 完成时 EventLoop 自动 resolve/reject Future。
+ *
+ * msCallAsync 在返回前驱动 EventLoop（pump），使不挂起的协程立即完成。
+ */
+MS_API MsValue *msCallAsync(MsVM *vm, MsValue *func, MsValue *const *args, int nargs);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 阻塞等待 Future 完成。
+ * - Resolved → 返回结果（新引用）
+ * - Rejected → 设置异常，返回 NULL
+ * - Pending → 驱动 EventLoop（单线程模式）；若仍 Pending，Condvar 等待（多线程模式）
+ */
+MS_API
+MsValue *msAwait(MsVM *vm,
+                 MsValue *future);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+MS_API MsFutureState msFutureState(MsVM *vm, MsValue *future);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 将 Future 设为 Resolved 并唤醒所有等待者（协程 + 线程）。幂等。
+ */
+MS_API void msFutureResolve(MsVM *vm, MsValue *future, MsValue *result);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 将 Future 设为 Rejected 并唤醒所有等待者。error 自动包装为 RuntimeError MsException。幂等。
+ */
+MS_API
+void msFutureReject(MsVM *vm,
+                    MsValue *future,
+                    MsValue *error);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 创建指定缓冲区大小的 Channel 对象。buffer_size 须在 0-255 范围内。
+ */
+MS_API MsValue *msChannel(MsVM *vm, int buffer_size);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 发送值到 Channel。缓冲区满时线程级阻塞。
+ */
+MS_API MsStatus msChannelSend(MsVM *vm, MsValue *ch, MsValue *val);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 从 Channel 接收值。缓冲区空时线程级阻塞；Channel 已关闭且为空时返回 nil。
+ */
+MS_API
+MsValue *msChannelRecv(MsVM *vm,
+                       MsValue *ch);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 关闭 Channel（幂等）。唤醒所有等待的协程与线程。
+ */
+MS_API MsStatus msChannelClose(MsVM *vm, MsValue *ch);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 查询 Channel 是否已关闭。
+ */
+MS_API int msChannelIsClosed(MsVM *vm, MsValue *ch);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 返回 Generator 的迭代器（Generator 自身即为迭代器，返回新引用）。
+ */
+MS_API MsValue *msGeneratorIter(MsVM *vm, MsValue *generator);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
+/**
+ * 恢复 Generator 执行，获取下一个 yield 值。
+ * MS_OK 时 *out 设置为 yield 值（新引用）；
+ * MS_ERROR 时迭代结束（无异常）或运行时错误（has_error=true）。
+ */
+MS_API MsStatus msGeneratorNext(MsVM *vm, MsValue *generator, MsValue **out);
+#endif
+
+#if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 MS_API int msErrOccurred(MsVM *vm);
 #endif
 
@@ -798,9 +894,9 @@ MS_API MsStatus msModuleAddFunc(MsVM *vm, MsValue *mod_val, const char *name, Ms
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 MS_API
 MsStatus msModuleAddAsyncFunc(MsVM *vm,
-                              MsValue *_mod_val,
-                              const char *_name,
-                              MsAsyncFunction _fn);
+                              MsValue *mod_val,
+                              const char *name,
+                              MsAsyncFunction fn_ptr);
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
