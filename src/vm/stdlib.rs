@@ -1492,11 +1492,11 @@ impl<'a> JsonParser<'a> {
 // ---------------------------------------------------------------------------
 
 /// 构造 `gc` 原生模块，返回指向 MsModule 的裸指针（TypeTag::MODULE）。
-/// exports 含 12 个原生函数：collect/collect_minor/enable/disable/is_enabled/
-/// set_threshold/set_promotion_age/set_gc_threads/stats/count/mem_alloc/mem_live。
+/// exports 含 13 个原生函数：collect/collect_minor/enable/disable/is_enabled/
+/// set_threshold/set_promotion_age/set_gc_threads/set_concurrent/stats/count/mem_alloc/mem_live。
 pub fn register_gc_module() -> *mut MsObjHeader {
     let mut exports = std::collections::HashMap::new();
-    let funcs: [(&str, NativeFn); 12] = [
+    let funcs: [(&str, NativeFn); 13] = [
         ("collect", gc_collect),
         ("collect_minor", gc_collect_minor),
         ("enable", gc_enable),
@@ -1505,6 +1505,7 @@ pub fn register_gc_module() -> *mut MsObjHeader {
         ("set_threshold", gc_set_threshold),
         ("set_promotion_age", gc_set_promotion_age),
         ("set_gc_threads", gc_set_gc_threads),
+        ("set_concurrent", gc_set_concurrent),
         ("stats", gc_stats),
         ("count", gc_count),
         ("mem_alloc", gc_mem_alloc),
@@ -1616,6 +1617,22 @@ fn gc_set_gc_threads(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     }
     // MVP STW 单线程：值存入字段但不生效。stats 中 gc_threads 固定返回 1。
     vm.heap.gc_threads_setting = n as u32;
+    Ok(Object::Nil)
+}
+
+/// task 62：启用/禁用并发 GC（14-gc.md § Phase 7.5 降级路径）。
+/// true → spawn GC Coordinator，maybe_gc 异步触发并发标记；false → 回退 Task 52 STW。
+fn gc_set_concurrent(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let enabled = match args.get(0) {
+        Some(Object::Bool(b)) => *b,
+        other => {
+            return Err(format!(
+                "TypeError: set_concurrent expects bool, got {}",
+                other.map(|o| o.type_name()).unwrap_or("missing")
+            ))
+        }
+    };
+    vm.gc_set_concurrent(enabled);
     Ok(Object::Nil)
 }
 

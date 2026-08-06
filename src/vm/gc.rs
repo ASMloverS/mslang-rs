@@ -34,6 +34,28 @@ use crate::vm::DeferEntry;
 use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
+// task 62：并发标记模块（tri-color + 写屏障）。子模块经 super:: 访问本文件的
+// Color/Generation/type_descriptor/sweep_heap 等私有项（子模块可见祖先私有项）。
+// ---------------------------------------------------------------------------
+pub mod barrier;
+pub mod cardtable;
+pub mod header;
+pub mod major;
+pub mod runtime;
+pub mod safepoint;
+
+pub use barrier::{alloc_during_gc, write_barrier, write_barrier_obj};
+pub use cardtable::CardTable;
+pub use header::{
+    color_atomic, generation_atomic, set_color_atomic, try_color_transition, GcPhase,
+};
+pub use major::{
+    close_concurrent_cycle, init_concurrent_mark, major_collect_stw, GcCoordinator, GcWorkerPool,
+};
+pub use runtime::{GcRuntime, GrayQueue};
+pub use safepoint::SafepointCoordinator;
+
+// ---------------------------------------------------------------------------
 // 常量（参照 14-gc.md / 52-gc.md）
 // ---------------------------------------------------------------------------
 
@@ -1068,6 +1090,16 @@ impl MsHeap {
         self.young_size() + self.old_size() + self.los_size()
     }
 
+    /// task 62：Old 代对象数（集成测试/调试用）。
+    pub fn old_objects_len(&self) -> usize {
+        self.old_objects.len()
+    }
+
+    /// task 62：Old 代是否为空（循环回收测试断言用）。
+    pub fn old_objects_is_empty(&self) -> bool {
+        self.old_objects.is_empty()
+    }
+
     /// 登记一个 Young 对象（由 gc_alloc_* 调用）。
     fn register_young(&mut self, ptr: *mut MsObjHeader, size: usize) {
         self.young_objects.push(ptr);
@@ -1395,8 +1427,37 @@ pub fn major_gc(
         }
     }
 
+    // 清扫 Old + LES 代（task 62：抽为 sweep_heap，供并发标记的 STW 收尾复用）。
+    sweep_heap(heap);
+
+    // task 62：bytes_allocated=0（空堆）时 computed=0 会让 should_collect_major 恒真，
+    // 每条指令触发 GC（并发模式下 → 每条指令一个完整周期 = 死级/死锁）。回退到初始阈值。
+    let computed = (heap.bytes_allocated as f64 * MAJOR_GC_RATIO) as usize;
+    heap.next_major_gc = if computed == 0 {
+        INITIAL_MAJOR_THRESHOLD
+    } else {
+        computed
+    };
+
+    // task 60：统计计数（计时 + major_count）。
+    let elapsed = t0.elapsed().as_nanos() as u64;
+    heap.total_pause_ns += elapsed;
+    heap.last_pause_ns = elapsed;
+    heap.major_count += 1;
+}
+
+// ---------------------------------------------------------------------------
+// Finalizer（GC 后由 mutator 线程执行）
+// ---------------------------------------------------------------------------
+
+/// task 62：清扫 Old + LES 代（标记完成后的 retain/free 逻辑）。
+/// 从 major_gc 抽出，供并发标记的 STW 收尾（close_concurrent_cycle）复用，
+/// 避免标记逻辑重复。Black→White 重置；White+finalizer→复活入队；White+无 finalizer→释放。
+/// pinned 对象即使 White 也保留（C 侧 pin，14-gc.md 84-85 行）。
+pub(super) fn sweep_heap(heap: &mut MsHeap) {
     // 清扫 Old 代。
     heap.old_objects.retain(|&obj| {
+        // SAFETY: obj 由 gc_alloc_*/copy_for_gc 经 Box::into_raw 分配，有效 MsObjHeader。
         let h = unsafe { &mut *obj };
         if h.color() == Color::Black {
             h.set_color(Color::White);
@@ -1404,6 +1465,10 @@ pub fn major_gc(
         } else if h.has_finalizer() {
             heap.finalizer_queue.push(obj);
             h.set_color(Color::White); // 复活，下次 GC 再回收
+            true
+        } else if h.is_pinned() {
+            // task 62：pinned 对象保留（C 侧 pin 不可回收）。
+            h.set_color(Color::White);
             true
         } else {
             let size = h.size as usize;
@@ -1415,8 +1480,9 @@ pub fn major_gc(
         }
     });
 
-    // 清扫 LES（真实大小取自侧表 los_sizes）。
+    // 清扫 LES（真实大小取自侧表 los_sizes）。LES 不参与 pin（C 侧 pin 对象走 Old 路径）。
     heap.los_objects.retain(|&obj| {
+        // SAFETY: obj 由 alloc_los 经 alloc+write 分配，有效 MsObjHeader。
         let h = unsafe { &mut *obj };
         if h.color() == Color::Black {
             h.set_color(Color::White);
@@ -1438,19 +1504,7 @@ pub fn major_gc(
             false
         }
     });
-
-    heap.next_major_gc = (heap.bytes_allocated as f64 * MAJOR_GC_RATIO) as usize;
-
-    // task 60：统计计数（计时 + major_count）。
-    let elapsed = t0.elapsed().as_nanos() as u64;
-    heap.total_pause_ns += elapsed;
-    heap.last_pause_ns = elapsed;
-    heap.major_count += 1;
 }
-
-// ---------------------------------------------------------------------------
-// Finalizer（GC 后由 mutator 线程执行）
-// ---------------------------------------------------------------------------
 
 /// 执行 finalizer_queue 中的对象，执行后清除 has_finalizer（避免无限复活）。
 pub fn run_finalizers(heap: &mut MsHeap) {

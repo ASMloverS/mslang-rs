@@ -9,7 +9,7 @@ use crate::compiler::Chunk;
 
 /// 字节码操作码。
 ///
-/// `#[repr(u8)]` 且判别值从 0 连续递增至 `Halt`(90)，
+/// `#[repr(u8)]` 且判别值从 0 连续递增至 `NopSafepoint`(91)，
 /// 因此可通过 `transmute` 与 `u8` 之间安全转换（见 [`OpCode::from_byte`]）。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +125,9 @@ pub enum OpCode {
     // task 59：select 多路复用（可变长度操作数，由 handler 内部解析）
     Select,
     Halt,
+    // task 62：安全点占位指令。编译器在超长（>1000 条）无安全点基本块中插入，
+    // handler 仅做 GC 安全点检查（与主循环顶部的检查同路径）。无操作数。
+    NopSafepoint,
 }
 
 impl OpCode {
@@ -201,9 +204,9 @@ impl TryFrom<u8> for OpCode {
     type Error = ();
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        if value <= Self::Halt as u8 {
+        if value <= Self::NopSafepoint as u8 {
             // SAFETY: OpCode is #[repr(u8)] with sequential discriminants
-            // Constant=0 through Halt(90). value <= Halt guarantees validity.
+            // Constant=0 through NopSafepoint(91). value <= NopSafepoint guarantees validity.
             Ok(unsafe { core::mem::transmute::<u8, Self>(value) })
         } else {
             Err(())
@@ -419,6 +422,7 @@ mod tests {
             OpCode::Await,
             OpCode::Select,
             OpCode::Halt,
+            OpCode::NopSafepoint,
         ];
         for op in &opcodes {
             let s = format!("{:?}", op);
@@ -460,14 +464,14 @@ mod tests {
 
     #[test]
     fn test_all_opcodes_byte_roundtrip() {
-        // 0..=Halt(89) 每个字节都应能往返转换
-        for b in 0u8..=OpCode::Halt as u8 {
+        // 0..=NopSafepoint(91) 每个字节都应能往返转换
+        for b in 0u8..=OpCode::NopSafepoint as u8 {
             let op =
                 OpCode::from_byte(b).unwrap_or_else(|| panic!("from_byte({}) should succeed", b));
             assert_eq!(op as u8, b);
         }
         // 超出范围的字节应转换失败
-        for b in (OpCode::Halt as u8 + 1)..=u8::MAX {
+        for b in (OpCode::NopSafepoint as u8 + 1)..=u8::MAX {
             assert_eq!(
                 OpCode::from_byte(b),
                 None,

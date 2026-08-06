@@ -263,6 +263,11 @@ pub struct VM {
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     /// task 74：pub(crate) 供 capi::gc 的 GC 控制/统计/finalizer API 直接访问。
     pub(crate) heap: gc::MsHeap,
+    /// task 62：GC 运行时（Arc 共享给 GC Coordinator/Worker 线程）。
+    /// concurrent_enabled 默认 false（降级 = Task 52 STW 行为），渐进启用。
+    pub(crate) gc_runtime: std::sync::Arc<gc::GcRuntime>,
+    /// task 62：GC Coordinator 线程句柄（gc.set_concurrent(true) 时启动）。
+    gc_coordinator: Option<gc::GcCoordinator>,
     /// task 53：事件循环。管理协程的就绪队列与暂停列表。
     pub(crate) event_loop: EventLoop,
     /// task 53：AWAIT Pending 时设置的 yield 信号。run_loop 退出后 EventLoop 检查此字段：
@@ -314,6 +319,20 @@ pub struct VM {
     pub loaded_libs: Vec<libloading::Library>,
 }
 
+/// task 62：VM 销毁时先完成进行中的并发周期，再 shutdown GC Coordinator（释放可能的
+/// 安全点请求，再 join），避免 Coordinator 阻塞在 request_and_wait 等 mutator park 而
+/// join 死锁。Coordinator 不访问 VM 结构体，join 完成后不再持 GcRuntime 引用。
+impl Drop for VM {
+    fn drop(&mut self) {
+        if self.gc_coordinator.is_some() {
+            self.complete_concurrent_cycle_if_pending();
+        }
+        if let Some(mut c) = self.gc_coordinator.take() {
+            c.shutdown(&self.gc_runtime);
+        }
+    }
+}
+
 impl VM {
     pub fn new() -> Self {
         let mut vm = VM {
@@ -330,6 +349,8 @@ impl VM {
             gen_outcome: None,
             gen_call_method: None,
             heap: gc::MsHeap::new(),
+            gc_runtime: std::sync::Arc::new(gc::GcRuntime::new()),
+            gc_coordinator: None,
             event_loop: EventLoop::new(),
             yield_future: None,
             yield_channel: None,
@@ -439,6 +460,7 @@ impl VM {
         vm.native_arities.insert("set_threshold".to_string(), 2);
         vm.native_arities.insert("set_promotion_age".to_string(), 1);
         vm.native_arities.insert("set_gc_threads".to_string(), 1);
+        vm.native_arities.insert("set_concurrent".to_string(), 1);
         vm.native_arities.insert("stats".to_string(), 0);
         vm.native_arities.insert("count".to_string(), 0);
         vm.native_arities.insert("mem_alloc".to_string(), 0);
@@ -996,7 +1018,10 @@ impl VM {
     // ---- task 60：GC 便捷方法（供 gc stdlib native 函数调用） ----
 
     /// Full GC = minor + major + finalizers（参照 gc::maybe_gc 的 Full 路径）。
+    /// task 62：若并发周期进行中，先完成它（Mark Term + Sweep），避免 STW major_gc
+    /// 与 Coordinator/Worker 并发访问同一对象图的数据竞争。
     pub fn gc_full(&mut self) {
+        self.complete_concurrent_cycle_if_pending();
         gc::minor_gc(
             &mut self.heap,
             &mut self.stack,
@@ -1027,7 +1052,9 @@ impl VM {
     }
 
     /// task 74：仅 Major GC + finalizers（供 msGcCollect(MS_GC_MAJOR) 调用）。
+    /// task 62：先完成进行中的并发周期，防 STW major 与 Coordinator 数据竞争。
     pub fn gc_major_only(&mut self) {
+        self.complete_concurrent_cycle_if_pending();
         gc::major_gc(
             &mut self.heap,
             &self.stack,
@@ -1036,6 +1063,130 @@ impl VM {
             &self.call_stack,
         );
         gc::run_finalizers(&mut self.heap);
+    }
+
+    // ---- task 62：并发 GC 协调 ----
+
+    /// task 62：主循环调用的 GC 触发入口。替代旧 `gc::maybe_gc(...)` 直调：
+    /// 1. 安全点检查 + finalize（并发协调；降级模式下零开销）。
+    /// 2. 重入守卫：并发周期进行中（phase != Idle）则跳过。
+    /// 3. minor 阈值 → 同步 minor GC（STW，快）。
+    /// 4. major 阈值 → 并发模式异步触发 Coordinator；降级模式同步 STW major。
+    pub(crate) fn maybe_gc(&mut self) {
+        self.gc_safepoint_and_finalize();
+        if !self.heap.gc_enabled {
+            return;
+        }
+        // 重入守卫：并发 GC 周期进行中则跳过（避免重复触发）。
+        if self.gc_runtime.phase() != gc::GcPhase::Idle {
+            return;
+        }
+        if self.heap.should_collect_minor() {
+            gc::minor_gc(
+                &mut self.heap,
+                &mut self.stack,
+                &mut self.globals,
+                &mut self.defer_stack,
+                &mut self.call_stack,
+            );
+        }
+        if self.heap.should_collect_major() {
+            if self.gc_runtime.concurrent_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+                // 并发模式：mutator 标灰根集 + 触发 Coordinator，不阻塞。
+                gc::init_concurrent_mark(self);
+            } else {
+                // 降级模式：同步 STW major（mutator 已停在 maybe_gc 中，无死锁）。
+                gc::major_gc(
+                    &mut self.heap,
+                    &self.stack,
+                    &self.globals,
+                    &self.defer_stack,
+                    &self.call_stack,
+                );
+                gc::run_finalizers(&mut self.heap);
+            }
+        }
+    }
+
+    /// 安全点检查 + 收尾/finalize 执行（并发协调）。降级模式下 safepoint 永不被请求，
+    /// `is_requested_fast` 为一次 Relaxed 原子读即返回。
+    fn gc_safepoint_and_finalize(&mut self) {
+        if self.gc_runtime.safepoint.is_requested_fast() {
+            self.gc_runtime.safepoint.check_and_park();
+            // 返回后若 Coordinator 标记了 closure_pending → 执行 Mark Term + Sweep。
+            if self
+                .gc_runtime
+                .closure_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                gc::close_concurrent_cycle(self);
+            }
+            // close 设置了 finalize_pending → 执行 finalizers（mutator 线程，需 &mut VM）。
+            if self
+                .gc_runtime
+                .finalize_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                gc::run_finalizers(&mut self.heap);
+            }
+        }
+    }
+
+    /// task 62：完成进行中的并发周期（若 phase != Idle）。在 gc_set_concurrent(false) /
+    /// VM::drop 关闭 Coordinator 前调用。Coordinator 在并发标记完成后经 safepoint 请求 STW，
+    /// mutator 在此 park → 执行 close_concurrent_cycle → phase 回 Idle。否则 Coordinator
+    /// 阻塞在 request_and_wait 等 mutator park，而 shutdown 的 join 等 Coordinator → 死锁。
+    fn complete_concurrent_cycle_if_pending(&mut self) {
+        while self.gc_runtime.phase() != gc::GcPhase::Idle {
+            self.gc_safepoint_and_finalize();
+            // 未进入 STW（Coordinator 仍在并发标记）→ 让出 CPU 等其完成后再重试。
+            if self.gc_runtime.phase() != gc::GcPhase::Idle {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    /// task 62：启用/禁用并发 GC。`gc.set_concurrent` stdlib 绑定。
+    /// 启用时 spawn Coordinator 线程；禁用时先完成进行中的周期再 shutdown（防死锁）。
+    pub fn gc_set_concurrent(&mut self, on: bool) {
+        self.gc_runtime
+            .concurrent_enabled
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        if on && self.gc_coordinator.is_none() {
+            self.gc_coordinator = Some(gc::GcCoordinator::spawn(std::sync::Arc::clone(
+                &self.gc_runtime,
+            )));
+        } else if !on {
+            self.complete_concurrent_cycle_if_pending();
+            if let Some(mut c) = self.gc_coordinator.take() {
+                c.shutdown(&self.gc_runtime);
+            }
+        }
+    }
+
+    /// task 62：GC 运行时只读引用（供 gc 模块 stdlib 统计读取 + 集成测试）。
+    pub fn gc_runtime(&self) -> &std::sync::Arc<gc::GcRuntime> {
+        &self.gc_runtime
+    }
+
+    /// task 62：值栈可变引用（集成测试 + 未来 C API 构造根集用）。
+    pub fn stack_mut(&mut self) -> &mut Vec<Object> {
+        &mut self.stack
+    }
+
+    /// task 62：值栈只读切片。
+    pub fn stack(&self) -> &[Object] {
+        &self.stack
+    }
+
+    /// task 62：堆可变引用。
+    pub fn heap_mut(&mut self) -> &mut gc::MsHeap {
+        &mut self.heap
+    }
+
+    /// task 62：堆只读引用。
+    pub fn heap(&self) -> &gc::MsHeap {
+        &self.heap
     }
 
     // ---- task 66：C API 访问器 ----
@@ -2691,15 +2842,9 @@ impl VM {
                 self.drive_unwind()?;
             }
 
-            // GC 触发点（task 52）。MVP：VM 日常分配未接入 GC 堆，bytes_allocated 保持
-            // 0，此调用为 no-op；接入后在此按阈值触发 minor/major GC（STW）。
-            gc::maybe_gc(
-                &mut self.heap,
-                &mut self.stack,
-                &mut self.globals,
-                &mut self.defer_stack,
-                &mut self.call_stack,
-            );
+            // GC 触发点（task 52/62）。task 62：经 VM::maybe_gc 统一入口，内部按
+            // concurrent_enabled 选择并发异步触发或降级 STW，并执行安全点/finalize 检查。
+            self.maybe_gc();
 
             let opcode_byte = self.read_byte()?;
             let opcode = OpCode::from_byte(opcode_byte)
@@ -2796,6 +2941,10 @@ impl VM {
                     self.close_upvalues_from(0);
                     return Ok(self.pop().unwrap_or(Object::Nil));
                 }
+
+                // task 62：安全点占位指令。安全点 + finalize 检查已在主循环顶部
+                //（self.maybe_gc → gc_safepoint_and_finalize）对本指令执行过，此处为 no-op。
+                OpCode::NopSafepoint => {}
 
                 OpCode::Add => {
                     let b = self.pop()?;
@@ -4316,13 +4465,8 @@ impl VM {
                 OpCode::Import => {
                     let idx = self.read_u16()? as usize;
                     let name = self.read_string_constant(idx)?;
-                    gc::maybe_gc(
-                        &mut self.heap,
-                        &mut self.stack,
-                        &mut self.globals,
-                        &mut self.defer_stack,
-                        &mut self.call_stack,
-                    );
+                    // task 62：IMPORT 安全点（14-gc § 安全点位置）+ GC 触发统一入口。
+                    self.maybe_gc();
                     match self.load_module(&name) {
                         Ok(module_ptr) => self.push(Object::Ref(module_ptr))?,
                         Err(msg) => {
