@@ -139,6 +139,7 @@ pub struct EventLoop {
     /// C API msAwait 注册 ThreadSignal 后阻塞；msFutureResolve/msFutureReject
     /// 取出全部 signals 并 notify。GC forwarding 时同步更新 key。
     /// Arc 内部状态（Mutex+Condvar）不参与 GC trace（与 mslang 对象图无关）。
+    #[cfg(feature = "capi")]
     pub(crate) thread_waiters:
         std::collections::HashMap<*mut MsObjHeader, Vec<ThreadSignal>>,
 }
@@ -153,6 +154,7 @@ impl EventLoop {
             ready_queue: std::collections::VecDeque::new(),
             paused: Vec::new(),
             timers: std::collections::BinaryHeap::new(),
+            #[cfg(feature = "capi")]
             thread_waiters: std::collections::HashMap::new(),
         }
     }
@@ -2127,6 +2129,7 @@ impl VM {
     /// task 76：包装 callable + args + future_ptr 为 Coroutine。
     /// 供 msCallAsync 使用（参照 async fn CALL 路径 + GO 指令）。
     /// 关闭闭包捕获的开放上值（协程运行在独立栈上）。
+    #[cfg(feature = "capi")]
     pub(crate) fn spawn_async_call_coroutine(
         &mut self,
         callable: Object,
@@ -2188,6 +2191,7 @@ impl VM {
 
     /// task 76：驱动 EventLoop 前进（供 msCallAsync/msAwait 使用）。
     /// 忽略 deadlock 错误——调用方通过检查 Future 状态判断结果。
+    #[cfg(feature = "capi")]
     pub(crate) fn pump_event_loop(&mut self) {
         let _ = self.event_loop_run();
     }
@@ -2195,6 +2199,7 @@ impl VM {
     /// task 76：从 C API 恢复 Generator 执行。
     /// Ok(value) = 成功 yield 一个值；Err("StopIteration") = 迭代结束（无异常）；
     /// Err(msg) = 运行时错误。
+    #[cfg(feature = "capi")]
     pub(crate) fn resume_generator_from_capi(
         &mut self,
         gen_ptr: *mut MsObjHeader,
