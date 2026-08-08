@@ -8,7 +8,7 @@ use super::header::GcPhase;
 use super::safepoint::SafepointCoordinator;
 use super::MsObjHeader;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// 默认 GC Worker 线程数：available_parallelism()/4，min 1。
@@ -125,6 +125,16 @@ pub struct GcRuntime {
     pub sweep_reconcile_pending: AtomicBool,
     /// task 63：并发清扫耗时（Task 77 C API 读取）。
     pub concurrent_sweep_ns: AtomicU64,
+
+    // ---- task 64：Coordinator 只读镜像（mutator 独占写入）----
+    /// Coordinator 请求 → mutator 在 safepoint 发起并发 Major 周期（Init 需 &mut VM）。
+    pub timer_major_pending: AtomicBool,
+    /// Old 字节镜像（mutator 在 minor_gc/reconcile 末尾 store）。
+    pub old_size: AtomicUsize,
+    /// 间隔镜像（mutator 在 set_threshold/VM::new 同步）。
+    pub major_gc_interval_ms: AtomicU64,
+    /// 上次 Major 完成时间镜像（mutator 在 reconcile_sweep 末尾同步）。
+    pub last_major_gc_ms: AtomicU64,
 }
 
 impl GcRuntime {
@@ -148,6 +158,11 @@ impl GcRuntime {
             swept_bytes: AtomicU64::new(0),
             sweep_reconcile_pending: AtomicBool::new(false),
             concurrent_sweep_ns: AtomicU64::new(0),
+            // task 64：Coordinator 镜像默认值。
+            timer_major_pending: AtomicBool::new(false),
+            old_size: AtomicUsize::new(0),
+            major_gc_interval_ms: AtomicU64::new(5000),
+            last_major_gc_ms: AtomicU64::new(0),
         }
     }
 

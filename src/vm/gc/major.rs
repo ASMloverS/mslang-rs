@@ -312,7 +312,8 @@ pub fn close_concurrent_cycle(vm: &mut VM) {
     gc.card_table.retain_valid(&vm.heap.old_objects);
 
     // task 62：bytes_allocated=0（空堆）时回退初始阈值（同 major_gc，防 should_collect_major 恒真）。
-    let computed = (vm.heap.bytes_allocated as f64 * super::MAJOR_GC_RATIO) as usize;
+    // task 64 B1：按持久化 old_gc_ratio 重算（替代 MAJOR_GC_RATIO 常量）。
+    let computed = (vm.heap.bytes_allocated as f64 * vm.heap.old_gc_ratio) as usize;
     vm.heap.next_major_gc = if computed == 0 {
         super::INITIAL_MAJOR_THRESHOLD
     } else {
@@ -326,6 +327,14 @@ pub fn close_concurrent_cycle(vm: &mut VM) {
     gc.finalize_pending.store(true, Ordering::Relaxed);
     gc.clear_gc_managed();
     gc.set_phase(GcPhase::Idle);
+
+    // task 64：Major 周期收尾 —— 同步镜像 + 自适应调优（与 reconcile_sweep 一致）。
+    let now_ms = super::tuning::now_mono_ms();
+    vm.heap.last_major_gc_ms = now_ms;
+    gc.last_major_gc_ms.store(now_ms, Ordering::Relaxed);
+    let old_bytes = vm.heap.old_size();
+    gc.old_size.store(old_bytes, Ordering::Relaxed);
+    super::tuning::run_adaptive_tuning(&mut vm.heap, &gc, now_ms);
 }
 
 // ===========================================================================
@@ -398,7 +407,8 @@ pub fn reconcile_sweep(vm: &mut VM) {
     gc.card_table.retain_valid(&vm.heap.old_objects);
 
     // 6. next_major_gc 阈值（空堆回退初始阈值，防 should_collect_major 恒真）。
-    let computed = (vm.heap.bytes_allocated as f64 * super::MAJOR_GC_RATIO) as usize;
+    // task 64 B1：按持久化 old_gc_ratio 重算（替代 MAJOR_GC_RATIO 常量）。
+    let computed = (vm.heap.bytes_allocated as f64 * vm.heap.old_gc_ratio) as usize;
     vm.heap.next_major_gc = if computed == 0 {
         super::INITIAL_MAJOR_THRESHOLD
     } else {
@@ -417,6 +427,14 @@ pub fn reconcile_sweep(vm: &mut VM) {
     gc.set_phase(GcPhase::Finalize);
     gc.finalize_pending.store(true, Ordering::Relaxed);
     gc.set_phase(GcPhase::Idle);
+
+    // task 64：Major 周期收尾 —— 同步镜像（Coordinator 定时判定用）+ 自适应调优。
+    let now_ms = super::tuning::now_mono_ms();
+    vm.heap.last_major_gc_ms = now_ms;
+    gc.last_major_gc_ms.store(now_ms, Ordering::Relaxed);
+    let old_bytes = vm.heap.old_size();
+    gc.old_size.store(old_bytes, Ordering::Relaxed);
+    super::tuning::run_adaptive_tuning(&mut vm.heap, &gc, now_ms);
 }
 
 /// task 63：Old 代 Compaction（STW）。当前 Box 模型下不应被调用（fragmentation_ratio 恒 0.0）。
@@ -453,15 +471,39 @@ impl GcCoordinator {
             .name("mslang-gc-coordinator".into())
             .spawn(move || {
                 let rt = &runtime;
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        GcTrigger::Major => {
+                // task 64：recv_timeout 支持 major_gc_interval_ms 定时触发（14-gc.md:695-710）。
+                // interval==0（禁用定时）→ Duration::MAX 等效永久阻塞，仅消息唤醒。
+                loop {
+                    let interval = rt.major_gc_interval_ms.load(Ordering::Relaxed);
+                    let timeout = if interval == 0 {
+                        std::time::Duration::MAX
+                    } else {
+                        std::time::Duration::from_millis(interval)
+                    };
+                    match rx.recv_timeout(timeout) {
+                        Ok(GcTrigger::Major) => {
                             // 仅在并发标记阶段响应（防过时触发）。
                             if rt.phase_is_concurrent_mark() {
                                 run_major_cycle(rt);
                             }
                         }
-                        GcTrigger::Shutdown => break,
+                        Ok(GcTrigger::Shutdown) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // task 64：定时触发。仅 Idle + interval>0 + Old 非空 + 间隔到期才请求。
+                            // Init 需 &mut VM，Coordinator 不能直接发起 → 置标志，mutator 在
+                            // 下个 safepoint 检测后调 init_concurrent_mark 完成周期。
+                            let now = super::tuning::now_mono_ms();
+                            let last = rt.last_major_gc_ms.load(Ordering::Relaxed);
+                            if interval > 0
+                                && rt.phase() == GcPhase::Idle
+                                && rt.old_size.load(Ordering::Relaxed) > 0
+                                && now.saturating_sub(last) >= interval
+                            {
+                                rt.timer_major_pending
+                                    .store(true, Ordering::Release);
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
             })

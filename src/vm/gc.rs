@@ -44,6 +44,7 @@ pub mod major;
 pub mod runtime;
 pub mod safepoint;
 pub mod sweep;
+pub mod tuning;
 
 pub use barrier::{alloc_during_gc, write_barrier, write_barrier_obj};
 pub use cardtable::CardTable;
@@ -68,8 +69,8 @@ pub const LARGE_OBJ_THRESHOLD: usize = 32 * 1024;
 pub const DEFAULT_PROMOTION_AGE: u8 = 2;
 /// major GC 触发倍率（相对 bytes_allocated）。
 const MAJOR_GC_RATIO: f64 = 2.0;
-/// 初始 minor GC 阈值。
-const INITIAL_MINOR_THRESHOLD: usize = 1024 * 1024;
+/// 初始 minor GC 阈值。task 64：由 1MB 改 4MB，对齐设计默认 young_size（14-gc.md:286）。
+const INITIAL_MINOR_THRESHOLD: usize = 4 * 1024 * 1024;
 /// 初始 major GC 阈值。
 const INITIAL_MAJOR_THRESHOLD: usize = 2 * 1024 * 1024;
 
@@ -1030,6 +1031,28 @@ pub struct MsHeap {
     pub gc_enabled: bool,
     /// 用户经 gc.set_gc_threads 设置的偏好值（MVP STW 单线程，不生效；Phase 7.5 用）。
     pub gc_threads_setting: u32,
+    // ---- task 64：GcConfig 散布字段（mutator 独占读写）----
+    /// Young 代目标大小（字节）。自适应引擎调整此值，minor_gc 收尾按此重置 next_minor_gc。
+    /// A2：stats dict 的 `young_size` 暴露此容量配置（对齐标准 14-gc.md:286）；存活字节数
+    /// 另由 `young_live` 暴露。
+    pub young_size: usize,
+    /// Old GC 触发比率（14-gc.md:285 old_gc_ratio，默认 2.0）。持久化：major_gc/reconcile
+    /// 重算 next_major_gc = bytes_allocated * old_gc_ratio（替代 MAJOR_GC_RATIO 常量，B1）。
+    pub old_gc_ratio: f64,
+    /// 并发标记触发阈值（Old 占用率近似，0.0-1.0）。默认 0.8。语义见 §4 注（C1 近似）。
+    pub concurrent_mark_threshold: f64,
+    /// Major GC 最大间隔（毫秒）。默认 5000。0 = 禁用定时（仅分配驱动）。
+    /// 镜像至 GcRuntime.major_gc_interval_ms 供 Coordinator 只读。
+    pub major_gc_interval_ms: u64,
+    /// 自适应开关。默认 true。
+    pub adaptive_enabled: bool,
+    /// Minor GC 频率采样（最近完成时间戳，单调时钟毫秒）。自适应引擎读取。
+    pub minor_gc_times: std::collections::VecDeque<u64>,
+    /// 上次 Minor GC 的存活/晋升字节（Copier 记录）。
+    pub last_minor_survived: usize,
+    pub last_minor_promoted: usize,
+    /// 上次 Major GC 完成的单调时钟（毫秒）。镜像至 GcRuntime.last_major_gc_ms。
+    pub last_major_gc_ms: u64,
     /// task 74：GC 调试模式（仅 debug_assertions 构建中由 msGcSetDebug 设置）。
     /// 启用后 root/unroot 配对检查、类型标签校验、堆一致性验证。
     /// MVP：存储不用（检查项随后续 task 落地）。
@@ -1056,6 +1079,16 @@ impl MsHeap {
             bytes_freed: 0,
             gc_enabled: true,
             gc_threads_setting: 1,
+            // task 64：GcConfig 默认值（对齐 14-gc.md:282-292）。
+            young_size: INITIAL_MINOR_THRESHOLD, // 4MB
+            old_gc_ratio: MAJOR_GC_RATIO,        // 2.0
+            concurrent_mark_threshold: 0.8,
+            major_gc_interval_ms: 5000,
+            adaptive_enabled: true,
+            minor_gc_times: std::collections::VecDeque::new(),
+            last_minor_survived: 0,
+            last_minor_promoted: 0,
+            last_major_gc_ms: 0,
             debug: false,
         }
     }
@@ -1104,6 +1137,13 @@ impl MsHeap {
     /// task 62：Old 代对象数（集成测试/调试用）。
     pub fn old_objects_len(&self) -> usize {
         self.old_objects.len()
+    }
+
+    /// task 64：Old 代「容量」近似（C1）。Old 为散布 Box（Task 52/63）无连续 arena capacity，
+    /// 取 `next_major_gc`（Major 触发阈值）作为近似上界，使 `concurrent_mark_threshold`
+    /// 语义为「Old 字节达 Major 阈值的 80% 时提前并发标记」。arena 迁移后改为真实 capacity。
+    pub fn old_capacity(&self) -> usize {
+        self.next_major_gc
     }
 
     /// task 62：Old 代是否为空（循环回收测试断言用）。
@@ -1267,6 +1307,10 @@ struct Copier<'a> {
     /// task 60：from-space 指针集合。forward_slot 仅转发此集合内的 Young 对象，
     /// 避免 GC 误复制经 alloc_*（非 GC 堆）分配的对象（gc_meta=0 但非 GC 托管）。
     old_young_set: HashSet<*mut MsObjHeader>,
+    /// task 64：本轮存活字节（复制到 to-space 的对象 size 之和）。
+    survived_bytes: usize,
+    /// task 64：本轮晋升字节（age >= promotion_age → Old 的对象 size 之和）。
+    promoted_bytes: usize,
 }
 
 impl<'a> Copier<'a> {
@@ -1293,6 +1337,11 @@ impl<'a> Copier<'a> {
             (*np).gc_meta = meta;
             let size = (*np).size as usize;
             self.heap.bytes_allocated = self.heap.bytes_allocated.saturating_add(size);
+            // task 64：存活/晋升字节统计（自适应引擎读取）。
+            self.survived_bytes = self.survived_bytes.saturating_add(size);
+            if promote {
+                self.promoted_bytes = self.promoted_bytes.saturating_add(size);
+            }
         }
         if promote {
             self.heap.old_objects.push(np);
@@ -1319,6 +1368,7 @@ impl<'a> Copier<'a> {
 
 /// Young 代复制 GC。扫描根集（stack + globals），存活对象克隆转发，不可达者释放。
 /// frames 在 MVP 无 closure（task 28 起），故仅扫 stack+globals。
+/// task 64：新增 `gc: &GcRuntime` 参数（供自适应引擎读并发统计）。
 pub fn minor_gc(
     heap: &mut MsHeap,
     stack: &mut [Object],
@@ -1326,6 +1376,7 @@ pub fn minor_gc(
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
     card_table: &CardTable,
+    gc: &GcRuntime,
 ) {
     // task 60：GC 计时（入口快照，出口累加 pause_ns）。
     let t0 = std::time::Instant::now();
@@ -1340,6 +1391,8 @@ pub fn minor_gc(
         worklist: Vec::new(),
         promotion_age,
         old_young_set,
+        survived_bytes: 0,
+        promoted_bytes: 0,
     };
 
     // 根集转发（&mut 槽）。
@@ -1404,6 +1457,19 @@ pub fn minor_gc(
     c.heap.total_pause_ns += elapsed;
     c.heap.last_pause_ns = elapsed;
     c.heap.minor_count += 1;
+
+    // task 64：自适应引擎数据采集 + 触发。
+    let now_ms = tuning::now_mono_ms();
+    c.heap.last_minor_survived = c.survived_bytes;
+    c.heap.last_minor_promoted = c.promoted_bytes;
+    c.heap.minor_gc_times.push_back(now_ms);
+    // 按 young_size 重置 next_minor_gc（替代固定 INITIAL_MINOR_THRESHOLD）。
+    c.heap.next_minor_gc = c.heap.bytes_allocated.saturating_add(c.heap.young_size);
+    // 同步 Old 字节镜像（Coordinator 定时判定用）。
+    let old_bytes = c.heap.old_size();
+    gc.old_size.store(old_bytes, std::sync::atomic::Ordering::Relaxed);
+    // 触发自适应调优（mutator 独占 &mut MsHeap，无并发风险）。
+    tuning::run_adaptive_tuning(c.heap, gc, now_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -1487,7 +1553,8 @@ pub fn major_gc(
 
     // task 62：bytes_allocated=0（空堆）时 computed=0 会让 should_collect_major 恒真，
     // 每条指令触发 GC（并发模式下 → 每条指令一个完整周期 = 死级/死锁）。回退到初始阈值。
-    let computed = (heap.bytes_allocated as f64 * MAJOR_GC_RATIO) as usize;
+    // task 64 B1：按持久化 old_gc_ratio 重算（替代 MAJOR_GC_RATIO 常量）。
+    let computed = (heap.bytes_allocated as f64 * heap.old_gc_ratio) as usize;
     heap.next_major_gc = if computed == 0 {
         INITIAL_MAJOR_THRESHOLD
     } else {
@@ -1499,6 +1566,9 @@ pub fn major_gc(
     heap.total_pause_ns += elapsed;
     heap.last_pause_ns = elapsed;
     heap.major_count += 1;
+    // task 64：记录上次 Major 完成时间（Coordinator 定时判定镜像由 reconcile_sweep 同步；
+    // 降级模式无 Coordinator，但 last_major_gc_ms 仍更新供未来降级定时兜底）。
+    heap.last_major_gc_ms = tuning::now_mono_ms();
 }
 
 // ---------------------------------------------------------------------------
@@ -1596,6 +1666,7 @@ pub fn maybe_gc(
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
     card_table: &CardTable,
+    gc: &GcRuntime,
 ) {
     // task 60：gc_enabled guard — 禁用时自动 GC 为 no-op（手动 gc.collect() 不受此限）。
     if !heap.gc_enabled {
@@ -1603,11 +1674,11 @@ pub fn maybe_gc(
     }
     let mut ran = false;
     if heap.should_collect_major() {
-        minor_gc(heap, stack, globals, defer_stack, frames, card_table);
+        minor_gc(heap, stack, globals, defer_stack, frames, card_table, gc);
         major_gc(heap, stack, globals, defer_stack, frames);
         ran = true;
     } else if heap.should_collect_minor() {
-        minor_gc(heap, stack, globals, defer_stack, frames, card_table);
+        minor_gc(heap, stack, globals, defer_stack, frames, card_table, gc);
     }
     if ran {
         run_finalizers(heap);
@@ -1655,7 +1726,7 @@ mod tests {
         let mut globals = HashMap::new();
         let before = heap_list(&live);
 
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
 
         let after = heap_list(stack.last().unwrap());
         assert_ne!(
@@ -1681,7 +1752,7 @@ mod tests {
         let ptr = heap_list(&dead);
         let mut stack = Vec::new();
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         assert!(heap.young_objects.is_empty());
         let _ = ptr; // 已释放；不可解引用
     }
@@ -1696,8 +1767,8 @@ mod tests {
         let mut stack = vec![live];
         let mut globals = HashMap::new();
         // 连续两次 minor_gc，age 累积达 promotion_age → 晋升 Old。
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         let r = heap_list(stack.last().unwrap());
         unsafe {
             assert_eq!((*r).generation(), Generation::Old);
@@ -1717,7 +1788,7 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "temp");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc); // 晋升到 Old
         assert_eq!(heap.old_objects.len(), 1);
         assert!(heap.bytes_allocated > 0);
         stack.clear(); // 解除根：Old 对象不可达
@@ -1736,7 +1807,7 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "kept");
         let mut stack = vec![live.clone()];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc); // 晋升到 Old
         assert_eq!(heap.old_objects.len(), 1);
         // stack 仍指向晋升后的对象（minor 转发了根槽）。
         major_gc(&mut heap, &stack, &globals, &[], &[]);
@@ -1763,7 +1834,7 @@ mod tests {
         heap.promotion_age = 1;
         let mut stack = vec![a.clone(), b.clone()];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         // 清除根 → 两者仅彼此引用（循环），major 应回收。
         stack.clear();
         major_gc(&mut heap, &stack, &globals, &[], &[]);
@@ -1817,7 +1888,7 @@ mod tests {
         let outer = gc_alloc_list(&mut heap, &gc, vec![inner]);
         let mut stack = vec![outer];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         let new_outer = heap_list(stack.last().unwrap());
         unsafe {
             let items = gc_read_list(new_outer);
@@ -1838,7 +1909,7 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "x");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         // bytes_allocated 经 saturating_sub 不应下溢（usize 下溢会 panic）。
         assert!(heap.bytes_allocated < usize::MAX);
     }
@@ -1855,7 +1926,7 @@ mod tests {
         let obj = gc_alloc_string(&mut heap, &gc, "fin");
         let mut stack = vec![obj];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc); // 晋升到 Old
         let old_ptr = *heap.old_objects.last().unwrap();
         unsafe {
             (*old_ptr).set_has_finalizer(true);
@@ -1898,6 +1969,7 @@ mod tests {
             &mut defer_stack,
             &mut [],
             &ct,
+            &gc,
         );
         // live 经 minor 晋升 Old，major 标记可达 → 存活。
         assert_eq!(heap.old_objects.len(), 1);
@@ -2121,7 +2193,7 @@ mod tests {
         let _dead = gc_alloc_string(&mut heap, &gc, "unreachable");
         let mut stack = Vec::new();
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         assert_eq!(heap.minor_count, 1);
         assert_eq!(heap.major_count, 0);
         assert!(heap.last_pause_ns < u64::MAX); // 被写入
@@ -2137,7 +2209,7 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "temp");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
         stack.clear();
         major_gc(&mut heap, &stack, &globals, &[], &[]);
         assert_eq!(heap.major_count, 1);
@@ -2147,6 +2219,7 @@ mod tests {
     #[test]
     fn test_maybe_gc_respects_disabled() {
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
         let ct = CardTable::new();
         heap.gc_enabled = false;
         heap.next_minor_gc = 0; // 强制触发条件
@@ -2161,6 +2234,7 @@ mod tests {
             &mut defer_stack,
             &mut [],
             &ct,
+            &gc,
         );
         // disabled → no GC ran。
         assert_eq!(heap.minor_count, 0);
@@ -2186,6 +2260,7 @@ mod tests {
             &mut defer_stack,
             &mut [],
             &ct,
+            &gc,
         );
         assert!(heap.minor_count >= 1);
         assert!(heap.major_count >= 1);

@@ -380,6 +380,13 @@ impl VM {
         vm.register_builtins();
         vm.init_object_class();
         vm.init_exception_classes();
+        // task 64：同步 GcRuntime 定时镜像基线 —— last_major_gc_ms = now，使首个
+        // major_gc_interval_ms 间隔不会在 VM 构造后立即到期触发。major_gc_interval_ms
+        // / old_size 已在 GcRuntime::new 设默认值（5000 / 0）。
+        vm.gc_runtime.last_major_gc_ms.store(
+            gc::tuning::now_mono_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // task 45：快照基线全局（内置函数 + 异常类），供 execute_module 隔离复用。
         vm.baseline_globals = vm.globals.clone();
         // task 46：注册原生 io 模块 + 模块函数 arity（经 module.fn() 走 GET_ATTR→CALL 校验）。
@@ -463,6 +470,7 @@ impl VM {
         vm.native_arities.insert("set_promotion_age".to_string(), 1);
         vm.native_arities.insert("set_gc_threads".to_string(), 1);
         vm.native_arities.insert("set_concurrent".to_string(), 1);
+        vm.native_arities.insert("set_adaptive".to_string(), 1);
         vm.native_arities.insert("stats".to_string(), 0);
         vm.native_arities.insert("count".to_string(), 0);
         vm.native_arities.insert("mem_alloc".to_string(), 0);
@@ -1031,6 +1039,7 @@ impl VM {
             &mut self.defer_stack,
             &mut self.call_stack,
             &self.gc_runtime.card_table,
+            &self.gc_runtime,
         );
         gc::major_gc(
             &mut self.heap,
@@ -1051,6 +1060,7 @@ impl VM {
             &mut self.defer_stack,
             &mut self.call_stack,
             &self.gc_runtime.card_table,
+            &self.gc_runtime,
         );
         gc::run_finalizers(&mut self.heap);
     }
@@ -1093,6 +1103,7 @@ impl VM {
                 &mut self.defer_stack,
                 &mut self.call_stack,
                 &self.gc_runtime.card_table,
+                &self.gc_runtime,
             );
         }
         if self.heap.should_collect_major() {
@@ -1110,12 +1121,47 @@ impl VM {
                 );
                 gc::run_finalizers(&mut self.heap);
             }
+        } else if self
+            .gc_runtime
+            .concurrent_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // task 64：并发标记阈值（C1 近似）。Old 占用率达 concurrent_mark_threshold 时
+            // 提前启动并发标记，而非等到 bytes_allocated > next_major_gc 全量阈值。
+            // old_capacity() 近似为 next_major_gc（Old 为散布 Box 无真实 capacity）。
+            let old_cap = self.heap.old_capacity();
+            let old_occupancy = if old_cap > 0 {
+                self.heap.old_size() as f64 / old_cap as f64
+            } else {
+                0.0
+            };
+            if old_occupancy >= self.heap.concurrent_mark_threshold {
+                gc::init_concurrent_mark(self);
+            }
         }
     }
 
     /// 安全点检查 + 收尾/finalize 执行（并发协调）。降级模式下 safepoint 永不被请求，
     /// `is_requested_fast` 为一次 Relaxed 原子读即返回。
     fn gc_safepoint_and_finalize(&mut self) {
+        // task 64：Coordinator 定时触发 —— 请求 mutator 在 safepoint 发起并发 Major 周期。
+        // 置于 safepoint 检查之外：定时请求不依赖 Coordinator 的 safepoint rendezvous，
+        // mutator 在主循环每个 NopSafepoint 都会检测。gc_enabled 守卫已在 maybe_gc 调用链中。
+        if self
+            .gc_runtime
+            .timer_major_pending
+            .swap(false, std::sync::atomic::Ordering::Acquire)
+        {
+            // 仅在 Idle 且并发启用时发起（避免与进行中的周期冲突）。
+            if self.gc_runtime.phase() == gc::GcPhase::Idle
+                && self
+                    .gc_runtime
+                    .concurrent_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                gc::init_concurrent_mark(self);
+            }
+        }
         if self.gc_runtime.safepoint.is_requested_fast() {
             self.gc_runtime.safepoint.check_and_park();
             // Rendezvous #1：Mark Termination（不含 Sweep）。
