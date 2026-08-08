@@ -131,11 +131,14 @@
 | # | 任务 | 状态 |
 |---|---|---|
 | 62 | [并发标记（tri-color + 写屏障）](62-concurrent-mark.md) | ✅ |
-| 63 | [并发清扫与 Compaction](63-concurrent-sweep-compaction.md) | ⬜ |
+| 63 | [并发清扫与 Compaction](63-concurrent-sweep-compaction.md) | ✅ |
 | 64 | GC 调优接口与 gc.ms 模块（待创建） | ⬜ |
 | 77 | [C API — 并发 GC 交互（并发写屏障/调优）](77-capi-concurrent-gc.md) | ⬜ |
+| — | Old 代 arena 迁移 + Compaction 实装（task 63 §8 延后，待创建） | 待创建 |
 
 > 设计规格见 [14-gc](../14-gc.md) Phase 7.5。Task 77 与 62-64 协调。
+> task 63 §8：Compaction 度量已落地（`fragmentation_ratio`/`should_compact`），但实装需先将
+> Old 代迁移为连续 arena + free-list（当前为散布 Box，无碎片）。占位行如上，防 `compact_old` 死代码。
 
 ## Phase 8 — REPL + 工具链
 

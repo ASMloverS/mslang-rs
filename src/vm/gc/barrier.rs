@@ -53,18 +53,23 @@ pub unsafe fn write_barrier_obj(
     old_val: *mut MsObjHeader,
     new_val: *mut MsObjHeader,
 ) {
-    if !gc.phase_is_concurrent_mark() {
-        return;
-    }
-    shade_if_white(gc, old_val);
-    shade_if_white(gc, new_val);
-    // Card marking：Old parent 持有 Young 引用 → 标 dirty card（§7）。
+    // task 63：跨代 card marking 常驻（任意阶段）。Old parent 写入 Young 引用 → dirty。
+    // 修正 Task 62 仅在 ConcurrentMark 期标记 card 的限制：Old→Young 引用可在任意阶段建立，
+    // 未记录会导致 Minor GC 漏扫。此判定为 Minor GC 扫描 dirty cards 正确性的前提
+    //（14-gc.md § Remembered Set，326-344 行）。
     if !new_val.is_null()
         && unsafe { generation_atomic(parent) } == Generation::Old
         && unsafe { generation_atomic(new_val) } == Generation::Young
     {
         gc.card_table.mark_dirty(parent);
     }
+
+    // 着色仅在并发标记期（三色不变性维护）。
+    if !gc.phase_is_concurrent_mark() {
+        return;
+    }
+    shade_if_white(gc, old_val);
+    shade_if_white(gc, new_val);
 }
 
 /// 若 obj 非 null 且 White → 原子标灰 + 入灰色队列。

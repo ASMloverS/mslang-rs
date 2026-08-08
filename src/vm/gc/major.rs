@@ -22,8 +22,9 @@ use super::header::{
     set_color_atomic, try_color_transition, GcPhase,
 };
 use super::runtime::{GcManagedSet, GcRuntime};
-use super::{run_finalizers, sweep_heap, type_descriptor, Color, MsObjHeader};
+use super::{run_finalizers, sweep_heap, sweep_los, type_descriptor, Color, MsObjHeader};
 use crate::vm::VM;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
@@ -236,20 +237,46 @@ pub fn init_concurrent_mark(vm: &mut VM) {
     }
 }
 
-/// Coordinator 线程的核心：并发标记（Worker 池），完成后经安全点协调 Mark Termination。
+/// Coordinator 线程的核心：并发标记（Worker 池）+ 并发清扫，经两次安全点 rendezvous
+/// 与 mutator 协调（Task 63：Mark Termination 与 Sweep reconcile 分离为两次极短 STW）。
 fn run_major_cycle(gc: &Arc<GcRuntime>) {
     let Some(gc_managed) = gc.gc_managed_clone() else {
         // 无 gc_managed（未 Init）→ 空周期，直接回 Idle。
         gc.set_phase(GcPhase::Idle);
         return;
     };
+
+    // 阶段 A：并发标记（Worker 池）。
     run_concurrent_mark_only(gc, &gc_managed);
 
-    // 并发标记完成 → 请求 STW，让 mutator 在安全点停下后执行收尾（拥有 &mut VM）。
+    // Rendezvous #1：请求 STW，mutator park → 设 closure_pending → release。
+    // mutator 醒后在 gc_safepoint_and_finalize 调 finish_mark_termination（设 ConcurrentSweep）。
     gc.safepoint.request_and_wait();
-    gc.closure_pending.store(true, Ordering::Relaxed);
+    // Release：建立 happens-before，保证 mutator 的着色对阶段 B 可见（spec §1）。
+    gc.closure_pending.store(true, Ordering::Release);
     gc.safepoint.release();
-    // mutator 在 check_and_park 返回后执行 close_concurrent_cycle。
+
+    // 等 mutator 完成 Mark Termination（phase → ConcurrentSweep）。
+    // 有界自旋：mutator 醒后几微秒内完成 finish_mark_termination。NopSafepoint（Task 62，
+    // ≤1000 指令）保证正常字节码执行下快速到达。VM drop 时 shutdown 先 release safepoint 解
+    // 除阻塞，不 panic。
+    let mut spins = 0u32;
+    while gc.phase() != GcPhase::ConcurrentSweep {
+        thread::yield_now();
+        spins = spins.saturating_add(1);
+        if spins.is_multiple_of(1_000_000) {
+            eprintln!("mslang-gc: long wait for mutator to finish mark termination");
+        }
+    }
+
+    // 阶段 B：并发清扫（mutator 继续运行字节码）。释放 White Old 对象、记录 finalizer。
+    super::sweep::concurrent_sweep(gc);
+
+    // Rendezvous #2：请求 STW，mutator park → 设 sweep_reconcile_pending → release。
+    // mutator 醒后调 reconcile_sweep（应用 dead 集 + 回 Idle）。Release：保证 swept_bytes 可见。
+    gc.safepoint.request_and_wait();
+    gc.sweep_reconcile_pending.store(true, Ordering::Release);
+    gc.safepoint.release();
 }
 
 /// 启动 Worker 池并发标记 + 兜底 drain。结束后所有可达 gc_managed 对象为 Black。
@@ -299,6 +326,107 @@ pub fn close_concurrent_cycle(vm: &mut VM) {
     gc.finalize_pending.store(true, Ordering::Relaxed);
     gc.clear_gc_managed();
     gc.set_phase(GcPhase::Idle);
+}
+
+// ===========================================================================
+// task 63：并发清扫 —— Mark Termination 与 Sweep reconcile 拆分
+// ===========================================================================
+
+/// mutator 在 closure_pending（rendezvous #1）后调用：Mark Termination，不含 Sweep。
+/// 完成后置 phase=ConcurrentSweep，Coordinator 检测到后开始并发清扫（mutator 恢复执行字节码）。
+pub fn finish_mark_termination(vm: &mut VM) {
+    let gc = Arc::clone(&vm.gc_runtime);
+    let t0 = std::time::Instant::now();
+
+    let gc_managed = gc.gc_managed_clone().unwrap_or_default();
+
+    // Mark Termination：重扫根集（并发标记期间栈/globals 可能被修改）。
+    gc.set_phase(GcPhase::MarkTermination);
+    scan_roots_gray(&gc, vm, &gc_managed);
+    drain_gray(&gc, &gc_managed);
+
+    gc.term_stw_ns
+        .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+    // task 63：清空 sweep 累加器，进入并发清扫（mutator 随后恢复执行字节码）。
+    gc.clear_sweep_accumulators();
+    gc.sweep_reconcile_pending.store(false, Ordering::Relaxed);
+    gc.set_phase(GcPhase::ConcurrentSweep);
+    // 注意：不设 finalize_pending、不回 Idle。Coordinator 将并发清扫后再请求第 2 次 STW。
+}
+
+/// mutator 在 sweep_reconcile_pending（rendezvous #2）后调用：应用 Coordinator 的清扫结果。
+/// 拥有 &mut VM，故可修改 old_objects/los_objects/bytes_allocated/finalizer_queue。
+pub fn reconcile_sweep(vm: &mut VM) {
+    let gc = Arc::clone(&vm.gc_runtime);
+    let t0 = std::time::Instant::now();
+
+    let dead_old: HashSet<*mut MsObjHeader> =
+        gc.sweep_dead_old.lock().unwrap().drain(..).collect();
+    let finalizers: Vec<*mut MsObjHeader> =
+        gc.sweep_finalizers.lock().unwrap().drain(..).collect();
+    let swept = gc.swept_bytes.load(Ordering::Relaxed);
+
+    // 1. Old 代：移除 dead，存活者 Black|Gray→White 重置（mutator 独占 old_objects，安全）。
+    vm.heap.old_objects.retain(|&p| {
+        if dead_old.contains(&p) {
+            return false;
+        }
+        // SAFETY: p 为有效 Old 对象（Coordinator 未释放它，即非 dead）。
+        let h = unsafe { &mut *p };
+        h.set_color(Color::White);
+        true
+    });
+
+    // 2. finalizer 对象：复活（保留在 old_objects，置 White，入 finalizer_queue）。
+    for &obj in &finalizers {
+        // SAFETY: finalizer 对象仍有效（Coordinator 未释放它，仅记录指针）。
+        unsafe {
+            (*obj).set_color(Color::White);
+        }
+        vm.heap.finalizer_queue.push(obj);
+    }
+
+    // 3. LOS 清扫（Coordinator 不处理 LOS，mutator 序贯完成；LOS 对象稀有）。
+    sweep_los(&mut vm.heap);
+
+    // 4. bytes 计数。
+    vm.heap.bytes_allocated = vm.heap.bytes_allocated.saturating_sub(swept as usize);
+    vm.heap.bytes_freed = vm.heap.bytes_freed.saturating_add(swept);
+
+    // 5. 清理 Card Table 中已释放对象的悬垂 dirty 指针（防下次 minor GC drain 后 UAF）。
+    gc.card_table.retain_valid(&vm.heap.old_objects);
+
+    // 6. next_major_gc 阈值（空堆回退初始阈值，防 should_collect_major 恒真）。
+    let computed = (vm.heap.bytes_allocated as f64 * super::MAJOR_GC_RATIO) as usize;
+    vm.heap.next_major_gc = if computed == 0 {
+        super::INITIAL_MAJOR_THRESHOLD
+    } else {
+        computed
+    };
+    vm.heap.major_count += 1;
+
+    // task 63：Compaction 触发判定（Box 模型下恒不触发）。
+    if vm.heap.should_compact() {
+        compact_old(vm);
+    }
+
+    gc.concurrent_sweep_ns
+        .store(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    gc.clear_gc_managed();
+    gc.set_phase(GcPhase::Finalize);
+    gc.finalize_pending.store(true, Ordering::Relaxed);
+    gc.set_phase(GcPhase::Idle);
+}
+
+/// task 63：Old 代 Compaction（STW）。当前 Box 模型下不应被调用（fragmentation_ratio 恒 0.0）。
+/// 未来 Old 迁移为 arena + free-list 后实装：滑动压缩存活对象、更新所有 Ref 指针、
+/// 重建 free-list。依赖 forward_fields 全量重写指针（同 Minor GC 的 Cheney 转发语义）。
+fn compact_old(_vm: &mut VM) {
+    debug_assert!(
+        false,
+        "compaction not implemented; fragmentation_ratio should be 0.0"
+    );
 }
 
 // ===========================================================================

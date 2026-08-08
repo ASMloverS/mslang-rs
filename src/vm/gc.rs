@@ -43,6 +43,7 @@ pub mod header;
 pub mod major;
 pub mod runtime;
 pub mod safepoint;
+pub mod sweep;
 
 pub use barrier::{alloc_during_gc, write_barrier, write_barrier_obj};
 pub use cardtable::CardTable;
@@ -50,10 +51,12 @@ pub use header::{
     color_atomic, generation_atomic, set_color_atomic, try_color_transition, GcPhase,
 };
 pub use major::{
-    close_concurrent_cycle, init_concurrent_mark, major_collect_stw, GcCoordinator, GcWorkerPool,
+    close_concurrent_cycle, finish_mark_termination, init_concurrent_mark, major_collect_stw,
+    reconcile_sweep, GcCoordinator, GcWorkerPool,
 };
 pub use runtime::{GcRuntime, GrayQueue};
 pub use safepoint::SafepointCoordinator;
+pub use sweep::concurrent_sweep;
 
 // ---------------------------------------------------------------------------
 // 常量（参照 14-gc.md / 52-gc.md）
@@ -141,6 +144,14 @@ impl MsObjHeader {
     }
     pub fn is_pinned(&self) -> bool {
         self.gc_meta & Self::PINNED != 0
+    }
+    /// task 63：设置 pinned 标志（C 侧 msPin / 并发清扫保留判定）。Task 74 的 msPin 复用。
+    pub fn set_pinned(&mut self, on: bool) {
+        if on {
+            self.gc_meta |= Self::PINNED;
+        } else {
+            self.gc_meta &= !Self::PINNED;
+        }
     }
 }
 
@@ -1100,6 +1111,18 @@ impl MsHeap {
         self.old_objects.is_empty()
     }
 
+    /// task 63：Old 代碎片率。Box 模型下恒为 0（无 arena holes）。
+    /// 未来 Old 迁移为 arena + free-list 后，改为 free_bytes / old_capacity。
+    /// 14-gc.md § 动态阈值：碎片率 > 30% 触发 Compaction。
+    pub fn fragmentation_ratio(&self) -> f64 {
+        0.0
+    }
+
+    /// task 63：是否应触发 Compaction。当前恒 false（Box 模型无碎片）。
+    pub fn should_compact(&self) -> bool {
+        self.fragmentation_ratio() > 0.30
+    }
+
     /// 登记一个 Young 对象（由 gc_alloc_* 调用）。
     fn register_young(&mut self, ptr: *mut MsObjHeader, size: usize) {
         self.young_objects.push(ptr);
@@ -1138,54 +1161,74 @@ impl Default for MsHeap {
 // gc_alloc_*：经 GC 堆分配托管对象（返回 Object::Ref，与既有 alloc_* 接口一致）
 // ---------------------------------------------------------------------------
 
-pub fn gc_alloc_string(heap: &mut MsHeap, s: &str) -> Object {
+pub fn gc_alloc_string(heap: &mut MsHeap, gc: &GcRuntime, s: &str) -> Object {
     let obj = Box::new(GcString {
         header: header_for(TypeTag::STRING, std::mem::size_of::<GcString>() as u16),
         data: Box::from(s.as_bytes()),
     });
     let ptr = Box::into_raw(obj) as *mut MsObjHeader;
     heap.register_young(ptr, std::mem::size_of::<GcString>());
+    // task 63：并发标记/清扫期间新分配 → 标黑，避免下轮误回收（spec §9）。
+    // SAFETY: ptr 刚由 Box::into_raw 分配，有效 MsObjHeader。
+    unsafe {
+        alloc_during_gc(gc, ptr);
+    }
     Object::Ref(ptr)
 }
 
-pub fn gc_alloc_list(heap: &mut MsHeap, items: Vec<Object>) -> Object {
+pub fn gc_alloc_list(heap: &mut MsHeap, gc: &GcRuntime, items: Vec<Object>) -> Object {
     let obj = Box::new(GcList {
         header: header_for(TypeTag::LIST, std::mem::size_of::<GcList>() as u16),
         items,
     });
     let ptr = Box::into_raw(obj) as *mut MsObjHeader;
     heap.register_young(ptr, std::mem::size_of::<GcList>());
+    // SAFETY: ptr 刚由 Box::into_raw 分配，有效 MsObjHeader。
+    unsafe {
+        alloc_during_gc(gc, ptr);
+    }
     Object::Ref(ptr)
 }
 
-pub fn gc_alloc_tuple(heap: &mut MsHeap, items: Vec<Object>) -> Object {
+pub fn gc_alloc_tuple(heap: &mut MsHeap, gc: &GcRuntime, items: Vec<Object>) -> Object {
     let obj = Box::new(GcTuple {
         header: header_for(TypeTag::TUPLE, std::mem::size_of::<GcTuple>() as u16),
         items,
     });
     let ptr = Box::into_raw(obj) as *mut MsObjHeader;
     heap.register_young(ptr, std::mem::size_of::<GcTuple>());
-    let _ = ptr;
+    // SAFETY: ptr 刚由 Box::into_raw 分配，有效 MsObjHeader。
+    unsafe {
+        alloc_during_gc(gc, ptr);
+    }
     Object::Ref(ptr)
 }
 
-pub fn gc_alloc_dict(heap: &mut MsHeap, map: DictMap) -> Object {
+pub fn gc_alloc_dict(heap: &mut MsHeap, gc: &GcRuntime, map: DictMap) -> Object {
     let obj = Box::new(GcDict {
         header: header_for(TypeTag::DICT, std::mem::size_of::<GcDict>() as u16),
         map,
     });
     let ptr = Box::into_raw(obj) as *mut MsObjHeader;
     heap.register_young(ptr, std::mem::size_of::<GcDict>());
+    // SAFETY: ptr 刚由 Box::into_raw 分配，有效 MsObjHeader。
+    unsafe {
+        alloc_during_gc(gc, ptr);
+    }
     Object::Ref(ptr)
 }
 
-pub fn gc_alloc_set(heap: &mut MsHeap, inner: HashSet<Object>) -> Object {
+pub fn gc_alloc_set(heap: &mut MsHeap, gc: &GcRuntime, inner: HashSet<Object>) -> Object {
     let obj = Box::new(GcSet {
         header: header_for(TypeTag::SET, std::mem::size_of::<GcSet>() as u16),
         inner,
     });
     let ptr = Box::into_raw(obj) as *mut MsObjHeader;
     heap.register_young(ptr, std::mem::size_of::<GcSet>());
+    // SAFETY: ptr 刚由 Box::into_raw 分配，有效 MsObjHeader。
+    unsafe {
+        alloc_during_gc(gc, ptr);
+    }
     Object::Ref(ptr)
 }
 
@@ -1282,6 +1325,7 @@ pub fn minor_gc(
     globals: &mut HashMap<String, Object>,
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
+    card_table: &CardTable,
 ) {
     // task 60：GC 计时（入口快照，出口累加 pause_ns）。
     let t0 = std::time::Instant::now();
@@ -1321,6 +1365,17 @@ pub fn minor_gc(
     // [task 45] module_cache
     // [task 65] c_roots
     // [task 53] 暂停协程及其 Future.waiters
+
+    // task 63：扫描 dirty cards —— Old 对象持有的 Young 引用（14-gc.md § Remembered Set）。
+    // forward_slot 仅转发 from-space 内的 Young 对象；Old→Old 引用不动。drain 消费全部
+    // dirty（下个 epoch 由常驻写屏障重新标记）。dirty 集合经 sweep 后的 retain_valid
+    //（Task 62 major.rs）清理过悬垂指针，且 Minor/Major 不重叠（maybe_gc phase 守卫）。
+    for old_ptr in card_table.drain() {
+        // SAFETY: old_ptr 为有效 Old 对象（dirty 集合已 retain_valid，Minor 不与 Major 重叠）。
+        let tag = unsafe { (*old_ptr).type_tag };
+        let ff = type_descriptor(tag).forward_fields;
+        ff(old_ptr, &mut |slot| c.forward_slot(slot));
+    }
 
     // Cheney 扫描：遍历新对象，用 forward_fields 修正其内部子 Ref 槽。
     while let Some(obj) = c.worklist.pop() {
@@ -1481,6 +1536,14 @@ pub(super) fn sweep_heap(heap: &mut MsHeap) {
     });
 
     // 清扫 LES（真实大小取自侧表 los_sizes）。LES 不参与 pin（C 侧 pin 对象走 Old 路径）。
+    // task 63：抽为 sweep_los，供并发清扫的 reconcile_sweep 复用（LOS 由 mutator 序贯清扫）。
+    sweep_los(heap);
+}
+
+/// task 63：清扫 LES 代（标记完成后的 retain/free 逻辑）。从 sweep_heap 抽出，供
+/// 并发清扫的 reconcile_sweep 复用（LOS dealloc 需 los_sizes 侧表，Coordinator 无 &mut MsHeap）。
+/// Black→White 重置；White+finalizer→复活入队；White→dealloc（los_sizes 取大小）。
+pub(super) fn sweep_los(heap: &mut MsHeap) {
     heap.los_objects.retain(|&obj| {
         // SAFETY: obj 由 alloc_los 经 alloc+write 分配，有效 MsObjHeader。
         let h = unsafe { &mut *obj };
@@ -1532,6 +1595,7 @@ pub fn maybe_gc(
     globals: &mut HashMap<String, Object>,
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
+    card_table: &CardTable,
 ) {
     // task 60：gc_enabled guard — 禁用时自动 GC 为 no-op（手动 gc.collect() 不受此限）。
     if !heap.gc_enabled {
@@ -1539,11 +1603,11 @@ pub fn maybe_gc(
     }
     let mut ran = false;
     if heap.should_collect_major() {
-        minor_gc(heap, stack, globals, defer_stack, frames);
+        minor_gc(heap, stack, globals, defer_stack, frames, card_table);
         major_gc(heap, stack, globals, defer_stack, frames);
         ran = true;
     } else if heap.should_collect_minor() {
-        minor_gc(heap, stack, globals, defer_stack, frames);
+        minor_gc(heap, stack, globals, defer_stack, frames, card_table);
     }
     if ran {
         run_finalizers(heap);
@@ -1569,7 +1633,8 @@ mod tests {
     #[test]
     fn test_young_alloc() {
         let mut heap = MsHeap::new();
-        let obj = gc_alloc_string(&mut heap, "hi");
+        let gc = GcRuntime::new();
+        let obj = gc_alloc_string(&mut heap, &gc, "hi");
         let ptr = heap_list(&obj);
         assert!(!ptr.is_null());
         unsafe {
@@ -1582,13 +1647,15 @@ mod tests {
     fn test_minor_gc_copies_survivors_and_updates_root_slot() {
         // 根栈保留一个 list 引用；另分配一个不可达对象。minor_gc 后存活者被克隆转发。
         let mut heap = MsHeap::new();
-        let live = gc_alloc_list(&mut heap, vec![Object::Int(1), Object::Int(2)]);
-        let _dead = gc_alloc_list(&mut heap, vec![Object::Int(99)]); // 不可达
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
+        let live = gc_alloc_list(&mut heap, &gc, vec![Object::Int(1), Object::Int(2)]);
+        let _dead = gc_alloc_list(&mut heap, &gc, vec![Object::Int(99)]); // 不可达
         let mut stack = vec![live.clone()];
         let mut globals = HashMap::new();
         let before = heap_list(&live);
 
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
 
         let after = heap_list(stack.last().unwrap());
         assert_ne!(
@@ -1608,11 +1675,13 @@ mod tests {
     #[test]
     fn test_minor_gc_dead_object_freed() {
         let mut heap = MsHeap::new();
-        let dead = gc_alloc_string(&mut heap, "unreachable");
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
+        let dead = gc_alloc_string(&mut heap, &gc, "unreachable");
         let ptr = heap_list(&dead);
         let mut stack = Vec::new();
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         assert!(heap.young_objects.is_empty());
         let _ = ptr; // 已释放；不可解引用
     }
@@ -1620,13 +1689,15 @@ mod tests {
     #[test]
     fn test_promotion_to_old() {
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.promotion_age = 2;
-        let live = gc_alloc_list(&mut heap, vec![Object::Int(9)]);
+        let live = gc_alloc_list(&mut heap, &gc, vec![Object::Int(9)]);
         let mut stack = vec![live];
         let mut globals = HashMap::new();
         // 连续两次 minor_gc，age 累积达 promotion_age → 晋升 Old。
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         let r = heap_list(stack.last().unwrap());
         unsafe {
             assert_eq!((*r).generation(), Generation::Old);
@@ -1640,11 +1711,13 @@ mod tests {
     fn test_major_gc_collects_unreachable_old() {
         // 经晋升产生一个 Old 对象（类型正确，free 可安全 Drop 载荷），清除根后 major 回收。
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.promotion_age = 1;
-        let live = gc_alloc_string(&mut heap, "temp");
+        let live = gc_alloc_string(&mut heap, &gc, "temp");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct); // 晋升到 Old
         assert_eq!(heap.old_objects.len(), 1);
         assert!(heap.bytes_allocated > 0);
         stack.clear(); // 解除根：Old 对象不可达
@@ -1657,11 +1730,13 @@ mod tests {
     #[test]
     fn test_major_gc_keeps_reachable_old() {
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.promotion_age = 1; // 一次 minor 即晋升
-        let live = gc_alloc_string(&mut heap, "kept");
+        let live = gc_alloc_string(&mut heap, &gc, "kept");
         let mut stack = vec![live.clone()];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct); // 晋升到 Old
         assert_eq!(heap.old_objects.len(), 1);
         // stack 仍指向晋升后的对象（minor 转发了根槽）。
         major_gc(&mut heap, &stack, &globals, &[], &[]);
@@ -1672,8 +1747,10 @@ mod tests {
     fn test_cycle_collection() {
         // 循环引用：a=[1], b=[2], a.push(b), b.push(a)；解除根后 major GC 应回收两者。
         let mut heap = MsHeap::new();
-        let a = gc_alloc_list(&mut heap, vec![Object::Int(1)]);
-        let b = gc_alloc_list(&mut heap, vec![Object::Int(2)]);
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
+        let a = gc_alloc_list(&mut heap, &gc, vec![Object::Int(1)]);
+        let b = gc_alloc_list(&mut heap, &gc, vec![Object::Int(2)]);
         {
             let ap = heap_list(&a);
             let bp = heap_list(&b);
@@ -1686,7 +1763,7 @@ mod tests {
         heap.promotion_age = 1;
         let mut stack = vec![a.clone(), b.clone()];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         // 清除根 → 两者仅彼此引用（循环），major 应回收。
         stack.clear();
         major_gc(&mut heap, &stack, &globals, &[], &[]);
@@ -1734,11 +1811,13 @@ mod tests {
     fn test_nested_list_forwarded() {
         // 嵌套：outer=[inner], inner=[1]。两者均存活，minor_gc 后均转发且结构保持。
         let mut heap = MsHeap::new();
-        let inner = gc_alloc_list(&mut heap, vec![Object::Int(1)]);
-        let outer = gc_alloc_list(&mut heap, vec![inner]);
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
+        let inner = gc_alloc_list(&mut heap, &gc, vec![Object::Int(1)]);
+        let outer = gc_alloc_list(&mut heap, &gc, vec![inner]);
         let mut stack = vec![outer];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         let new_outer = heap_list(stack.last().unwrap());
         unsafe {
             let items = gc_read_list(new_outer);
@@ -1754,10 +1833,12 @@ mod tests {
     #[test]
     fn test_bytes_allocated_no_underflow() {
         let mut heap = MsHeap::new();
-        let live = gc_alloc_string(&mut heap, "x");
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
+        let live = gc_alloc_string(&mut heap, &gc, "x");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         // bytes_allocated 经 saturating_sub 不应下溢（usize 下溢会 panic）。
         assert!(heap.bytes_allocated < usize::MAX);
     }
@@ -1768,11 +1849,13 @@ mod tests {
         // 由 mutator 执行并清 has_finalizer；下次 GC 正常回收（不无限复活）。
         // 用户 __del__（INSTANCE）由 task 41 落地后在 VM 侧调用，此处验证机制。
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.promotion_age = 1;
-        let obj = gc_alloc_string(&mut heap, "fin");
+        let obj = gc_alloc_string(&mut heap, &gc, "fin");
         let mut stack = vec![obj];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct); // 晋升到 Old
         let old_ptr = *heap.old_objects.last().unwrap();
         unsafe {
             (*old_ptr).set_has_finalizer(true);
@@ -1799,10 +1882,12 @@ mod tests {
     fn test_maybe_gc_full_path() {
         // 验证 maybe_gc 的 minor/major 触发与 finalizer 串联。
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.promotion_age = 1;
         heap.next_minor_gc = 0; // 强制触发
         heap.next_major_gc = 0; // 强制 full GC
-        let live = gc_alloc_list(&mut heap, vec![Object::Int(7)]);
+        let live = gc_alloc_list(&mut heap, &gc, vec![Object::Int(7)]);
         let mut stack = vec![live];
         let mut globals = HashMap::new();
         let mut defer_stack: Vec<DeferEntry> = Vec::new();
@@ -1812,6 +1897,7 @@ mod tests {
             &mut globals,
             &mut defer_stack,
             &mut [],
+            &ct,
         );
         // live 经 minor 晋升 Old，major 标记可达 → 存活。
         assert_eq!(heap.old_objects.len(), 1);
@@ -1830,7 +1916,9 @@ mod tests {
         let Object::Ref(cls_ptr) = class_obj else {
             unreachable!()
         };
-        let lst = gc_alloc_list(&mut MsHeap::new(), vec![Object::Int(1)]);
+        let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let lst = gc_alloc_list(&mut heap, &gc, vec![Object::Int(1)]);
         let Object::Ref(lst_ptr) = lst else {
             unreachable!()
         };
@@ -1857,7 +1945,9 @@ mod tests {
         let Object::Ref(inst_ptr) = inst_obj else {
             unreachable!()
         };
-        let lst = gc_alloc_list(&mut MsHeap::new(), vec![Object::Int(2)]);
+        let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let lst = gc_alloc_list(&mut heap, &gc, vec![Object::Int(2)]);
         let Object::Ref(lst_ptr) = lst else {
             unreachable!()
         };
@@ -2026,10 +2116,12 @@ mod tests {
     #[test]
     fn test_minor_gc_increments_stats() {
         let mut heap = MsHeap::new();
-        let _dead = gc_alloc_string(&mut heap, "unreachable");
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
+        let _dead = gc_alloc_string(&mut heap, &gc, "unreachable");
         let mut stack = Vec::new();
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         assert_eq!(heap.minor_count, 1);
         assert_eq!(heap.major_count, 0);
         assert!(heap.last_pause_ns < u64::MAX); // 被写入
@@ -2039,11 +2131,13 @@ mod tests {
     #[test]
     fn test_major_gc_increments_stats() {
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.promotion_age = 1;
-        let live = gc_alloc_string(&mut heap, "temp");
+        let live = gc_alloc_string(&mut heap, &gc, "temp");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut []);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct);
         stack.clear();
         major_gc(&mut heap, &stack, &globals, &[], &[]);
         assert_eq!(heap.major_count, 1);
@@ -2053,6 +2147,7 @@ mod tests {
     #[test]
     fn test_maybe_gc_respects_disabled() {
         let mut heap = MsHeap::new();
+        let ct = CardTable::new();
         heap.gc_enabled = false;
         heap.next_minor_gc = 0; // 强制触发条件
         heap.next_major_gc = 0;
@@ -2065,6 +2160,7 @@ mod tests {
             &mut globals,
             &mut defer_stack,
             &mut [],
+            &ct,
         );
         // disabled → no GC ran。
         assert_eq!(heap.minor_count, 0);
@@ -2074,10 +2170,12 @@ mod tests {
     #[test]
     fn test_maybe_gc_runs_when_enabled() {
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
+        let ct = CardTable::new();
         heap.gc_enabled = true;
         heap.next_minor_gc = 0;
         heap.next_major_gc = 0;
-        let live = gc_alloc_list(&mut heap, vec![Object::Int(1)]);
+        let live = gc_alloc_list(&mut heap, &gc, vec![Object::Int(1)]);
         let mut stack = vec![live];
         let mut globals = HashMap::new();
         let mut defer_stack: Vec<DeferEntry> = Vec::new();
@@ -2087,6 +2185,7 @@ mod tests {
             &mut globals,
             &mut defer_stack,
             &mut [],
+            &ct,
         );
         assert!(heap.minor_count >= 1);
         assert!(heap.major_count >= 1);
@@ -2095,6 +2194,7 @@ mod tests {
     #[test]
     fn test_heap_size_accessors() {
         let mut heap = MsHeap::new();
+        let gc = GcRuntime::new();
         // 空堆 → 全 0。
         assert_eq!(heap.young_size(), 0);
         assert_eq!(heap.old_size(), 0);
@@ -2102,7 +2202,7 @@ mod tests {
         assert_eq!(heap.live_size(), 0);
 
         // 分配 Young 对象 → young_size > 0。
-        let _ = gc_alloc_string(&mut heap, "hello");
+        let _ = gc_alloc_string(&mut heap, &gc, "hello");
         assert!(heap.young_size() > 0);
         assert_eq!(heap.live_size(), heap.young_size());
 
@@ -2116,5 +2216,15 @@ mod tests {
         let heap = MsHeap::new();
         assert_eq!(heap.gc_threads_setting, 1);
         assert!(heap.gc_enabled);
+    }
+
+    // ---- task 63：Compaction 度量（延后实装，恒不触发） ----
+
+    #[test]
+    fn test_fragmentation_ratio_zero_and_no_compact() {
+        // Box 模型下 Old 代无连续 arena / free-list → 无碎片。度量恒 0，compaction 恒不触发。
+        let heap = MsHeap::new();
+        assert_eq!(heap.fragmentation_ratio(), 0.0);
+        assert!(!heap.should_compact());
     }
 }

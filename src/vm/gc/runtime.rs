@@ -114,6 +114,17 @@ pub struct GcRuntime {
     pub init_stw_ns: AtomicU64,
     pub term_stw_ns: AtomicU64,
     pub gray_queue_peak: AtomicU64,
+
+    /// task 63：Coordinator 清扫释放的 Old 对象指针（mutator reconcile 时从 old_objects 移除）。
+    pub sweep_dead_old: Mutex<Vec<*mut MsObjHeader>>,
+    /// task 63：White + has_finalizer 的对象（mutator reconcile 时入 finalizer_queue 复活）。
+    pub sweep_finalizers: Mutex<Vec<*mut MsObjHeader>>,
+    /// task 63：Coordinator 释放的 Old 对象字节数（reconcile 时从 bytes_allocated 减）。
+    pub swept_bytes: AtomicU64,
+    /// task 63：Coordinator 完成 sweep → 置 true，mutator 在 safepoint 检测后执行 reconcile。
+    pub sweep_reconcile_pending: AtomicBool,
+    /// task 63：并发清扫耗时（Task 77 C API 读取）。
+    pub concurrent_sweep_ns: AtomicU64,
 }
 
 impl GcRuntime {
@@ -132,11 +143,18 @@ impl GcRuntime {
             init_stw_ns: AtomicU64::new(0),
             term_stw_ns: AtomicU64::new(0),
             gray_queue_peak: AtomicU64::new(0),
+            sweep_dead_old: Mutex::new(Vec::new()),
+            sweep_finalizers: Mutex::new(Vec::new()),
+            swept_bytes: AtomicU64::new(0),
+            sweep_reconcile_pending: AtomicBool::new(false),
+            concurrent_sweep_ns: AtomicU64::new(0),
         }
     }
 
     pub fn phase(&self) -> GcPhase {
-        match self.phase.load(Ordering::Relaxed) {
+        // task 63：Acquire —— 配合 set_phase 的 Release，保证弱内存模型上颜色/累加器可见性
+        //（sweep 路径：mutator 着色后 Release，Coordinator Acquire 读到最新颜色）。
+        match self.phase.load(Ordering::Acquire) {
             x if x == GcPhase::Idle as u8 => GcPhase::Idle,
             x if x == GcPhase::Init as u8 => GcPhase::Init,
             x if x == GcPhase::ConcurrentMark as u8 => GcPhase::ConcurrentMark,
@@ -147,10 +165,18 @@ impl GcRuntime {
         }
     }
     pub fn set_phase(&self, p: GcPhase) {
-        self.phase.store(p as u8, Ordering::Relaxed);
+        // task 63：Release —— 建立 happens-before，使此前对颜色/累加器的写在其它线程可见。
+        self.phase.store(p as u8, Ordering::Release);
     }
     pub fn phase_is_concurrent_mark(&self) -> bool {
         self.phase.load(Ordering::Relaxed) == GcPhase::ConcurrentMark as u8
+    }
+
+    /// task 63：清空 sweep 累加器（finish_mark_termination 进入清扫前调用）。
+    pub fn clear_sweep_accumulators(&self) {
+        self.sweep_dead_old.lock().unwrap().clear();
+        self.sweep_finalizers.lock().unwrap().clear();
+        self.swept_bytes.store(0, Ordering::Relaxed);
     }
 
     /// 存入本轮 gc_managed 集合（mutator 在 Init 前调用）。

@@ -40,10 +40,12 @@ impl GcPhase {
     }
     #[allow(dead_code)]
     pub fn is_stw(self) -> bool {
-        matches!(
-            self,
-            GcPhase::Init | GcPhase::MarkTermination | GcPhase::ConcurrentSweep
-        )
+        // task 63：ConcurrentSweep 改为并发（mutator 运行）；reconcile 由独立标志触发，不靠 phase。
+        matches!(self, GcPhase::Init | GcPhase::MarkTermination)
+    }
+    /// task 63：是否处于并发清扫阶段（mutator 运行 + Coordinator 释放 White 对象）。
+    pub fn is_concurrent_sweep(self) -> bool {
+        self == GcPhase::ConcurrentSweep
     }
 }
 
@@ -218,5 +220,8 @@ mod tests {
         assert!(GcPhase::Init.is_stw());
         assert!(GcPhase::MarkTermination.is_stw());
         assert!(!GcPhase::ConcurrentMark.is_stw());
+        // task 63：ConcurrentSweep 不再是 STW（mutator 运行）。
+        assert!(!GcPhase::ConcurrentSweep.is_stw());
+        assert!(GcPhase::ConcurrentSweep.is_concurrent_sweep());
     }
 }

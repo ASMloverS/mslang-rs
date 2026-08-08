@@ -49,8 +49,10 @@ fn test_major_collect_stw_keeps_reachable() {
     // 分配 List → 经 minor 晋升 Old → STW major 标记 → 仍在栈上故存活，内容完好。
     let mut vm = VM::new();
     vm.heap_mut().promotion_age = 1; // 一次 minor 即晋升
+    let gc = vm.gc_runtime().clone();
     let live = gc::gc_alloc_list(
         vm.heap_mut(),
+        &gc,
         vec![Object::Int(10), Object::Int(20), Object::Int(30)],
     );
     vm.stack_mut().push(live.clone());
@@ -69,8 +71,9 @@ fn test_major_collect_stw_collects_unreachable_cycle() {
     // a → b → a 循环；晋升到 Old 后清空根集 → STW major 回收，Old 变空。
     let mut vm = VM::new();
     vm.heap_mut().promotion_age = 1;
-    let a = gc::gc_alloc_list(vm.heap_mut(), vec![Object::Int(1)]);
-    let b = gc::gc_alloc_list(vm.heap_mut(), vec![Object::Int(2)]);
+    let gc = vm.gc_runtime().clone();
+    let a = gc::gc_alloc_list(vm.heap_mut(), &gc, vec![Object::Int(1)]);
+    let b = gc::gc_alloc_list(vm.heap_mut(), &gc, vec![Object::Int(2)]);
     // 建立循环：a.items += [b], b.items += [a]
     unsafe {
         gc::gc_read_list_mut(ref_ptr(&a)).push(b.clone());

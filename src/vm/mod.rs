@@ -1028,6 +1028,7 @@ impl VM {
             &mut self.globals,
             &mut self.defer_stack,
             &mut self.call_stack,
+            &self.gc_runtime.card_table,
         );
         gc::major_gc(
             &mut self.heap,
@@ -1047,6 +1048,7 @@ impl VM {
             &mut self.globals,
             &mut self.defer_stack,
             &mut self.call_stack,
+            &self.gc_runtime.card_table,
         );
         gc::run_finalizers(&mut self.heap);
     }
@@ -1072,7 +1074,7 @@ impl VM {
     /// 2. 重入守卫：并发周期进行中（phase != Idle）则跳过。
     /// 3. minor 阈值 → 同步 minor GC（STW，快）。
     /// 4. major 阈值 → 并发模式异步触发 Coordinator；降级模式同步 STW major。
-    pub(crate) fn maybe_gc(&mut self) {
+    pub fn maybe_gc(&mut self) {
         self.gc_safepoint_and_finalize();
         if !self.heap.gc_enabled {
             return;
@@ -1088,6 +1090,7 @@ impl VM {
                 &mut self.globals,
                 &mut self.defer_stack,
                 &mut self.call_stack,
+                &self.gc_runtime.card_table,
             );
         }
         if self.heap.should_collect_major() {
@@ -1113,15 +1116,23 @@ impl VM {
     fn gc_safepoint_and_finalize(&mut self) {
         if self.gc_runtime.safepoint.is_requested_fast() {
             self.gc_runtime.safepoint.check_and_park();
-            // 返回后若 Coordinator 标记了 closure_pending → 执行 Mark Term + Sweep。
+            // Rendezvous #1：Mark Termination（不含 Sweep）。
             if self
                 .gc_runtime
                 .closure_pending
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
             {
-                gc::close_concurrent_cycle(self);
+                gc::finish_mark_termination(self);
             }
-            // close 设置了 finalize_pending → 执行 finalizers（mutator 线程，需 &mut VM）。
+            // Rendezvous #2：Sweep reconcile（应用 dead 集 + 回 Idle）。
+            if self
+                .gc_runtime
+                .sweep_reconcile_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                gc::reconcile_sweep(self);
+            }
+            // reconcile 设置了 finalize_pending → 执行 finalizers（mutator 线程，需 &mut VM）。
             if self
                 .gc_runtime
                 .finalize_pending
@@ -1136,7 +1147,8 @@ impl VM {
     /// VM::drop 关闭 Coordinator 前调用。Coordinator 在并发标记完成后经 safepoint 请求 STW，
     /// mutator 在此 park → 执行 close_concurrent_cycle → phase 回 Idle。否则 Coordinator
     /// 阻塞在 request_and_wait 等 mutator park，而 shutdown 的 join 等 Coordinator → 死锁。
-    fn complete_concurrent_cycle_if_pending(&mut self) {
+    /// task 63：覆盖两次 rendezvous（Mark Termination + Sweep reconcile），直至 reconcile 置 Idle。
+    pub fn complete_concurrent_cycle_if_pending(&mut self) {
         while self.gc_runtime.phase() != gc::GcPhase::Idle {
             self.gc_safepoint_and_finalize();
             // 未进入 STW（Coordinator 仍在并发标记）→ 让出 CPU 等其完成后再重试。
