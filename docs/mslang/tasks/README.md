@@ -131,7 +131,7 @@
 | # | 任务 | 状态 |
 |---|---|---|
 | 62 | [并发标记（tri-color + 写屏障）](62-concurrent-mark.md) | ✅ |
-| 63 | 并发清扫与 Compaction（待创建） | ⬜ |
+| 63 | [并发清扫与 Compaction](63-concurrent-sweep-compaction.md) | ⬜ |
 | 64 | GC 调优接口与 gc.ms 模块（待创建） | ⬜ |
 | 77 | [C API — 并发 GC 交互（并发写屏障/调优）](77-capi-concurrent-gc.md) | ⬜ |
 
