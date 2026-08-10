@@ -49,7 +49,16 @@ impl Repl {
 
         loop {
             let prompt = if self.buffer.is_empty() { "> " } else { ". " };
-            let line = self.editor.readline(prompt)?;
+            let line = match self.editor.readline(prompt) {
+                Ok(line) => line,
+                Err(ReadlineError::Interrupted) => {
+                    // Ctrl+C：取消当前输入，清空 buffer 继续读
+                    self.buffer.clear();
+                    continue;
+                }
+                Err(ReadlineError::Eof) => break,  // Ctrl+D：退出 REPL
+                Err(e) => return Err(e),
+            };
 
             if line == ":quit" { break; }
 
@@ -72,12 +81,19 @@ impl Repl {
 
 ```rust
 fn is_complete(&self) -> bool {
+    // 防止无限追加（用户持续输入未闭合块）
+    const MAX_BUFFER: usize = 64 * 1024;
+    if self.buffer.len() > MAX_BUFFER {
+        return true;  // 超限，交给执行阶段报告
+    }
+
     let source = &self.buffer;
 
     // 先词法分析，再语法分析（Parser 接收 Vec<Token>，非原始字符串）
     let tokens = match Lexer::new(source).tokenize_all() {
         Ok(tokens) => tokens,
-        Err(_) => return true,
+        Err(e) if e.is_unterminated() => return false,  // 未终结字符串/注释，继续读
+        Err(_) => return true,  // 其他词法错误，交给执行阶段报告
     };
 
     match Parser::new(tokens).parse() {
@@ -100,48 +116,65 @@ fn is_complete(&self) -> bool {
 
 ```rust
 fn evaluate_buffer(&mut self) -> Result<()> {
-    let source = &self.buffer;
+    let source = self.buffer.clone();  // clone 避免 &self.buffer 与 &mut self.vm 借用冲突
 
-    // 尝试作为表达式求值
-    if self.is_expression(source) {
-        match self.vm.eval_expression(source) {
+    // 尝试作为表达式求值（顶层为裸表达式的输入打印结果）
+    if Self::is_expression(&source) {
+        match self.vm.eval_expression(&source) {
             Ok(val) => {
                 println!("{}", val.display());
-                self.editor.add_history_entry(source);
+                self.editor.add_history_entry(&source);
             }
             Err(e) => self.print_error(&e),
         }
     } else {
-        // 作为语句执行
-        match self.vm.exec(source) {
+        // 作为语句执行（不打印返回值）
+        match self.vm.exec(&source) {
             Ok(_) => {
-                self.editor.add_history_entry(source);
+                self.editor.add_history_entry(&source);
             }
             Err(e) => self.print_error(&e),
         }
     }
     Ok(())
 }
+
+/// 判断源码顶层是否为裸表达式（而非语句）。
+/// 解析后若 Program 仅含单个 ExprStmt，则按表达式求值；
+/// 否则按语句执行（var/const/赋值/fn/class/import/defer/try/with/
+/// if/while/for/return/break/continue/throw/global/nonlocal/async 等）。
+fn is_expression(source: &str) -> bool {
+    let tokens = match Lexer::new(source).tokenize_all() {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    match Parser::new(tokens).parse() {
+        Ok(program) => program.statements.len() == 1
+            && matches!(program.statements[0], Stmt::Expr(_)),
+        Err(_) => false,
+    }
+}
+
+/// 格式化输出错误，不退出 REPL。
+/// 错误格式参照 tasks/57-error-messages.md（行号标注、高亮、堆栈跟踪）。
+fn print_error(&self, e: &Error) {
+    eprintln!("Error: {}", e);
+}
 ```
 
 表达式 vs 语句判断：
-- 如果顶层节点是表达式（不是 var/const/fn/class/if/while/for/import 等），按表达式处理
+- 解析后若 Program 仅含单个 `ExprStmt`，按表达式求值并打印结果
+- 其余一律按语句执行：`var/const/赋值/fn/class/import/defer/try/with/if/while/for/return/break/continue/throw/global/nonlocal/async` 等
 - 表达式结果使用 `display()` 格式化输出（字符串带引号）
 
 ### 4. 上下文持久化
 
-REPL 使用持久化的 VM 实例：
+REPL 使用持久化的 VM 实例（`evaluate_buffer` 定义见上文 §3）：
 
 - `self.vm` 在整个 REPL 生命周期内保持
 - 全局变量、函数、类定义在多次输入间共享
 - import 的模块被缓存，后续输入可直接使用
-
-```rust
-fn evaluate_buffer(&mut self) -> Result<()> {
-    // vm.globals 和 vm.module_resolver.cache 持久化
-    // 每次输入在同一个 VM 上执行
-}
-```
+- `vm.globals` 和 `vm.module_resolver.cache` 持久化，每次输入在同一个 VM 上执行
 
 ### 5. 行编辑（rustyline）
 
@@ -161,9 +194,20 @@ rustyline = "14"
 
 ```rust
 use rustyline::Editor;
+use rustyline::error::ReadlineError;
 use rustyline::hint::HistoryHinter;
+use rustyline::completion::Completer;
+use rustyline::highlight::Highlighter;
+use rustyline::validate::Validator;
+use rustyline::Helper;
 
 struct ReplHelper;
+
+// Helper trait 要求 Completer + Hinter + Highlighter + Validator 四者齐全
+impl Completer for ReplHelper {
+    type Candidate = String;
+    // Tab 补全：补全 vm.globals 的键与关键字表（完整实现可在后续迭代扩展）
+}
 
 impl Hinter for ReplHelper {
     type Hint = String;
@@ -171,6 +215,10 @@ impl Hinter for ReplHelper {
         HistoryHinter.hint(line, pos, ctx)
     }
 }
+
+impl Highlighter for ReplHelper {}
+impl Validator for ReplHelper {}
+impl Helper for ReplHelper {}
 ```
 
 ### 6. VM 适配
@@ -189,6 +237,8 @@ impl VM {
 
 - `exec`：编译为顶层语句，执行但不打印
 - `eval_expression`：编译为表达式，执行并返回结果
+
+> **依赖说明**：`eval_expression` 要求 Compiler 支持"表达式编译模式"（将单个表达式编译为结果压栈的字节码，而非执行后丢弃结果）。若 Phase 2 的 Compiler 仅有语句编译入口，需额外新增 `Compiler::compile_expression`，此为隐性前置依赖。
 
 ## 验证标准
 
@@ -279,8 +329,13 @@ mod tests {
 
     #[test]
     fn test_repl_multiline() {
-        let input = "fn add(a, b) {\n    return a + b\n}";
-        assert!(repl.is_complete(input));
+        let mut repl = Repl::new().unwrap();
+        // 输入未闭合的 fn 块 → 不完整
+        repl.buffer = "fn add(a, b) {".to_string();
+        assert!(!repl.is_complete());
+        // 闭合后 → 完整
+        repl.buffer = "fn add(a, b) {\n    return a + b\n}".to_string();
+        assert!(repl.is_complete());
     }
 }
 ```
