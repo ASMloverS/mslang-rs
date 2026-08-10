@@ -100,9 +100,13 @@ pub enum MsGcType {
 /// GC 统计结构（与 types.h 中 MsGcStats 对应）。
 /// task 74 在 Rust 侧匹配 types.h 手写定义（camelCase 字段）。
 /// `#[repr(C)]` 保证字段顺序与类型匹配；Rust snake_case 与 C camelCase 不影响布局。
+///
+/// task 77：新增 6 个并发 GC 指标字段，追加在末尾（前 8 字段偏移不变 → forward-compatible）。
+/// sizeof 从 64→112 字节；嵌入方若用 sizeof 做内存布局需重新编译。
 #[repr(C)]
 #[derive(Default, Clone)]
 pub struct MsGcStats {
+    // 原有字段（task 74）
     pub minor_gc_count: u64,
     pub major_gc_count: u64,
     pub total_pause_ns: u64,
@@ -111,4 +115,11 @@ pub struct MsGcStats {
     pub old_size: u64,
     pub los_size: u64,
     pub bytes_freed: u64,
+    // task 77：并发 GC 指标（全部 u64，与既有字段一致，避免 padding）
+    pub concurrent_mark_ns: u64,
+    pub concurrent_sweep_ns: u64,
+    pub init_stw_ns: u64,
+    pub term_stw_ns: u64,
+    pub gray_queue_peak: u64,
+    pub gc_threads: u64,
 }
