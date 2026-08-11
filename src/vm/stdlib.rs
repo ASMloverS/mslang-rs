@@ -4641,6 +4641,7 @@ assert(json.stringify(json.parse("-0.0")) == "-0.0")
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 测试合法使用 3.14 字面量（clippy 误报为 PI 近似）
     fn test_hash_key_valid_types() {
         assert!(hash_key(&Object::Nil).is_ok());
         assert!(hash_key(&Object::Bool(true)).is_ok());

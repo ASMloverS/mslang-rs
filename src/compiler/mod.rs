@@ -10,7 +10,7 @@ pub mod expression;
 pub mod opcode;
 pub mod statement;
 
-use crate::ast::node::{Program, Stmt};
+use crate::ast::node::{Expr, Program, Stmt};
 use crate::vm::object::Object;
 
 pub use opcode::OpCode;
@@ -462,6 +462,16 @@ impl Compiler {
                 }
             }
         }
+        self.emit_byte(OpCode::ExecDefer as u8, 0);
+        self.emit_byte(OpCode::Halt as u8, 0);
+        Ok(std::mem::take(&mut self.unit.chunk))
+    }
+
+    /// task 56：REPL 表达式编译模式。编译单个表达式为「求值后结果留栈顶」的字节码，
+    /// 顶层发 EXEC_DEFER + HALT（HALT 弹栈顶返回该值）。与 [`compile`](Self::compile)
+    /// 的区别：不发射 ExprStmt 末尾的 POP，使结果值被 HALT 返回。供 VM::eval_expression 使用。
+    pub fn compile_expression_program(&mut self, expr: &Expr) -> Result<Chunk, String> {
+        self.compile_expression(expr, 0)?;
         self.emit_byte(OpCode::ExecDefer as u8, 0);
         self.emit_byte(OpCode::Halt as u8, 0);
         Ok(std::mem::take(&mut self.unit.chunk))

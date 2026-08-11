@@ -27,7 +27,20 @@ fn main() {
     match cli.command {
         Some(Commands::Run { file: _ }) => {}
         Some(Commands::Eval { expr: _ }) => {}
-        Some(Commands::Repl) => {}
+        Some(Commands::Repl) => {
+            match mslang::repl::Repl::new() {
+                Ok(mut repl) => {
+                    if let Err(e) = repl.run() {
+                        eprintln!("REPL error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("failed to start REPL: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
         Some(Commands::Check { file: _ }) => {}
         None => {
             use clap::CommandFactory;

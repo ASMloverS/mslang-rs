@@ -1277,6 +1277,21 @@ impl Object {
         }
     }
 
+    /// task 56：REPL 友好的显示字符串。字符串值加引号（参照 56-repl.md §3「字符串带引号」）；
+    /// 其余类型与 [`Display`](std::fmt::Display) 一致。
+    pub fn display(&self) -> String {
+        if let Object::Ref(ptr) = self {
+            debug_assert!(!ptr.is_null(), "null Object::Ref");
+            // SAFETY: 调用方保证 Ref 指针指向有效 MsObjHeader。
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::STRING as u8 {
+                // SAFETY: type_tag 为 STRING，指针由 alloc_string 分配。
+                return format!("\"{}\"", unsafe { read_str(*ptr) });
+            }
+        }
+        format!("{}", self)
+    }
+
     /// 类型名称。引用 02-types.md。
     pub fn type_name(&self) -> &'static str {
         match self {

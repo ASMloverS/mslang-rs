@@ -515,6 +515,55 @@ impl VM {
         self.event_loop_run()
     }
 
+    // ---- task 56：REPL 支持 ----
+
+    /// 重置瞬时执行状态（值栈/调用栈/defer/异常/事件循环等），保留 globals、
+    /// module_resolver、内置函数与 GC 堆。REPL 每次输入前调用，使多次输入共享
+    /// 上下文且能从运行时错误中恢复（错误后栈/帧处于中间态，须清空后再运行）。
+    fn reset_execution_state(&mut self) {
+        self.stack = vec![Object::Nil];
+        self.call_stack.clear();
+        self.open_upvalues.clear();
+        self.defer_stack.clear();
+        self.exception_handlers.clear();
+        self.pending_unwind = None;
+        self.gen_outcome = None;
+        self.gen_call_method = None;
+        self.event_loop.ready_queue.clear();
+        self.event_loop.paused.clear();
+        self.yield_future = None;
+        self.yield_channel = None;
+        self.yield_join = None;
+        self.current_coro_handle = None;
+        self.last_uncaught_exception = None;
+    }
+
+    /// task 56：执行语句（不返回值）。供 REPL 顶层 var/fn/class/import/控制流等使用。
+    ///
+    /// 以 **module 模式**编译：顶层声明（var/const/`:=`/fn/class）经 STORE_GLOBAL 落入
+    /// `self.globals`，使 REPL 多次输入间共享上下文（见 56-repl.md §4）。
+    pub fn exec(&mut self, source: &str) -> Result<(), String> {
+        self.reset_execution_state();
+        let program = parse_source(source)?;
+        let mut compiler = crate::compiler::Compiler::new();
+        compiler.set_module_mode(true);
+        let chunk = compiler.compile(&program)?;
+        self.interpret(chunk).map(|_| ())
+    }
+
+    /// task 56：求值表达式并返回结果。要求源码顶层为单个裸表达式（ExprStmt），
+    /// 否则返回错误。结果经 HALT 弹栈返回（见 Compiler::compile_expression_program）。
+    pub fn eval_expression(&mut self, source: &str) -> Result<Object, String> {
+        self.reset_execution_state();
+        let program = parse_source(source)?;
+        let expr = match program.statements.as_slice() {
+            [crate::ast::Stmt::ExprStmt { expr }] => expr,
+            _ => return Err("not a single expression".to_string()),
+        };
+        let chunk = crate::compiler::Compiler::new().compile_expression_program(expr)?;
+        self.interpret(chunk)
+    }
+
     // ---- task 53：async/await 事件循环 ----
 
     /// 将当前 VM 执行状态提取为 Coroutine（move 语义，VM 字段被清空）。
@@ -5175,6 +5224,16 @@ impl Default for VM {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// task 56：lex + parse 辅助。返回语法错误的字符串形式（与 VM 运行时错误类型一致）。
+fn parse_source(source: &str) -> Result<crate::ast::Program, String> {
+    let tokens = crate::lexer::Lexer::new(source)
+        .tokenize_all()
+        .map_err(|e| format!("{}", e))?;
+    crate::parser::Parser::new(tokens)
+        .parse()
+        .map_err(|e| format!("{}", e))
 }
 
 #[cfg(test)]
