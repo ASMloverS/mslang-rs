@@ -5,7 +5,9 @@
 //!
 //! 参照 [19-compile-statements](../../../docs/mslang/tasks/19-compile-statements.md)。
 
-use crate::ast::node::{AssignOp, BinaryOp, ExceptClause, Expr, SelectCase, SelectOp, Stmt, UnaryOp};
+use crate::ast::node::{
+    AssignOp, BinaryOp, ExceptClause, Expr, SelectCase, SelectOp, Stmt, UnaryOp,
+};
 use crate::vm::object::{alloc_function, alloc_string, Function};
 
 use super::{CompilationUnit, Compiler, Local, OpCode};
@@ -14,72 +16,94 @@ use super::{CompilationUnit, Compiler, Local, OpCode};
 
 impl Compiler {
     /// 语句编译入口。根据 Stmt 变体路由到对应编译方法。
-    pub fn compile_statement(&mut self, stmt: &Stmt, line: usize) -> Result<(), String> {
+    /// task 57：使用 stmt.line()（AST 携带的源码行号）覆盖传入的 line，使每条
+    /// 语句的字节码记录真实行号（行号表 §1）。
+    pub fn compile_statement(&mut self, stmt: &Stmt, _passed_line: usize) -> Result<(), String> {
+        let line = stmt.line();
         match stmt {
-            Stmt::VarDecl { name, initializer } | Stmt::ShortVarDecl { name, initializer } => {
-                self.compile_var_decl(name, initializer, false, line)
+            Stmt::VarDecl {
+                name, initializer, ..
             }
-            Stmt::ConstDecl { name, initializer } => {
-                self.compile_var_decl(name, initializer, true, line)
-            }
-            Stmt::Assign { target, op, value } => self.compile_assign_stmt(target, op, value, line),
-            Stmt::ExprStmt { expr } => self.compile_expr_stmt(expr, line),
-            Stmt::Block { statements } => self.compile_block(statements, line),
+            | Stmt::ShortVarDecl {
+                name, initializer, ..
+            } => self.compile_var_decl(name, initializer, false, line),
+            Stmt::ConstDecl {
+                name, initializer, ..
+            } => self.compile_var_decl(name, initializer, true, line),
+            Stmt::Assign {
+                target, op, value, ..
+            } => self.compile_assign_stmt(target, op, value, line),
+            Stmt::ExprStmt { expr, .. } => self.compile_expr_stmt(expr, line),
+            Stmt::Block { statements, .. } => self.compile_block(statements, line),
             Stmt::If {
                 condition,
                 then_block,
                 elif_clauses,
                 else_block,
+                ..
             } => self.compile_if(condition, then_block, elif_clauses, else_block, line),
-            Stmt::While { condition, body } => self.compile_while(condition, body, line),
+            Stmt::While {
+                condition, body, ..
+            } => self.compile_while(condition, body, line),
             Stmt::ForIn {
                 variable,
                 second_variable,
                 iterable,
                 body,
+                ..
             } => self.compile_for_in(variable, second_variable.as_deref(), iterable, body, line),
-            Stmt::Break => self.compile_break(line),
-            Stmt::Continue => self.compile_continue(line),
-            Stmt::Return { values } => self.compile_return(values, line),
-            Stmt::Nonlocal { names } => self.compile_nonlocal(names, line),
-            Stmt::Global { names } => self.compile_global(names, line),
+            Stmt::Break { .. } => self.compile_break(line),
+            Stmt::Continue { .. } => self.compile_continue(line),
+            Stmt::Return { values, .. } => self.compile_return(values, line),
+            Stmt::Nonlocal { names, .. } => self.compile_nonlocal(names, line),
+            Stmt::Global { names, .. } => self.compile_global(names, line),
             Stmt::FnDecl {
-                name, params, body, is_async, ..
+                name,
+                params,
+                body,
+                is_async,
+                ..
             } => self.compile_fn_decl(name, params, body, *is_async, line),
             Stmt::ClassDecl {
                 name,
                 parent,
                 methods,
                 class_vars,
+                ..
             } => self.compile_class_decl(name, parent, methods, class_vars, line),
-            Stmt::Defer { expr } => self.compile_defer(expr, line),
+            Stmt::Defer { expr, .. } => self.compile_defer(expr, line),
             Stmt::Try {
                 try_block,
                 except_clauses,
                 finally_block,
+                ..
             } => self.compile_try(try_block, except_clauses, finally_block, line),
             Stmt::With {
                 expression,
                 alias,
                 body,
+                ..
             } => self.compile_with(expression, alias, body, line),
             Stmt::Import {
                 module_path,
                 alias,
                 is_stdlib,
+                ..
             } => self.compile_import(module_path, alias, *is_stdlib, line),
             Stmt::FromImport {
                 module_path,
                 targets,
                 is_stdlib,
+                ..
             } => self.compile_from_import(module_path, targets, *is_stdlib, line),
-            Stmt::Throw { expr } => self.compile_throw(expr, line),
-            Stmt::Decorated { decorators, target } => {
-                self.compile_decorated(decorators, target, line)
-            }
+            Stmt::Throw { expr, .. } => self.compile_throw(expr, line),
+            Stmt::Decorated {
+                decorators, target, ..
+            } => self.compile_decorated(decorators, target, line),
             Stmt::Select {
                 cases,
                 default_block,
+                ..
             } => self.compile_select(cases, default_block, line),
         }
     }
@@ -103,7 +127,12 @@ impl Compiler {
     }
 
     /// 发射 IMPORT module_idx(2)，将 Module 对象压栈。
-    fn emit_import(&mut self, module_path: &[String], is_stdlib: bool, line: usize) -> Result<(), String> {
+    fn emit_import(
+        &mut self,
+        module_path: &[String],
+        is_stdlib: bool,
+        line: usize,
+    ) -> Result<(), String> {
         let idx = self.module_const_idx(module_path, is_stdlib)?;
         self.emit_byte(OpCode::Import as u8, line);
         self.emit_bytes(&idx.to_be_bytes(), line);
@@ -423,6 +452,7 @@ impl Compiler {
             is_generator: func_unit.is_generator,
             locals_count: func_unit.locals.len(),
             is_async,
+            lines: func_unit.chunk.lines,
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)

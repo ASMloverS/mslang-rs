@@ -20,7 +20,11 @@ impl Parser {
         self.expect(TokenKind::Equal, "expected '=' after variable name")?;
         let initializer = self.parse_expression()?;
         self.consume_newline();
-        Ok(Stmt::VarDecl { name, initializer })
+        Ok(Stmt::VarDecl {
+            name,
+            initializer,
+            line: 0,
+        })
     }
 
     pub(super) fn parse_const_decl(&mut self) -> Result<Stmt> {
@@ -29,7 +33,11 @@ impl Parser {
         self.expect(TokenKind::Equal, "expected '=' after constant name")?;
         let initializer = self.parse_expression()?;
         self.consume_newline();
-        Ok(Stmt::ConstDecl { name, initializer })
+        Ok(Stmt::ConstDecl {
+            name,
+            initializer,
+            line: 0,
+        })
     }
 
     // ---- 赋值 / 短声明 / 表达式语句 ----
@@ -52,6 +60,7 @@ impl Parser {
                 return Ok(Stmt::ShortVarDecl {
                     name,
                     initializer: value,
+                    line: 0,
                 });
             }
             let tok = self.previous();
@@ -79,6 +88,7 @@ impl Parser {
                     return Ok(Stmt::VarDecl {
                         name,
                         initializer: *value,
+                        line: 0,
                     });
                 }
             }
@@ -86,11 +96,12 @@ impl Parser {
                 target: *target,
                 op,
                 value: *value,
+                line: 0,
             });
         }
 
         self.consume_newline();
-        Ok(Stmt::ExprStmt { expr })
+        Ok(Stmt::ExprStmt { expr, line: 0 })
     }
 
     /// 多目标赋值：first_target 为已解析的第一个目标。
@@ -126,6 +137,7 @@ impl Parser {
             target: Expr::TupleLiteral { elements: targets },
             op: AssignOp::Assign,
             value: Expr::TupleLiteral { elements: values },
+            line: 0,
         })
     }
 
@@ -164,6 +176,7 @@ impl Parser {
             then_block,
             elif_clauses,
             else_block,
+            line: 0,
         })
     }
 
@@ -171,7 +184,11 @@ impl Parser {
         self.advance(); // consume 'while'
         let condition = self.parse_expression()?;
         let body = self.parse_block()?;
-        Ok(Stmt::While { condition, body })
+        Ok(Stmt::While {
+            condition,
+            body,
+            line: 0,
+        })
     }
 
     pub(super) fn parse_for(&mut self) -> Result<Stmt> {
@@ -194,6 +211,7 @@ impl Parser {
             second_variable,
             iterable,
             body,
+            line: 0,
         })
     }
 
@@ -212,7 +230,7 @@ impl Parser {
         }
 
         self.consume_newline();
-        Ok(Stmt::Return { values })
+        Ok(Stmt::Return { values, line: 0 })
     }
 
     // ---- 函数声明 ----
@@ -222,7 +240,7 @@ impl Parser {
         if self.is_fn_literal() {
             let expr = self.parse_expression()?;
             self.consume_newline();
-            Ok(Stmt::ExprStmt { expr })
+            Ok(Stmt::ExprStmt { expr, line: 0 })
         } else {
             self.parse_fn_decl()
         }
@@ -241,6 +259,7 @@ impl Parser {
             params,
             body,
             is_async: false,
+            line: 0,
         })
     }
 
@@ -343,6 +362,7 @@ impl Parser {
         Ok(Stmt::Decorated {
             decorators,
             target: Box::new(stmt),
+            line: 0,
         })
     }
 
@@ -352,6 +372,7 @@ impl Parser {
         self.advance(); // consume 'nonlocal'
         Ok(Stmt::Nonlocal {
             names: self.parse_name_list("expected identifier after 'nonlocal'")?,
+            line: 0,
         })
     }
 
@@ -359,6 +380,7 @@ impl Parser {
         self.advance(); // consume 'global'
         Ok(Stmt::Global {
             names: self.parse_name_list("expected identifier after 'global'")?,
+            line: 0,
         })
     }
 
@@ -399,7 +421,7 @@ impl Parser {
         self.advance(); // consume 'defer'
         let expr = self.parse_expression()?;
         self.consume_newline();
-        Ok(Stmt::Defer { expr })
+        Ok(Stmt::Defer { expr, line: 0 })
     }
 
     pub(super) fn parse_try(&mut self) -> Result<Stmt> {
@@ -454,6 +476,7 @@ impl Parser {
             try_block,
             except_clauses,
             finally_block,
+            line: 0,
         })
     }
 
@@ -464,12 +487,18 @@ impl Parser {
         if self.check(&TokenKind::Newline) || self.check(&TokenKind::RightBrace) || self.is_at_end()
         {
             self.consume_newline();
-            return Ok(Stmt::Throw { expr: None });
+            return Ok(Stmt::Throw {
+                expr: None,
+                line: 0,
+            });
         }
 
         let expr = self.parse_expression()?;
         self.consume_newline();
-        Ok(Stmt::Throw { expr: Some(expr) })
+        Ok(Stmt::Throw {
+            expr: Some(expr),
+            line: 0,
+        })
     }
 
     pub(super) fn parse_with(&mut self) -> Result<Stmt> {
@@ -487,6 +516,7 @@ impl Parser {
             expression,
             alias,
             body,
+            line: 0,
         })
     }
 
@@ -530,6 +560,7 @@ impl Parser {
             parent,
             methods,
             class_vars,
+            line: 0,
         })
     }
 
@@ -545,6 +576,7 @@ impl Parser {
             params,
             body,
             is_async: false,
+            line: 0,
         })
     }
 
@@ -586,6 +618,7 @@ impl Parser {
             module_path,
             alias,
             is_stdlib,
+            line: 0,
         })
     }
 
@@ -629,6 +662,7 @@ impl Parser {
             module_path,
             targets,
             is_stdlib,
+            line: 0,
         })
     }
 
@@ -703,6 +737,7 @@ impl Parser {
         Ok(Stmt::Select {
             cases,
             default_block,
+            line: 0,
         })
     }
 
@@ -862,7 +897,7 @@ mod tests {
         let prog = parse("for i in x {\n    break\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::ForIn { body, .. } => {
-                assert!(matches!(body[0], Stmt::Break));
+                assert!(matches!(body[0], Stmt::Break { .. }));
             }
             _ => panic!("expected for"),
         }
@@ -873,7 +908,7 @@ mod tests {
         let prog = parse("fn f() {\n    return\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => {
-                assert!(matches!(&body[0], Stmt::Return { values } if values.is_empty()));
+                assert!(matches!(&body[0], Stmt::Return { values, .. } if values.is_empty()));
             }
             _ => panic!("expected fn"),
         }
@@ -884,7 +919,7 @@ mod tests {
         let prog = parse("fn f() {\n    return 1, 2, 3\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => match &body[0] {
-                Stmt::Return { values } => assert_eq!(values.len(), 3),
+                Stmt::Return { values, .. } => assert_eq!(values.len(), 3),
                 _ => panic!("expected return"),
             },
             _ => panic!("expected fn"),
@@ -938,6 +973,7 @@ mod tests {
                 target,
                 op: AssignOp::Assign,
                 value,
+                ..
             } => {
                 assert!(matches!(target, Expr::TupleLiteral { elements } if elements.len() == 2));
                 assert!(matches!(value, Expr::TupleLiteral { elements } if elements.len() == 2));
@@ -963,7 +999,7 @@ mod tests {
         let prog = parse("fn f() {\n    nonlocal x, y\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => {
-                assert!(matches!(&body[0], Stmt::Nonlocal { names } if names.len() == 2));
+                assert!(matches!(&body[0], Stmt::Nonlocal { names, .. } if names.len() == 2));
             }
             _ => panic!("expected fn"),
         }
@@ -974,7 +1010,7 @@ mod tests {
         let prog = parse("fn f() {\n    global counter\n}\n").unwrap();
         match &prog.statements[0] {
             Stmt::FnDecl { body, .. } => {
-                assert!(matches!(&body[0], Stmt::Global { names } if names.len() == 1));
+                assert!(matches!(&body[0], Stmt::Global { names, .. } if names.len() == 1));
             }
             _ => panic!("expected fn"),
         }
@@ -1008,6 +1044,7 @@ mod tests {
                 parent,
                 methods,
                 class_vars,
+                ..
             } => {
                 assert_eq!(name, "Animal");
                 assert!(parent.is_none());
@@ -1058,6 +1095,7 @@ mod tests {
                 try_block,
                 except_clauses,
                 finally_block,
+                ..
             } => {
                 assert_eq!(try_block.len(), 1);
                 assert_eq!(except_clauses.len(), 1);
@@ -1102,6 +1140,7 @@ mod tests {
                 expression: _,
                 alias,
                 body,
+                ..
             } => {
                 assert!(alias.as_deref() == Some("f"));
                 assert_eq!(body.len(), 1);
@@ -1130,7 +1169,8 @@ mod tests {
                 assert!(matches!(
                     &body[0],
                     Stmt::ExprStmt {
-                        expr: Expr::Yield { value: Some(_) }
+                        expr: Expr::Yield { value: Some(_) },
+                        ..
                     }
                 ));
             }
@@ -1146,7 +1186,8 @@ mod tests {
                 assert!(matches!(
                     &body[0],
                     Stmt::ExprStmt {
-                        expr: Expr::YieldFrom { .. }
+                        expr: Expr::YieldFrom { .. },
+                        ..
                     }
                 ));
             }
@@ -1162,7 +1203,8 @@ mod tests {
                 assert!(matches!(
                     &body[0],
                     Stmt::ExprStmt {
-                        expr: Expr::Yield { value: None }
+                        expr: Expr::Yield { value: None },
+                        ..
                     }
                 ));
             }
@@ -1188,6 +1230,7 @@ mod tests {
         match &prog.statements[0] {
             Stmt::ExprStmt {
                 expr: Expr::Go { .. },
+                ..
             } => {}
             _ => panic!("expected go expression"),
         }
@@ -1229,7 +1272,9 @@ mod tests {
     fn test_decorator_basic() {
         let prog = parse("@log\nfn double(x) {\n    return x * 2\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::Decorated { decorators, target } => {
+            Stmt::Decorated {
+                decorators, target, ..
+            } => {
                 assert_eq!(decorators.len(), 1);
                 assert!(matches!(&decorators[0], Expr::Identifier(n) if n == "log"));
                 assert!(matches!(target.as_ref(), Stmt::FnDecl { name, .. } if name == "double"));
@@ -1242,7 +1287,9 @@ mod tests {
     fn test_decorator_multiple() {
         let prog = parse("@d1\n@d2\nfn greet() {\n    return \"hi\"\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::Decorated { decorators, target } => {
+            Stmt::Decorated {
+                decorators, target, ..
+            } => {
                 // decorators[0] = d1 (outermost), decorators[1] = d2 (innermost)
                 assert_eq!(decorators.len(), 2);
                 assert!(matches!(&decorators[0], Expr::Identifier(n) if n == "d1"));
@@ -1270,7 +1317,9 @@ mod tests {
     fn test_decorator_class() {
         let prog = parse("@add_greet\nclass Foo {\n    fn __init__(self) {}\n}\n").unwrap();
         match &prog.statements[0] {
-            Stmt::Decorated { decorators, target } => {
+            Stmt::Decorated {
+                decorators, target, ..
+            } => {
                 assert_eq!(decorators.len(), 1);
                 assert!(matches!(&decorators[0], Expr::Identifier(n) if n == "add_greet"));
                 assert!(matches!(target.as_ref(), Stmt::ClassDecl { name, .. } if name == "Foo"));
@@ -1320,6 +1369,7 @@ mod tests {
             Stmt::Select {
                 cases,
                 default_block,
+                ..
             } => {
                 assert_eq!(cases.len(), 1);
                 assert!(matches!(
@@ -1340,6 +1390,7 @@ mod tests {
             Stmt::Select {
                 cases,
                 default_block,
+                ..
             } => {
                 assert_eq!(cases.len(), 1);
                 assert!(matches!(
@@ -1360,6 +1411,7 @@ mod tests {
             Stmt::Select {
                 cases,
                 default_block,
+                ..
             } => {
                 assert!(cases.is_empty());
                 assert!(default_block.is_none());

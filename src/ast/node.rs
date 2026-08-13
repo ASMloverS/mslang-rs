@@ -79,101 +79,127 @@ pub enum Stmt {
     VarDecl {
         name: String,
         initializer: Expr,
+        line: usize,
     },
     ShortVarDecl {
         name: String,
         initializer: Expr,
+        line: usize,
     },
     ConstDecl {
         name: String,
         initializer: Expr,
+        line: usize,
     },
     Assign {
         target: Expr,
         op: AssignOp,
         value: Expr,
+        line: usize,
     },
     ExprStmt {
         expr: Expr,
+        line: usize,
     },
     Block {
         statements: Vec<Stmt>,
+        line: usize,
     },
     If {
         condition: Expr,
         then_block: Vec<Stmt>,
         elif_clauses: Vec<(Expr, Vec<Stmt>)>,
         else_block: Option<Vec<Stmt>>,
+        line: usize,
     },
     While {
         condition: Expr,
         body: Vec<Stmt>,
+        line: usize,
     },
     ForIn {
         variable: String,
         second_variable: Option<String>,
         iterable: Expr,
         body: Vec<Stmt>,
+        line: usize,
     },
-    Break,
-    Continue,
+    Break {
+        line: usize,
+    },
+    Continue {
+        line: usize,
+    },
     Return {
         values: Vec<Expr>,
+        line: usize,
     },
     FnDecl {
         name: String,
         params: Vec<Param>,
         body: Vec<Stmt>,
         is_async: bool,
+        line: usize,
     },
     ClassDecl {
         name: String,
         parent: Option<String>,
         methods: Vec<Stmt>,
         class_vars: Vec<(String, Expr)>,
+        line: usize,
     },
     Defer {
         expr: Expr,
+        line: usize,
     },
     Try {
         try_block: Vec<Stmt>,
         except_clauses: Vec<ExceptClause>,
         finally_block: Option<Vec<Stmt>>,
+        line: usize,
     },
     With {
         expression: Expr,
         alias: Option<String>,
         body: Vec<Stmt>,
+        line: usize,
     },
     Import {
         module_path: Vec<String>,
         alias: Option<String>,
         is_stdlib: bool,
+        line: usize,
     },
     FromImport {
         module_path: Vec<String>,
         targets: Vec<(String, Option<String>)>,
         is_stdlib: bool,
+        line: usize,
     },
     Throw {
         expr: Option<Expr>,
+        line: usize,
     },
     Nonlocal {
         names: Vec<String>,
+        line: usize,
     },
     Global {
         names: Vec<String>,
+        line: usize,
     },
     /// task 44：装饰器。`decorators` 从上到下存储（decorators[0] 最外层），
     /// `target` 为 FnDecl 或 ClassDecl。无装饰器时解析器直接返回裸 target，不经此变体。
     Decorated {
         decorators: Vec<Expr>,
         target: Box<Stmt>,
+        line: usize,
     },
     /// task 59：select 语句（多 channel 复用）。
     Select {
         cases: Vec<SelectCase>,
         default_block: Option<Vec<Stmt>>,
+        line: usize,
     },
 }
 
@@ -188,15 +214,9 @@ pub struct SelectCase {
 #[derive(Debug, Clone)]
 pub enum SelectOp {
     /// 接收：`target = <-channel`
-    Receive {
-        channel: String,
-        target: String,
-    },
+    Receive { channel: String, target: String },
     /// 发送：`channel <- value`
-    Send {
-        channel: String,
-        value: Expr,
-    },
+    Send { channel: String, value: Expr },
 }
 
 impl Stmt {
@@ -206,6 +226,67 @@ impl Stmt {
         match self {
             Stmt::FnDecl { name, .. } | Stmt::ClassDecl { name, .. } => Some(name),
             _ => None,
+        }
+    }
+
+    /// task 57：设置语句的源码行号。由 parse_statement 在分派子解析器后统一调用，
+    /// 使每条语句携带其首 token 的行号（行号表构建 §1）。各子解析器构造时填 line: 0。
+    pub fn set_line(&mut self, line: usize) {
+        match self {
+            Stmt::VarDecl { line: l, .. }
+            | Stmt::ShortVarDecl { line: l, .. }
+            | Stmt::ConstDecl { line: l, .. }
+            | Stmt::Assign { line: l, .. }
+            | Stmt::ExprStmt { line: l, .. }
+            | Stmt::Block { line: l, .. }
+            | Stmt::If { line: l, .. }
+            | Stmt::While { line: l, .. }
+            | Stmt::ForIn { line: l, .. }
+            | Stmt::Break { line: l }
+            | Stmt::Continue { line: l }
+            | Stmt::Return { line: l, .. }
+            | Stmt::FnDecl { line: l, .. }
+            | Stmt::ClassDecl { line: l, .. }
+            | Stmt::Defer { line: l, .. }
+            | Stmt::Try { line: l, .. }
+            | Stmt::With { line: l, .. }
+            | Stmt::Import { line: l, .. }
+            | Stmt::FromImport { line: l, .. }
+            | Stmt::Throw { line: l, .. }
+            | Stmt::Nonlocal { line: l, .. }
+            | Stmt::Global { line: l, .. }
+            | Stmt::Decorated { line: l, .. }
+            | Stmt::Select { line: l, .. } => *l = line,
+        }
+    }
+
+    /// task 57：返回语句的源码行号。
+    pub fn line(&self) -> usize {
+        match self {
+            Stmt::VarDecl { line, .. }
+            | Stmt::ShortVarDecl { line, .. }
+            | Stmt::ConstDecl { line, .. }
+            | Stmt::Assign { line, .. }
+            | Stmt::ExprStmt { line, .. }
+            | Stmt::Block { line, .. }
+            | Stmt::If { line, .. }
+            | Stmt::While { line, .. }
+            | Stmt::ForIn { line, .. }
+            | Stmt::Break { line }
+            | Stmt::Continue { line }
+            | Stmt::Return { line, .. }
+            | Stmt::FnDecl { line, .. }
+            | Stmt::ClassDecl { line, .. }
+            | Stmt::Defer { line, .. }
+            | Stmt::Try { line, .. }
+            | Stmt::With { line, .. }
+            | Stmt::Import { line, .. }
+            | Stmt::FromImport { line, .. }
+            | Stmt::Throw { line, .. }
+            | Stmt::Nonlocal { line, .. }
+            | Stmt::Global { line, .. }
+            | Stmt::Decorated { line, .. }
+            | Stmt::Select { line, .. } => *line,
         }
     }
 }
@@ -484,20 +565,28 @@ impl std::fmt::Display for Expr {
 impl std::fmt::Display for Stmt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Stmt::VarDecl { name, initializer } => {
+            Stmt::VarDecl {
+                name, initializer, ..
+            } => {
                 write!(f, "var {} = {}", name, initializer)
             }
-            Stmt::ShortVarDecl { name, initializer } => {
+            Stmt::ShortVarDecl {
+                name, initializer, ..
+            } => {
                 write!(f, "{} := {}", name, initializer)
             }
-            Stmt::ConstDecl { name, initializer } => {
+            Stmt::ConstDecl {
+                name, initializer, ..
+            } => {
                 write!(f, "const {} = {}", name, initializer)
             }
-            Stmt::Assign { target, op, value } => {
+            Stmt::Assign {
+                target, op, value, ..
+            } => {
                 write!(f, "{} {} {}", target, op, value)
             }
-            Stmt::ExprStmt { expr } => write!(f, "{}", expr),
-            Stmt::Block { statements } => {
+            Stmt::ExprStmt { expr, .. } => write!(f, "{}", expr),
+            Stmt::Block { statements, .. } => {
                 if statements.is_empty() {
                     return write!(f, "{{}}");
                 }
@@ -509,6 +598,7 @@ impl std::fmt::Display for Stmt {
                 then_block,
                 elif_clauses,
                 else_block,
+                ..
             } => {
                 let body: Vec<_> = then_block.iter().map(|s| format!("{}", s)).collect();
                 write!(f, "if {} {{\n{}\n}}", condition, body.join("\n"))?;
@@ -522,7 +612,9 @@ impl std::fmt::Display for Stmt {
                 }
                 Ok(())
             }
-            Stmt::While { condition, body } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 let b: Vec<_> = body.iter().map(|s| format!("{}", s)).collect();
                 write!(f, "while {} {{\n{}\n}}", condition, b.join("\n"))
             }
@@ -531,6 +623,7 @@ impl std::fmt::Display for Stmt {
                 second_variable,
                 iterable,
                 body,
+                ..
             } => {
                 let b: Vec<_> = body.iter().map(|s| format!("{}", s)).collect();
                 match second_variable {
@@ -551,9 +644,9 @@ impl std::fmt::Display for Stmt {
                     ),
                 }
             }
-            Stmt::Break => write!(f, "break"),
-            Stmt::Continue => write!(f, "continue"),
-            Stmt::Return { values } => {
+            Stmt::Break { .. } => write!(f, "break"),
+            Stmt::Continue { .. } => write!(f, "continue"),
+            Stmt::Return { values, .. } => {
                 if values.is_empty() {
                     write!(f, "return")
                 } else {
@@ -566,6 +659,7 @@ impl std::fmt::Display for Stmt {
                 params,
                 body,
                 is_async,
+                ..
             } => {
                 let prefix = if *is_async { "async " } else { "" };
                 let ps: Vec<_> = params.iter().map(|p| p.name.clone()).collect();
@@ -584,6 +678,7 @@ impl std::fmt::Display for Stmt {
                 parent,
                 methods,
                 class_vars: _,
+                ..
             } => {
                 let parent_str = match parent {
                     Some(p) => format!(" < {}", p),
@@ -592,11 +687,12 @@ impl std::fmt::Display for Stmt {
                 let ms: Vec<_> = methods.iter().map(|s| format!("{}", s)).collect();
                 write!(f, "class {}{} {{\n{}\n}}", name, parent_str, ms.join("\n"))
             }
-            Stmt::Defer { expr } => write!(f, "defer {}", expr),
+            Stmt::Defer { expr, .. } => write!(f, "defer {}", expr),
             Stmt::Try {
                 try_block,
                 except_clauses,
                 finally_block,
+                ..
             } => {
                 let tb: Vec<_> = try_block.iter().map(|s| format!("{}", s)).collect();
                 write!(f, "try {{\n{}\n}}", tb.join("\n"))?;
@@ -627,6 +723,7 @@ impl std::fmt::Display for Stmt {
                 expression,
                 alias,
                 body,
+                ..
             } => {
                 let b: Vec<_> = body.iter().map(|s| format!("{}", s)).collect();
                 match alias {
@@ -658,13 +755,15 @@ impl std::fmt::Display for Stmt {
                     .collect();
                 write!(f, "from {} import {}", path, ts.join(", "))
             }
-            Stmt::Throw { expr } => match expr {
+            Stmt::Throw { expr, .. } => match expr {
                 Some(e) => write!(f, "throw {}", e),
                 None => write!(f, "throw"),
             },
-            Stmt::Nonlocal { names } => write!(f, "nonlocal {}", names.join(", ")),
-            Stmt::Global { names } => write!(f, "global {}", names.join(", ")),
-            Stmt::Decorated { decorators, target } => {
+            Stmt::Nonlocal { names, .. } => write!(f, "nonlocal {}", names.join(", ")),
+            Stmt::Global { names, .. } => write!(f, "global {}", names.join(", ")),
+            Stmt::Decorated {
+                decorators, target, ..
+            } => {
                 for dec in decorators {
                     writeln!(f, "@{}", dec)?;
                 }
@@ -673,6 +772,7 @@ impl std::fmt::Display for Stmt {
             Stmt::Select {
                 cases,
                 default_block,
+                ..
             } => {
                 write!(f, "select {{\n")?;
                 for case in cases {
@@ -861,6 +961,7 @@ mod tests {
         let stmt = Stmt::VarDecl {
             name: "x".into(),
             initializer: Expr::Literal(Literal::Int(42)),
+            line: 0,
         };
         assert_eq!(format!("{}", stmt), "var x = 42");
     }
@@ -874,9 +975,11 @@ mod tests {
                     callee: Box::new(Expr::Identifier("print".into())),
                     args: vec![Expr::Literal(Literal::String("yes".into()))],
                 },
+                line: 0,
             }],
             elif_clauses: vec![],
             else_block: None,
+            line: 0,
         };
         let s = format!("{}", stmt);
         assert!(s.starts_with("if x"));
@@ -905,8 +1008,10 @@ mod tests {
                     op: BinaryOp::Add,
                     right: Box::new(Expr::Identifier("b".into())),
                 }],
+                line: 0,
             }],
             is_async: false,
+            line: 0,
         };
         let s = format!("{}", stmt);
         assert!(s.contains("fn add(a, b)"));
@@ -927,7 +1032,9 @@ mod tests {
                     callee: Box::new(Expr::Identifier("print".into())),
                     args: vec![Expr::Identifier("i".into())],
                 },
+                line: 0,
             }],
+            line: 0,
         };
         let s = format!("{}", stmt);
         assert!(s.contains("for i in"));
@@ -939,6 +1046,7 @@ mod tests {
             module_path: vec!["os".into(), "path".into()],
             alias: Some("pathutil".into()),
             is_stdlib: false,
+            line: 0,
         };
         assert_eq!(format!("{}", stmt), "import os.path as pathutil");
     }
@@ -950,10 +1058,12 @@ mod tests {
                 Stmt::VarDecl {
                     name: "x".into(),
                     initializer: Expr::Literal(Literal::Int(1)),
+                    line: 0,
                 },
                 Stmt::VarDecl {
                     name: "y".into(),
                     initializer: Expr::Literal(Literal::Int(2)),
+                    line: 0,
                 },
             ],
         };

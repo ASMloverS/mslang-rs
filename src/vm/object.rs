@@ -524,6 +524,10 @@ pub struct Function {
     pub locals_count: usize,
     /// task 53：是否为 async fn。CALL 时据此创建 Future + Coroutine 而非直接压帧。
     pub is_async: bool,
+    /// task 57：行号表（指令偏移, 源码行号），由编译单元 chunk.lines 迁入。
+    /// VM 据此做 ip→line 反查，构建堆栈跟踪（§1.1）。Vec<(usize,usize)> 不持
+    /// Object 引用，GC trace 无需扫描。
+    pub lines: Vec<(usize, usize)>,
 }
 
 impl Function {
@@ -541,6 +545,7 @@ impl Function {
             is_generator: false,
             locals_count: 1,
             is_async: false,
+            lines: Vec::new(),
         }
     }
 }
@@ -1122,7 +1127,11 @@ pub fn alloc_module(name: &str) -> Object {
 /// `ptr` 必须指向由 `alloc_module` 分配的、在 `'a` 期间有效的 `MsModule`。
 /// 生命周期由调用方约束（`'a`），**不得**用 `'static` — 遵循 task 20 read_* 约定。
 pub unsafe fn read_module<'a>(ptr: *mut MsObjHeader) -> &'a MsModule {
-    debug_assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8, "read_module on non-MODULE");
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::MODULE as u8,
+        "read_module on non-MODULE"
+    );
     &*(ptr as *mut MsModule)
 }
 
@@ -1131,7 +1140,11 @@ pub unsafe fn read_module<'a>(ptr: *mut MsObjHeader) -> &'a MsModule {
 /// # Safety
 /// `ptr` 必须指向由 `alloc_module` 分配的、在 `'a` 期间有效的 `MsModule`。
 pub unsafe fn read_module_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsModule {
-    debug_assert_eq!((*ptr).type_tag, TypeTag::MODULE as u8, "read_module_mut on non-MODULE");
+    debug_assert_eq!(
+        (*ptr).type_tag,
+        TypeTag::MODULE as u8,
+        "read_module_mut on non-MODULE"
+    );
     &mut *(ptr as *mut MsModule)
 }
 
@@ -1186,8 +1199,7 @@ pub fn alloc_file_handle(path: &str, mode: &str, file: std::fs::File) -> Object 
         file_ptr,
     });
     // Immortal 代（不进 Young 复制）+ has_finalizer（兜底关闭 fd）。
-    h.header
-        .set_generation(crate::vm::gc::Generation::Immortal);
+    h.header.set_generation(crate::vm::gc::Generation::Immortal);
     h.header.set_has_finalizer(true);
     Object::Ref(Box::into_raw(h) as *mut MsObjHeader)
 }
@@ -2510,9 +2522,7 @@ pub fn alloc_native_async_function(
 /// `ptr` 必须指向由 `alloc_native_async_function` 分配的、在 `'a` 期间有效的
 /// `NativeAsyncFunction`。
 #[cfg(feature = "capi")]
-pub unsafe fn read_native_async_function<'a>(
-    ptr: *mut MsObjHeader,
-) -> &'a NativeAsyncFunction {
+pub unsafe fn read_native_async_function<'a>(ptr: *mut MsObjHeader) -> &'a NativeAsyncFunction {
     debug_assert_eq!(
         (*ptr).type_tag,
         TypeTag::NATIVE_ASYNC_FUNCTION as u8,

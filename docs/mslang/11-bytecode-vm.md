@@ -277,6 +277,7 @@ Function {
     code: Vec<u8>             // 字节码
     constants: Vec<Value>     // 常量池（内联值或 Ref 指针）
     upvalue_count: usize
+    lines: Vec<(usize, usize)>  // 行号表（指令偏移, 源码行号），task 57
 }
 ```
 
@@ -414,10 +415,14 @@ lines: Vec<(instruction_offset, source_line)>
 
 ```
 Error: division by zero
+Stack trace:
     at divmod (math.ms:5)
     at calculate (main.ms:12)
     at <main> (main.ms:20)
 ```
+
+> task 57：在 `Error: <message>` 与 `at <fn> (...)` 之间插入 `Stack trace:` 标题行
+> 作为可读性增强（见 task 57 §0.3/§10）。
 
 ## 生成器执行模型
 

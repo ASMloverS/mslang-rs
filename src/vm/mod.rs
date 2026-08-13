@@ -4,12 +4,14 @@ pub mod gc;
 pub mod object;
 pub mod stdlib;
 
+use crate::async_runtime::channel::{read_channel, ChannelState, WaitingReceiver, WaitingSender};
+use crate::async_runtime::join_handle::{alloc_join_handle, read_join_handle};
 use crate::compiler::opcode::OpCode;
 use crate::compiler::Chunk;
 use crate::module::{self, ModuleResolver};
-use crate::async_runtime::channel::{read_channel, ChannelState, WaitingReceiver, WaitingSender};
-use crate::async_runtime::join_handle::{alloc_join_handle, read_join_handle};
-use crate::vm::builtins::{alloc_native_function, read_native_function, NativeFunction, to_iterator};
+use crate::vm::builtins::{
+    alloc_native_function, read_native_function, to_iterator, NativeFunction,
+};
 use crate::vm::object::{
     alloc_bound_method, alloc_class, alloc_closure, alloc_dict, alloc_exception,
     alloc_exception_class, alloc_function, alloc_future, alloc_generator, alloc_instance,
@@ -27,6 +29,20 @@ use std::path::PathBuf;
 const STACK_MAX: usize = 1024;
 /// 调用栈最大深度（对齐 Python 默认；task 28/31/36/37/70 共用此常量）。
 pub const MAX_CALL_DEPTH: usize = 1000;
+/// task 57：源文件大小上限（§9）。超过此大小的文件视为「源码不可读」，避免 OOM。
+/// 1 MiB 对脚本文件足够。
+const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// task 57：ip → source line 反查（§5）。lines 表按 instruction_offset 升序；
+/// 从尾向前找到第一个 offset <= ip 的条目即对应行号；空表或 ip 早于首条 → 0。
+fn get_line(lines: &[(usize, usize)], ip: usize) -> usize {
+    for (off, line) in lines.iter().rev() {
+        if *off <= ip {
+            return *line;
+        }
+    }
+    0
+}
 
 /// defer 注册条目（task 36）。`call_tuple` = tuple(callee, arg1, ..., argN)，
 /// 在 defer 注册时已求值完毕（规则 3）。GC 须将其作根扫描（见 gc.rs）。
@@ -140,8 +156,7 @@ pub struct EventLoop {
     /// 取出全部 signals 并 notify。GC forwarding 时同步更新 key。
     /// Arc 内部状态（Mutex+Condvar）不参与 GC trace（与 mslang 对象图无关）。
     #[cfg(feature = "capi")]
-    pub(crate) thread_waiters:
-        std::collections::HashMap<*mut MsObjHeader, Vec<ThreadSignal>>,
+    pub(crate) thread_waiters: std::collections::HashMap<*mut MsObjHeader, Vec<ThreadSignal>>,
 }
 
 /// task 76：线程级等待信号（C API msAwait 使用）。
@@ -175,13 +190,9 @@ enum ChannelYield {
         value: Object,
     },
     /// RECEIVE 阻塞：协程存入 channel.waiting_receivers。
-    Recv {
-        channel: *mut MsObjHeader,
-    },
+    Recv { channel: *mut MsObjHeader },
     /// task 59：select 阻塞——协程存入 paused，EventLoop 轮询检查 case 就绪状态。
-    Select {
-        entries: Vec<SelectEntry>,
-    },
+    Select { entries: Vec<SelectEntry> },
     /// task 59：空 select{} 永久阻塞——协程存入 paused 但不挂到任何 channel。
     EmptySelect,
 }
@@ -287,6 +298,15 @@ pub struct VM {
     /// task 53：协程未捕获异常的 Object 快照。drive_unwind 在 call_stack 空时格式化错误
     /// 前存储此值，供 EventLoop 据此 reject Future。
     last_uncaught_exception: Option<Object>,
+    /// task 57：throw() 时捕获的调用栈快照（所有帧未弹出前）。drive_unwind 弹帧
+    /// 续传期间此快照保留原始栈帧信息，format_uncaught_error 消费它构建
+    /// RuntimeError 的 stack_trace。VM 内部 String 错误不经 throw()，在
+    /// interpret_named 退出时由当前 call_stack 直接构建（错误传播不弹帧）。
+    captured_stack_trace: Option<crate::error::StackTrace>,
+    /// task 57：源文件行缓存（§9 R5）。键为文件路径，值为按行切分的源码。
+    /// 首次 read_source_line 后缓存，重复命中走缓存（避免深栈多帧同文件 O(n²) IO）。
+    /// 不设容量上限——单次运行内导入的源文件数量有限。
+    source_cache: HashMap<String, std::sync::Arc<Vec<String>>>,
     /// task 42：隐式 Object 基类（Immortal 代）。无显式父类的类在 CLASS handler
     /// 中自动链接至此；提供默认 __repr__/__eq__/__ne__。
     pub(crate) object_class: *mut MsObjHeader,
@@ -359,6 +379,8 @@ impl VM {
             yield_join: None,
             current_coro_handle: None,
             last_uncaught_exception: None,
+            captured_stack_trace: None,
+            source_cache: HashMap::new(),
             object_class: std::ptr::null_mut(),
             module_resolver: ModuleResolver::new(),
             baseline_globals: HashMap::new(),
@@ -490,19 +512,32 @@ impl VM {
     }
 
     pub fn interpret(&mut self, chunk: Chunk) -> Result<Object, String> {
+        self.interpret_named(chunk, None)
+    }
+
+    /// task 57：带源文件名的 interpret。`source_file` 写入顶层 `<main>` 函数，
+    /// 使 [`build_stack_trace`](Self::build_stack_trace) 能反查 ip→line 并在错误
+    /// 信息中显示文件名。退出时区分两类错误（§0.1）：MsException（已由
+    /// `format_uncaught_error` 格式化）与 VM 内部 String 错误（此处格式化）。
+    pub fn interpret_named(
+        &mut self,
+        chunk: Chunk,
+        source_file: Option<String>,
+    ) -> Result<Object, String> {
         let function = Function {
             name: "<main>".to_string(),
             arity: 0,
             code: chunk.code,
             constants: chunk.constants,
             upvalue_count: 0,
-            source_file: None,
+            source_file,
             default_values: Vec::new(),
             has_variadic: false,
             required_arity: 0,
             is_generator: false,
             locals_count: 1,
             is_async: false,
+            lines: chunk.lines,
         };
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
@@ -512,7 +547,19 @@ impl VM {
         // task 53：主脚本作为主协程在事件循环中执行。
         let main_coro = self.take_coroutine_state(None, None);
         self.event_loop.ready_queue.push_back(main_coro);
-        self.event_loop_run()
+        let result = self.event_loop_run();
+        match result {
+            Ok(v) => Ok(v),
+            Err(msg) => {
+                // last_uncaught_exception 为 Some → MsException 路径，msg 已格式化；
+                // 否则为 VM 内部 String 错误，需构建 RuntimeError（call_stack 完好）。
+                if self.last_uncaught_exception.is_some() {
+                    Err(msg)
+                } else {
+                    Err(self.format_vm_internal_error(&msg))
+                }
+            }
+        }
     }
 
     // ---- task 56：REPL 支持 ----
@@ -536,6 +583,7 @@ impl VM {
         self.yield_join = None;
         self.current_coro_handle = None;
         self.last_uncaught_exception = None;
+        self.captured_stack_trace = None;
     }
 
     /// task 56：执行语句（不返回值）。供 REPL 顶层 var/fn/class/import/控制流等使用。
@@ -557,7 +605,7 @@ impl VM {
         self.reset_execution_state();
         let program = parse_source(source)?;
         let expr = match program.statements.as_slice() {
-            [crate::ast::Stmt::ExprStmt { expr }] => expr,
+            [crate::ast::Stmt::ExprStmt { expr, .. }] => expr,
             _ => return Err("not a single expression".to_string()),
         };
         let chunk = crate::compiler::Compiler::new().compile_expression_program(expr)?;
@@ -612,8 +660,7 @@ impl VM {
     /// 注册 async.sleep timer：到时将 Future resolve 为 Nil。
     /// `ms` 须已校验为非负且 ≤ 86_400_000（调用方负责）。
     pub(crate) fn push_sleep_timer(&mut self, future_ptr: *mut MsObjHeader, ms: i64) {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
         self.event_loop.timers.push(std::cmp::Reverse(TimerEntry {
             deadline,
             future_ptr,
@@ -629,8 +676,7 @@ impl VM {
         ms: i64,
         sub_coro_handle: *mut MsObjHeader,
     ) {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms as u64);
         self.event_loop.timers.push(std::cmp::Reverse(TimerEntry {
             deadline,
             future_ptr,
@@ -842,14 +888,10 @@ impl VM {
         let ch = unsafe { read_channel(channel_ptr) };
 
         // 1. 从缓冲区取值
-        let from_buffer = {
-            ch.buffer.borrow_mut().pop_front()
-        };
+        let from_buffer = { ch.buffer.borrow_mut().pop_front() };
         if let Some(val) = from_buffer {
             // 缓冲区腾位：唤醒等待发送者
-            let woken = {
-                ch.waiting_senders.borrow_mut().pop_front()
-            };
+            let woken = { ch.waiting_senders.borrow_mut().pop_front() };
             if let Some(sender) = woken {
                 let mut buffer = ch.buffer.borrow_mut();
                 buffer.push_back(sender.value);
@@ -862,9 +904,7 @@ impl VM {
         }
 
         // 2. 从等待发送者交接（rendezvous）
-        let woken = {
-            ch.waiting_senders.borrow_mut().pop_front()
-        };
+        let woken = { ch.waiting_senders.borrow_mut().pop_front() };
         if let Some(sender) = woken {
             let mut coro = sender.coroutine;
             coro.stack.push(Object::Nil);
@@ -886,9 +926,7 @@ impl VM {
         let ch = unsafe { read_channel(channel_ptr) };
 
         // 1. 交付给等待接收者
-        let woken = {
-            ch.waiting_receivers.borrow_mut().pop_front()
-        };
+        let woken = { ch.waiting_receivers.borrow_mut().pop_front() };
         if let Some(receiver) = woken {
             let mut coro = receiver.coroutine;
             coro.stack.push(value);
@@ -918,11 +956,11 @@ impl VM {
                         continue;
                     }
                     // 检查是否全部为空 select{}（永久阻塞，非死锁）
-                    let all_empty_select = self.event_loop.paused.iter().all(|p| {
-                        p.select_entries
-                            .as_ref()
-                            .is_some_and(|e| e.is_empty())
-                    });
+                    let all_empty_select = self
+                        .event_loop
+                        .paused
+                        .iter()
+                        .all(|p| p.select_entries.as_ref().is_some_and(|e| e.is_empty()));
                     if all_empty_select && !self.event_loop.paused.is_empty() {
                         // 空 select{} 永久阻塞（与 Go 一致），不报 deadlock
                         return Ok(Object::Nil);
@@ -948,6 +986,7 @@ impl VM {
             self.yield_channel = None;
             self.yield_join = None;
             self.last_uncaught_exception = None;
+            self.captured_stack_trace = None;
             let result = self.run_loop(None);
             self.current_coro_handle = None;
 
@@ -974,9 +1013,10 @@ impl VM {
                 match cy {
                     ChannelYield::Send { channel, value } => {
                         let ch = unsafe { read_channel(channel) };
-                        ch.waiting_senders
-                            .borrow_mut()
-                            .push_back(WaitingSender { coroutine: coro, value });
+                        ch.waiting_senders.borrow_mut().push_back(WaitingSender {
+                            coroutine: coro,
+                            value,
+                        });
                     }
                     ChannelYield::Recv { channel } => {
                         let ch = unsafe { read_channel(channel) };
@@ -1037,14 +1077,15 @@ impl VM {
                             };
                             if !already_settled {
                                 // async fn 协程异常：reject Future
-                                let exc = self.last_uncaught_exception.take().unwrap_or_else(|| {
-                                    alloc_exception(
-                                        "Error",
-                                        alloc_string(&msg),
-                                        alloc_string(""),
-                                        Object::Nil,
-                                    )
-                                });
+                                let exc =
+                                    self.last_uncaught_exception.take().unwrap_or_else(|| {
+                                        alloc_exception(
+                                            "Error",
+                                            alloc_string(&msg),
+                                            alloc_string(""),
+                                            Object::Nil,
+                                        )
+                                    });
                                 let f = unsafe { read_future(fp) };
                                 *f.state.borrow_mut() = FutureState::Rejected(exc);
                                 self.wake_waiters(fp);
@@ -1156,7 +1197,11 @@ impl VM {
             );
         }
         if self.heap.should_collect_major() {
-            if self.gc_runtime.concurrent_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            if self
+                .gc_runtime
+                .concurrent_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 // 并发模式：mutator 标灰根集 + 触发 Coordinator，不阻塞。
                 gc::init_concurrent_mark(self);
             } else {
@@ -1312,9 +1357,7 @@ impl VM {
 
     /// task 67：C root 注册表可变引用（供 capi::gc 的 msRoot/msUnroot 使用）。
     #[cfg(feature = "capi")]
-    pub(crate) fn c_roots_mut(
-        &mut self,
-    ) -> &mut std::collections::HashSet<*mut MsObjHeader> {
+    pub(crate) fn c_roots_mut(&mut self) -> &mut std::collections::HashSet<*mut MsObjHeader> {
         &mut self.c_roots
     }
 
@@ -2026,10 +2069,7 @@ impl VM {
             Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::BOUND_METHOD as u8 => {
                 let (method_ptr, receiver) = {
                     let bound = unsafe { read_bound_method(*ptr) };
-                    debug_assert!(
-                        !bound.method.is_null(),
-                        "bound method pointer is null"
-                    );
+                    debug_assert!(!bound.method.is_null(), "bound method pointer is null");
                     (bound.method, bound.receiver.clone())
                 };
                 let method_tag = unsafe { (*method_ptr).type_tag };
@@ -2061,8 +2101,11 @@ impl VM {
                     // frame_base = callee(BoundMethod) 所在 slot；覆写为 receiver（self）。
                     let frame_base = self.stack.len() - argc - 1;
                     self.stack[frame_base] = receiver;
-                    self.call_stack
-                        .push(CallFrame::new(method_ptr, frame_base, self.defer_stack.len()));
+                    self.call_stack.push(CallFrame::new(
+                        method_ptr,
+                        frame_base,
+                        self.defer_stack.len(),
+                    ));
                 }
             }
             // task 37：异常类对象（EXCEPTION_CLASS）— `ValueError("msg")` 等构造调用。
@@ -2085,16 +2128,14 @@ impl VM {
             }
             // task 70：C 原生函数（NATIVE_C_FUNCTION）— 桥接 C 函数调用。
             #[cfg(feature = "capi")]
-            Object::Ref(ptr) if unsafe { (**ptr).type_tag }
-                == TypeTag::NATIVE_C_FUNCTION as u8 =>
-            {
+            Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::NATIVE_C_FUNCTION as u8 => {
                 self.call_c_native(*ptr, argc, callee_idx)?;
             }
             // task 76：C 异步函数（NATIVE_ASYNC_FUNCTION）— 创建 Future +
             // 调用 C 函数，C 函数负责异步完成时 resolve/reject Future。
             #[cfg(feature = "capi")]
-            Object::Ref(ptr) if unsafe { (**ptr).type_tag }
-                == TypeTag::NATIVE_ASYNC_FUNCTION as u8 =>
+            Object::Ref(ptr)
+                if unsafe { (**ptr).type_tag } == TypeTag::NATIVE_ASYNC_FUNCTION as u8 =>
             {
                 self.call_c_async_native(*ptr, argc, callee_idx)?;
             }
@@ -2308,11 +2349,7 @@ impl VM {
     /// task 51：调用任意 callable Object（CLOSURE/FUNCTION/BOUND_METHOD）并返回结果。
     /// 供 List.map/filter/reduce 等原生方法调用用户回调。
     /// 压栈 callee + args，call_value 后 run_loop 至返回，弹出结果。
-    pub fn call_function(
-        &mut self,
-        callee: &Object,
-        args: &[Object],
-    ) -> Result<Object, String> {
+    pub fn call_function(&mut self, callee: &Object, args: &[Object]) -> Result<Object, String> {
         self.push(callee.clone())?;
         for arg in args {
             self.push(arg.clone())?;
@@ -2378,12 +2415,7 @@ impl VM {
             let msg = self.error_message.clone();
             self.has_error = false;
             self.error_message.clear();
-            let exc = alloc_exception(
-                "Error",
-                alloc_string(&msg),
-                alloc_string(""),
-                Object::Nil,
-            );
+            let exc = alloc_exception("Error", alloc_string(&msg), alloc_string(""), Object::Nil);
             return self.throw(exc);
         }
 
@@ -2468,7 +2500,6 @@ impl VM {
         self.push(future_obj)?;
         Ok(())
     }
-
 
     /// 调用 obj.method(args...) 并返回 Ok(Some(result))；否则返回 Ok(None)，
     /// 由调用方决定 fallback（内置运算）或报错。
@@ -2767,8 +2798,14 @@ impl VM {
     }
 
     /// 格式化未捕获异常为错误字符串（顶层 throw() 返回此 Err）。
-    fn format_uncaught_error(&self, err: &Object) -> String {
-        match err {
+    /// 格式化未捕获异常为多行 traceback 字符串（顶层 throw() 返回此 Err）。
+    ///
+    /// task 57：升级原单行 `<ClassName>: <msg>` 为 RuntimeError::Display。
+    /// MsException 路径（§0.1 case 1）：`Error: <message>` + stack_trace；
+    /// 不显示 location/source_line（throw 点已在栈帧中，避免冗余）。
+    /// stack_trace 取 throw() 时捕获的快照（drive_unwind 已弹帧，当前栈不全）。
+    fn format_uncaught_error(&mut self, err: &Object) -> String {
+        let (message, trace) = match err {
             Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::EXCEPTION as u8 => {
                 let e = unsafe { read_exception(*ptr) };
                 let msg = match &e.message {
@@ -2777,10 +2814,106 @@ impl VM {
                     }
                     _ => e.message.type_name().to_string(),
                 };
-                format!("{}: {}", e.class_name, msg)
+                let trace = self
+                    .captured_stack_trace
+                    .take()
+                    .unwrap_or_else(|| self.build_stack_trace());
+                (msg, trace)
             }
-            _ => "Error: <non-exception thrown>".to_string(),
+            _ => {
+                let trace = self
+                    .captured_stack_trace
+                    .take()
+                    .unwrap_or_else(|| self.build_stack_trace());
+                ("<non-exception thrown>".to_string(), trace)
+            }
+        };
+        let re = crate::error::RuntimeError {
+            message,
+            titled: true, // MsException 路径：输出 "Error: <message>"
+            stack_trace: trace,
+            // throw 路径不显示 location/source_line（位置已在 stack_trace 首帧）
+            source_line: None,
+            location: None,
+        };
+        re.to_string()
+    }
+
+    // ---- task 57：堆栈跟踪与源码行 ----
+
+    /// 构建调用堆栈快照（§5）。遍历 call_stack，按栈顶→栈底顺序收集帧
+    /// （Display 输出最内层在前）。生成器帧按普通帧显示（§5.1）。
+    ///
+    /// SAFETY：CallFrame.closure 由 alloc_closure 分配（CLOSURE），帧存活期间
+    /// closure 与其 function 均被根集（call_stack）持有，GC 不会回收。本函数
+    /// 仅做 String::clone / Vec::push（堆分配走 Rust 全局分配器，不进 mslang
+    /// GC 堆），不触发 GC safepoint。
+    fn build_stack_trace(&self) -> crate::error::StackTrace {
+        let mut frames = Vec::new();
+        for frame in self.call_stack.iter().rev() {
+            let closure = unsafe { read_closure(frame.closure) };
+            let function = unsafe { read_function(closure.function) };
+            let func = &function.function;
+            // ip 已越过当前指令（read_byte/read_u16 推进）；ip-1 指向最后消费的字节，
+            // 属当前指令（opcode + 操作数同 line），故 get_line(ip-1) 返回正确行号。
+            let line = get_line(&func.lines, frame.ip.saturating_sub(1));
+            let name = func.name.clone();
+            let file = func
+                .source_file
+                .clone()
+                .unwrap_or_else(|| "<script>".into());
+            frames.push(crate::error::StackTraceFrame {
+                function_name: name,
+                location: crate::error::SourceLocation {
+                    file,
+                    line,
+                    column: None,
+                },
+            });
         }
+        crate::error::StackTrace { frames }
+    }
+
+    /// 格式化 VM 内部 `Result<_, String>` 错误（§0.1 case 2）。message 逐字输出
+    /// （已含类型前缀如 "ZeroDivisionError: ..."）。location/source_line 取自
+    /// 栈顶帧；call_stack 完好（错误经 `?` 传播不弹帧）。
+    fn format_vm_internal_error(&mut self, msg: &str) -> String {
+        let trace = self.build_stack_trace();
+        let loc = trace.frames.first().map(|f| f.location.clone());
+        let source_line = loc
+            .as_ref()
+            .and_then(|l| self.read_source_line(&l.file, l.line));
+        let re = crate::error::RuntimeError {
+            message: msg.to_string(),
+            titled: false, // case 2：逐字输出，不加 "Error:" 前缀
+            stack_trace: trace,
+            source_line,
+            location: loc,
+        };
+        re.to_string()
+    }
+
+    /// 读取源文件第 `line` 行（§9）。含四项防护：line==0 下溢、文件大小无界、
+    /// 源文件不可读回退、缓存。缓存键为 `file`（与 source_file 一致）。
+    fn read_source_line(&mut self, file: &str, line: usize) -> Option<String> {
+        if line == 0 {
+            return None;
+        }
+        // 缓存命中：直接取行。
+        if let Some(cached) = self.source_cache.get(file) {
+            return cached.get(line - 1).cloned();
+        }
+        // 大文件防护（§9 V4）。
+        let meta = std::fs::metadata(file).ok()?;
+        if meta.len() > MAX_SOURCE_FILE_BYTES {
+            return None;
+        }
+        let content = std::fs::read_to_string(file).ok()?;
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        let result = lines.get(line - 1).cloned();
+        self.source_cache
+            .insert(file.to_string(), std::sync::Arc::new(lines));
+        result
     }
 
     /// 异常传播入口（THROW/RETHROW/FINALLY_END 调用）。
@@ -2789,6 +2922,10 @@ impl VM {
     /// （一个 defer 抛了新异常）或当前帧正处理某异常（finally 内抛新异常），则旧异常
     /// 挂为新异常的 `__cause__`（规则 1/4 / finally 覆盖）。
     fn throw(&mut self, err: Object) -> Result<(), String> {
+        // task 57：在 drive_unwind 弹帧前捕获调用栈快照（所有帧仍在 call_stack），
+        // 供 format_uncaught_error 构建 stack_trace。每次 throw 覆盖旧快照；
+        // format_uncaught_error 消费（take）它。
+        self.captured_stack_trace = Some(self.build_stack_trace());
         // 取出「当前正在传播/处理的异常」作为 __cause__ 链源：
         //  - pending_unwind：unwind 途中某 defer 抛了新异常（规则 1/4）。
         //  - current_exc：finally 块内抛新异常，覆盖进入 finally 时的原异常（规则 §6）。
@@ -3061,7 +3198,9 @@ impl VM {
                 OpCode::Add => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__add__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__add__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.add(&b)?)?;
@@ -3071,7 +3210,9 @@ impl VM {
                 OpCode::Subtract => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__sub__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__sub__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.subtract(&b)?)?;
@@ -3081,7 +3222,9 @@ impl VM {
                 OpCode::Multiply => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__mul__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__mul__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.multiply(&b)?)?;
@@ -3091,7 +3234,9 @@ impl VM {
                 OpCode::Divide => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__div__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__div__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.divide(&b)?)?;
@@ -3101,7 +3246,9 @@ impl VM {
                 OpCode::FloorDiv => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__floordiv__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__floordiv__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.floor_divide(&b)?)?;
@@ -3111,7 +3258,9 @@ impl VM {
                 OpCode::Modulo => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__mod__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__mod__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.modulo(&b)?)?;
@@ -3121,7 +3270,9 @@ impl VM {
                 OpCode::Power => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__pow__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__pow__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.power(&b)?)?;
@@ -3180,7 +3331,9 @@ impl VM {
                 OpCode::Equal => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__eq__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__eq__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(Object::Bool(a == b))?;
@@ -3190,7 +3343,9 @@ impl VM {
                 OpCode::NotEqual => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__ne__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__ne__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(Object::Bool(a != b))?;
@@ -3200,7 +3355,9 @@ impl VM {
                 OpCode::Less => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__lt__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__lt__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.compare(&b, CmpOp::Less)?)?;
@@ -3210,7 +3367,9 @@ impl VM {
                 OpCode::Greater => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__gt__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__gt__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.compare(&b, CmpOp::Greater)?)?;
@@ -3220,7 +3379,9 @@ impl VM {
                 OpCode::LessEqual => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__le__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__le__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.compare(&b, CmpOp::LessEqual)?)?;
@@ -3230,7 +3391,9 @@ impl VM {
                 OpCode::GreaterEqual => {
                     let b = self.pop()?;
                     let a = self.pop()?;
-                    if let Some(r) = self.try_instance_magic(&a, "__ge__", std::slice::from_ref(&b))? {
+                    if let Some(r) =
+                        self.try_instance_magic(&a, "__ge__", std::slice::from_ref(&b))?
+                    {
                         self.push(r)?;
                     } else {
                         self.push(a.compare(&b, CmpOp::GreaterEqual)?)?;
@@ -3247,7 +3410,11 @@ impl VM {
                     let container = self.pop()?;
                     let item = self.pop()?;
                     if Self::is_instance(&container) {
-                        if let Some(r) = self.try_instance_magic(&container, "__contains__", std::slice::from_ref(&item))? {
+                        if let Some(r) = self.try_instance_magic(
+                            &container,
+                            "__contains__",
+                            std::slice::from_ref(&item),
+                        )? {
                             self.push(r)?;
                         } else {
                             return Err("argument of type 'instance' is not iterable".into());
@@ -4090,9 +4257,7 @@ impl VM {
                     match &obj {
                         // task 51：Dict 方法分派（length/keys/.../merge 等 9 个），
                         // 先查方法名；若非已知方法则回退到键访问（d.key 等价 d["key"]）。
-                        Object::Ref(ptr)
-                            if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 =>
-                        {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::DICT as u8 => {
                             if let Some(func) = stdlib::lookup_dict_method(&attr) {
                                 let method_obj = alloc_native_function(NativeFunction {
                                     name: attr.clone(),
@@ -4281,9 +4446,7 @@ impl VM {
                             }
                         }
                         // task 51：List 方法分派（length/push/.../reduce 等 14 个）。
-                        Object::Ref(ptr)
-                            if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 =>
-                        {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::LIST as u8 => {
                             match stdlib::lookup_list_method(&attr) {
                                 Some(func) => {
                                     let method_obj = alloc_native_function(NativeFunction {
@@ -4305,9 +4468,7 @@ impl VM {
                             }
                         }
                         // task 51：Set 方法分派（length/add/.../difference 等 7 个）。
-                        Object::Ref(ptr)
-                            if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 =>
-                        {
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::SET as u8 => {
                             match stdlib::lookup_set_method(&attr) {
                                 Some(func) => {
                                     let method_obj = alloc_native_function(NativeFunction {
@@ -4494,11 +4655,7 @@ impl VM {
                         .get(&class_name)
                         .ok_or_else(|| format!("class '{}' not found", class_name))?;
                     let current_cls_ptr = match current_cls_obj {
-                        Object::Ref(p)
-                            if unsafe { (**p).type_tag } == TypeTag::CLASS as u8 =>
-                        {
-                            *p
-                        }
+                        Object::Ref(p) if unsafe { (**p).type_tag } == TypeTag::CLASS as u8 => *p,
                         _ => return Err(format!("'{}' is not a class", class_name)),
                     };
                     let parent_ptr = unsafe { read_class(current_cls_ptr).parent }
@@ -4521,7 +4678,11 @@ impl VM {
                     let key = self.pop()?;
                     let obj = self.pop()?;
                     if Self::is_instance(&obj) {
-                        if let Some(r) = self.try_instance_magic(&obj, "__getitem__", std::slice::from_ref(&key))? {
+                        if let Some(r) = self.try_instance_magic(
+                            &obj,
+                            "__getitem__",
+                            std::slice::from_ref(&key),
+                        )? {
                             self.push(r)?;
                         } else {
                             return Err("'instance' object is not subscriptable".into());
@@ -4540,7 +4701,10 @@ impl VM {
                     let obj = self.pop()?;
                     let val = self.pop()?;
                     if Self::is_instance(&obj) {
-                        if self.try_instance_magic(&obj, "__setitem__", &[key, val])?.is_none() {
+                        if self
+                            .try_instance_magic(&obj, "__setitem__", &[key, val])?
+                            .is_none()
+                        {
                             return Err("'instance' object does not support item assignment".into());
                         }
                     } else {
@@ -4639,10 +4803,7 @@ impl VM {
                         } else {
                             // 回退 ip 使 AWAIT 恢复时重新执行（JoinHandle 留在栈上）
                             let frame = self.call_stack.last_mut().unwrap();
-                            frame.ip = frame
-                                .ip
-                                .checked_sub(1)
-                                .ok_or("ip underflow in AWAIT")?;
+                            frame.ip = frame.ip.checked_sub(1).ok_or("ip underflow in AWAIT")?;
                             self.yield_join = Some(handle_ptr);
                             return Ok(Object::Nil);
                         }
@@ -4672,17 +4833,14 @@ impl VM {
                         }
                         FutureState::Rejected(exc) => {
                             self.pop()?; // 弹出 Future
-                            // throw 设置 catch_address 或传播异常；Ok 则继续循环
+                                         // throw 设置 catch_address 或传播异常；Ok 则继续循环
                             self.throw(exc)?;
                             continue;
                         }
                         FutureState::Pending => {
                             // 回退 ip 使 AWAIT 在恢复时重新执行（Future 留在栈上）
                             let frame = self.call_stack.last_mut().unwrap();
-                            frame.ip = frame
-                                .ip
-                                .checked_sub(1)
-                                .ok_or("ip underflow in AWAIT")?;
+                            frame.ip = frame.ip.checked_sub(1).ok_or("ip underflow in AWAIT")?;
                             // 设置 yield 信号，run_loop 将退出交还 EventLoop
                             self.yield_future = Some(future_ptr);
                             return Ok(Object::Nil);
@@ -4823,7 +4981,7 @@ impl VM {
                             let mut buffer = ch.buffer.borrow_mut();
                             buffer.push_back(sender.value);
                             drop(buffer); // guard 释放后再操作 EventLoop
-                            // 发送者的 SEND 已完成，压入 Nil 作为其表达式结果。
+                                          // 发送者的 SEND 已完成，压入 Nil 作为其表达式结果。
                             let mut coro = sender.coroutine;
                             coro.stack.push(Object::Nil);
                             self.event_loop.ready_queue.push_back(coro);
@@ -4873,8 +5031,7 @@ impl VM {
                     let has_default = self.read_byte()? != 0;
 
                     // 读取 case 描述表
-                    let mut vm_cases: Vec<(u8, u8, u8, u8, u16)> =
-                        Vec::with_capacity(case_count);
+                    let mut vm_cases: Vec<(u8, u8, u8, u8, u16)> = Vec::with_capacity(case_count);
                     for _ in 0..case_count {
                         let kind = self.read_byte()?;
                         let ch_slot = self.read_byte()?;
@@ -4903,8 +5060,7 @@ impl VM {
                     let mut ready_indices: Vec<usize> = Vec::new();
                     for (i, &(kind, ch_slot, _, _, _)) in vm_cases.iter().enumerate() {
                         let ch_idx = self.slot_to_stack_idx(ch_slot as usize)?;
-                        let channel_obj =
-                            self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
+                        let channel_obj = self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
                         let channel_ptr = expect_channel(&channel_obj)?;
                         let ch = unsafe { read_channel(channel_ptr) };
 
@@ -4943,8 +5099,7 @@ impl VM {
                             vm_cases[ready_indices[chosen]];
 
                         let ch_idx = self.slot_to_stack_idx(ch_slot as usize)?;
-                        let channel_obj =
-                            self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
+                        let channel_obj = self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
                         let channel_ptr = expect_channel(&channel_obj)?;
 
                         if kind == 0 {
@@ -4958,8 +5113,7 @@ impl VM {
                         } else {
                             // 执行 Send
                             let val_idx = self.slot_to_stack_idx(val_slot as usize)?;
-                            let val =
-                                self.stack.get(val_idx).cloned().unwrap_or(Object::Nil);
+                            let val = self.stack.get(val_idx).cloned().unwrap_or(Object::Nil);
                             self.select_do_send(channel_ptr, val)?;
                         }
 
@@ -4984,8 +5138,7 @@ impl VM {
                     let mut entries = Vec::with_capacity(vm_cases.len());
                     for &(kind, ch_slot, _, _, _) in &vm_cases {
                         let ch_idx = self.slot_to_stack_idx(ch_slot as usize)?;
-                        let obj =
-                            self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
+                        let obj = self.stack.get(ch_idx).cloned().unwrap_or(Object::Nil);
                         let ptr = expect_channel(&obj)?;
                         entries.push(SelectEntry {
                             channel_ptr: ptr,
@@ -5026,10 +5179,7 @@ impl VM {
 
         // 1. 安全模式：仅允许 @std import。
         if self.module_resolver.safe_mode && !stdlib_only {
-            return Err(format!(
-                "安全模式下仅允许 import @std（拒绝 {}）",
-                mod_name
-            ));
+            return Err(format!("安全模式下仅允许 import @std（拒绝 {}）", mod_name));
         }
         // 2. 递归深度限制：load → execute_module → IMPORT → load 链。
         if self.module_resolver.loading_stack.len() >= module::MAX_IMPORT_DEPTH {
@@ -5046,14 +5196,9 @@ impl VM {
                 #[cfg(feature = "capi")]
                 {
                     if !self.capi_vm_ptr.is_null() {
-                        let vm_ptr =
-                            self.capi_vm_ptr as *mut crate::capi::vm::MsVM;
-                        if crate::capi::module::load_native_module(vm_ptr, mod_name)
-                            .is_ok()
-                        {
-                            if let Some(&ptr) =
-                                self.module_resolver.native_modules.get(mod_name)
-                            {
+                        let vm_ptr = self.capi_vm_ptr as *mut crate::capi::vm::MsVM;
+                        if crate::capi::module::load_native_module(vm_ptr, mod_name).is_ok() {
+                            if let Some(&ptr) = self.module_resolver.native_modules.get(mod_name) {
                                 return Ok(ptr);
                             }
                         }
@@ -5088,15 +5233,14 @@ impl VM {
             self.cleanup_failed_load(&canon);
             format!("无法加载 '{}': {}", mod_name, e)
         })?;
-        let (chunk, export_names, private_names) =
-            module::compile_module_source(&source, mod_name).map_err(|e| {
+        let (chunk, export_names, private_names) = module::compile_module_source(&source, mod_name)
+            .map_err(|e| {
                 self.cleanup_failed_load(&canon);
                 format!("编译 '{}' 失败: {}", mod_name, e)
             })?;
 
         // 7. 在隔离全局作用域中执行模块顶层字节码（§7）。
-        let exec_result =
-            self.execute_module(chunk, &export_names, &private_names);
+        let exec_result = self.execute_module(chunk, &export_names, &private_names);
 
         // 8. 无论成败，从 loading_stack 移除（不再「加载中」）。
         self.module_resolver.loading_stack.remove(&canon);
@@ -5188,12 +5332,16 @@ impl VM {
             is_generator: false,
             locals_count: 1,
             is_async: false,
+            lines: chunk.lines,
         };
         let Object::Ref(closure_ptr) = alloc_closure(alloc_function(function), Vec::new()) else {
             unreachable!()
         };
-        self.call_stack
-            .push(CallFrame::new(closure_ptr, stack_depth, self.defer_stack.len()));
+        self.call_stack.push(CallFrame::new(
+            closure_ptr,
+            stack_depth,
+            self.defer_stack.len(),
+        ));
         // run() 至 HALT（丢弃返回值）或顶层异常（propagate 为 Err）。
         // 若当前已有进行中的 unwind（模块在 try 内 import），交由 drive_unwind 续行。
         let result = if self.pending_unwind.is_some() {
@@ -5248,8 +5396,8 @@ mod tests {
     use crate::parser::Parser;
     use crate::vm::object::{
         alloc_bound_method, alloc_class, alloc_dict, alloc_instance, alloc_iterator, alloc_list,
-        alloc_set, alloc_string, alloc_tuple, read_bound_method, read_class, read_list,
-        DictMap, IteratorState, Object,
+        alloc_set, alloc_string, alloc_tuple, read_bound_method, read_class, read_list, DictMap,
+        IteratorState, Object,
     };
     use std::collections::HashSet;
 
@@ -7271,6 +7419,7 @@ mod tests {
             is_generator: false,
             locals_count: 1,
             is_async: false,
+            lines: vec![],
         };
         let func_obj = alloc_function(func);
         let Object::Ref(func_ptr) = func_obj else {
@@ -8778,24 +8927,26 @@ run()
     }
 
     /// 未捕获异常终止程序并返回错误字符串（验证标准 9）。
+    /// task 57：MsException 路径输出 "Error: <message>"（§0.1 case 1，class_name
+    /// 不在标题中）。
     #[test]
     fn test_uncaught_exception() {
         let src = "throw ValueError(\"uncaught\")";
         let err = compile_and_run(src).unwrap_err();
-        assert!(err.contains("ValueError"), "got: {}", err);
-        assert!(err.contains("uncaught"), "got: {}", err);
+        assert!(err.contains("Error: uncaught"), "got: {}", err);
     }
 
     /// 裸 throw 在 except 块外抛 RuntimeError("nothing to rethrow")（验证标准 8）。
+    /// task 57：消息 "nothing to rethrow"（§0.1 case 1）。
     #[test]
     fn test_bare_throw_outside_except() {
         let src = "throw";
         let err = compile_and_run(src).unwrap_err();
-        assert!(err.contains("RuntimeError"), "got: {}", err);
         assert!(err.contains("nothing to rethrow"), "got: {}", err);
     }
 
     /// GeneratorExit 不可被用户 except 捕获（验证标准 13）。
+    /// task 57：消息 "ge"（§0.1 case 1）。
     #[test]
     fn test_generator_exit_not_caught() {
         let src = r#"
@@ -8808,8 +8959,7 @@ try {
 }
 "#;
         let err = compile_and_run(src).unwrap_err();
-        assert!(err.contains("GeneratorExit"), "got: {}", err);
-        assert!(err.contains("ge"), "got: {}", err);
+        assert!(err.contains("Error: ge"), "got: {}", err);
     }
 
     /// throw 非 string/Exception → TypeError。
@@ -8818,6 +8968,150 @@ try {
         let src = "throw 42";
         let err = compile_and_run(src).unwrap_err();
         assert!(err.contains("TypeError"), "got: {}", err);
+    }
+
+    // ---- task 57：友好错误信息与堆栈跟踪 ----
+
+    /// task 57 测试辅助：将源码写入临时文件后编译运行（带文件名），返回结果。
+    /// 文件路径同时传入编译器与 interpret_named，使错误信息能显示文件名并回读源码行。
+    fn run_source_in_file(filename: &str, source: &str) -> Result<Object, String> {
+        let path = std::env::temp_dir().join(filename);
+        std::fs::write(&path, source).unwrap();
+        let program = parse(source);
+        let path_str = path.to_string_lossy().to_string();
+        let mut compiler = Compiler::with_source(source, Some(path_str.clone()));
+        let chunk = compiler.compile(&program).unwrap();
+        let mut vm = VM::new();
+        let result = vm.interpret_named(chunk, Some(path_str));
+        std::fs::remove_file(&path).ok();
+        result
+    }
+
+    /// 除零错误：VM 内部 String 错误（§0.1 case 2），逐字输出，显示文件名/行号/源码行。
+    #[test]
+    fn test_error_divzero() {
+        let err = run_source_in_file("mslang_57_divzero.ms", "x = 10 / 0").unwrap_err();
+        assert!(
+            err.contains("ZeroDivisionError: division by zero"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("mslang_57_divzero.ms:1"), "got: {}", err);
+        assert!(err.contains("1 | x = 10 / 0"), "got: {}", err);
+        // 运行时错误无 column → 不画 ^ 行
+        assert!(!err.contains('^'), "should not draw caret: {}", err);
+    }
+
+    /// 类型错误：VM 内部 String 错误（§0.1 case 2），逐字输出。
+    #[test]
+    fn test_error_type() {
+        let err = run_source_in_file("mslang_57_type.ms", "x = \"hello\" + 42").unwrap_err();
+        assert!(
+            err.contains("TypeError: unsupported operand type(s) for +: 'string' and 'int'"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("mslang_57_type.ms:1"), "got: {}", err);
+        assert!(err.contains("x = \"hello\" + 42"), "got: {}", err);
+        assert!(!err.contains('^'), "should not draw caret: {}", err);
+    }
+
+    /// 索引越界：VM 内部 String 错误（§0.1 case 2），含位置与堆栈跟踪。
+    /// 注：`lst[10]` 经 INDEX opcode → normalize_index，错误字符串为
+    /// "index N out of range for length L"（mod.rs:1599），逐字输出。
+    #[test]
+    fn test_error_index() {
+        let err = run_source_in_file("mslang_57_index.ms", "lst = [1, 2, 3]\nprint(lst[10])")
+            .unwrap_err();
+        assert!(
+            err.contains("IndexError: index 10 out of range for length 3"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("mslang_57_index.ms:2"), "got: {}", err);
+        assert!(err.contains("print(lst[10])"), "got: {}", err);
+        // 单帧 <main> 仍出现在堆栈跟踪
+        assert!(err.contains("at <main>"), "got: {}", err);
+    }
+
+    /// 未捕获异常堆栈跟踪：MsException 路径（§0.1 case 1），"Error: <msg>" + 多帧跟踪。
+    #[test]
+    fn test_error_stack_trace() {
+        let src = "fn foo() {\n    bar()\n}\n\nfn bar() {\n    throw RuntimeError(\"oops\")\n}\n\nfoo()\n";
+        let err = run_source_in_file("mslang_57_st.ms", src).unwrap_err();
+        assert!(err.contains("Error: oops"), "got: {}", err);
+        assert!(err.contains("Stack trace:"), "got: {}", err);
+        // 帧顺序：最内层在前。bar@6 → foo@2 → <main>@9（行号由 AST line 跟踪）
+        assert!(
+            err.contains("at bar") && err.contains("mslang_57_st.ms:6"),
+            "got: {}",
+            err
+        );
+        assert!(
+            err.contains("at foo") && err.contains("mslang_57_st.ms:2"),
+            "got: {}",
+            err
+        );
+        assert!(
+            err.contains("at <main>") && err.contains("mslang_57_st.ms:9"),
+            "got: {}",
+            err
+        );
+    }
+
+    /// throw NameError：MsException 路径（§0.1 case 1）。
+    #[test]
+    fn test_error_undefined() {
+        let err = run_source_in_file(
+            "mslang_57_undef.ms",
+            "throw NameError(\"undefined variable 'undefined_var'\")",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Error: undefined variable 'undefined_var'"),
+            "got: {}",
+            err
+        );
+        assert!(err.contains("at <main>"), "got: {}", err);
+    }
+
+    /// 编译时错误：column + 源码行 + ^ 指示（§7）。
+    #[test]
+    fn test_compile_error_display() {
+        use crate::error::format_compile_error;
+        let path = std::env::temp_dir().join("mslang_57_compile.ms");
+        let source = "x = 1 + ";
+        std::fs::write(&path, source).unwrap();
+        let path_str = path.to_string_lossy().to_string();
+        let err = Lexer::new(source)
+            .tokenize_all()
+            .and_then(|tokens| Parser::new(tokens).parse())
+            .unwrap_err();
+        let formatted = format_compile_error(&path_str, source, &err);
+        std::fs::remove_file(&path).ok();
+        assert!(formatted.contains("Compile error:"), "got: {}", formatted);
+        assert!(
+            formatted.contains("mslang_57_compile.ms:1:"),
+            "got: {}",
+            formatted
+        );
+        assert!(formatted.contains("x = 1 + "), "got: {}", formatted);
+        assert!(formatted.contains("^--- here"), "got: {}", formatted);
+    }
+
+    /// 行号表迁移验证：Function.lines 由 chunk.lines 携带（§1.1）。
+    #[test]
+    fn test_function_carries_lines() {
+        let src = "x = 1\ny = 2\n";
+        let program = parse(src);
+        let mut compiler = Compiler::with_source(src, Some("test.ms".into()));
+        let chunk = compiler.compile(&program).unwrap();
+        // 顶层 chunk.lines 非空（emit_byte 每字节记录）
+        assert!(!chunk.lines.is_empty(), "chunk.lines should be populated");
+        // interpret_named 将 lines 迁入 <main> Function；无 panic 即成功
+        let mut vm = VM::new();
+        let r = vm.interpret_named(chunk, None);
+        assert!(r.is_ok(), "got: {:?}", r.err());
     }
 
     /// 编译器：try/except/finally 生成 TRY_ENTER / TRY_EXIT / CATCH / FINALLY_END 等指令。
@@ -11117,7 +11411,10 @@ assert(make() == 111)
     #[test]
     fn test_module_private_var_inaccessible() {
         // 标准 6：var（私有）不可从外部访问 → GET_ATTR 抛 NameError。
-        let dir = write_module("mslang_mod_priv", &[("p.ms", "var secret = 42\nfn pub() { return 1 }")]);
+        let dir = write_module(
+            "mslang_mod_priv",
+            &[("p.ms", "var secret = 42\nfn pub() { return 1 }")],
+        );
         let src = "import p\nassert(p.pub() == 1)\ntry {\n    p.secret\n} except NameError {\n    assert(true)\n}";
         let r = run_with_module_dir(src, &dir);
         std::fs::remove_dir_all(&dir).ok();
@@ -11190,7 +11487,10 @@ assert(make() == 111)
             "mslang_mod_fromstd",
             // 注：模块名用 "sample" 而非 "io"——task 46 起 "io" 为原生模块，会命中
             // native_modules 注册表而跳过磁盘，故此 @std 语义测试改用非保留名。
-            &[("stdlib/sample.ms", "fn open() { return \"opened\" }\nconst MODE = 1")],
+            &[(
+                "stdlib/sample.ms",
+                "fn open() { return \"opened\" }\nconst MODE = 1",
+            )],
         );
         let stdlib = dir.join("stdlib");
         let main = "from @std sample import open\nassert(open() == \"opened\")";
@@ -11229,16 +11529,15 @@ assert(make() == 111)
         let r = vm.interpret(chunk);
         std::fs::remove_dir_all(&dir).ok();
         let err = r.unwrap_err();
-        assert!(err.contains("ImportError"), "safe mode should reject: {}", err);
+        // task 57：MsException 路径输出 "Error: <message>"（§0.1 case 1）。
+        // 安全模式拒绝的 message 不含 class_name，断言消息内容。
+        assert!(err.contains("安全模式"), "safe mode should reject: {}", err);
     }
 
     #[test]
     fn test_module_safe_mode_allows_std() {
         // 标准 11 对照：安全模式下 @std import 正常加载。
-        let dir = write_module(
-            "mslang_mod_safestd",
-            &[("stdlib/m.ms", "const V = 5")],
-        );
+        let dir = write_module("mslang_mod_safestd", &[("stdlib/m.ms", "const V = 5")]);
         let stdlib = dir.join("stdlib");
         let main = "import @std m\nassert(m.V == 5)";
         let program = parse(main);
@@ -11290,7 +11589,11 @@ assert(make() == 111)
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..=201 {
-            let next = if i < 201 { format!("import d{}", i + 1) } else { String::new() };
+            let next = if i < 201 {
+                format!("import d{}", i + 1)
+            } else {
+                String::new()
+            };
             std::fs::write(dir.join(format!("d{}.ms", i)), next).unwrap();
         }
         let src = "import d0".to_string();
@@ -11306,8 +11609,8 @@ assert(make() == 111)
         let err = handle.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert!(
-            err.contains("ImportError") && err.contains("导入深度"),
-            "expected depth-limit ImportError, got: {}",
+            err.contains("导入深度"),
+            "expected depth-limit error, got: {}",
             err
         );
     }
@@ -11686,7 +11989,10 @@ assert(make() == 111)
     fn test_channel_buffer_size_validation() {
         // 编译期：buffer_size 超过 255 → 编译错误。
         let chunk = compile_result("ch = channel(256)");
-        assert!(chunk.is_err(), "expected compile error for buffer size > 255");
+        assert!(
+            chunk.is_err(),
+            "expected compile error for buffer size > 255"
+        );
     }
 
     #[test]
@@ -12220,15 +12526,9 @@ assert(make() == 111)
         for _ in 0..256 {
             cases.push_str("case v = <-ch {}\n");
         }
-        let src = format!(
-            "ch = channel(1)\nselect {{\n{}\n}}\n",
-            cases
-        );
+        let src = format!("ch = channel(1)\nselect {{\n{}\n}}\n", cases);
         let result = compile_result(&src);
-        assert!(
-            result.is_err(),
-            "expected compile error for > 255 cases"
-        );
+        assert!(result.is_err(), "expected compile error for > 255 cases");
         assert!(result.unwrap_err().contains("exceeds 255"));
     }
 

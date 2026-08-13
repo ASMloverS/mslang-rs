@@ -93,11 +93,11 @@ impl Compiler {
                     .as_ref()
                     .ok_or_else(|| "'super' used outside of class method".to_string())?;
                 let class_idx = self.add_constant(alloc_string(class_name));
-                let class_idx = u16::try_from(class_idx)
-                    .map_err(|_| "constant pool overflow".to_string())?;
+                let class_idx =
+                    u16::try_from(class_idx).map_err(|_| "constant pool overflow".to_string())?;
                 let name_idx = self.add_constant(alloc_string(name));
-                let name_idx = u16::try_from(name_idx)
-                    .map_err(|_| "constant pool overflow".to_string())?;
+                let name_idx =
+                    u16::try_from(name_idx).map_err(|_| "constant pool overflow".to_string())?;
                 self.emit_byte(OpCode::GetSuper as u8, line);
                 self.emit_bytes(&class_idx.to_be_bytes(), line);
                 self.emit_bytes(&name_idx.to_be_bytes(), line);
@@ -166,7 +166,10 @@ impl Compiler {
             _ => {
                 let thunk = Expr::FnLiteral {
                     params: vec![],
-                    body: vec![Stmt::ExprStmt { expr: expr.clone() }],
+                    body: vec![Stmt::ExprStmt {
+                        expr: expr.clone(),
+                        line: 0,
+                    }],
                 };
                 self.compile_expression(&thunk, line)?;
             }
@@ -710,6 +713,7 @@ impl Compiler {
             is_generator: func_unit.is_generator,
             locals_count: func_unit.locals.len(),
             is_async: false,
+            lines: func_unit.chunk.lines,
         };
         let func_idx = self.add_constant(alloc_function(function));
         let func_idx = u16::try_from(func_idx)
@@ -1081,6 +1085,7 @@ impl Compiler {
             is_generator: true,
             locals_count: func_unit.locals.len(),
             is_async: false,
+            lines: func_unit.chunk.lines,
         };
         let func_idx = self.add_constant(crate::vm::object::alloc_function(function));
         let func_idx = u16::try_from(func_idx).map_err(|_| "constant pool overflow".to_string())?;

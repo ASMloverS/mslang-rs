@@ -98,8 +98,10 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Stmt> {
         self.skip_newlines();
+        // task 57：捕获语句首 token 的行号，分派后写入 AST（行号表 §1）。
+        let line = self.peek().span.start.line;
 
-        if self.check(&TokenKind::At) {
+        let stmt = if self.check(&TokenKind::At) {
             self.parse_declaration()
         } else if self.check(&TokenKind::Var) {
             self.parse_var_decl()
@@ -123,11 +125,11 @@ impl Parser {
         } else if self.check(&TokenKind::Break) {
             self.advance();
             self.consume_newline();
-            Ok(Stmt::Break)
+            Ok(Stmt::Break { line })
         } else if self.check(&TokenKind::Continue) {
             self.advance();
             self.consume_newline();
-            Ok(Stmt::Continue)
+            Ok(Stmt::Continue { line })
         } else if self.check(&TokenKind::Return) {
             self.parse_return()
         } else if self.check(&TokenKind::Nonlocal) {
@@ -152,7 +154,11 @@ impl Parser {
             self.parse_select()
         } else {
             self.parse_expr_or_assignment()
-        }
+        };
+        // 写入行号（子解析器构造时填 line: 0，此处统一覆盖为首 token 行号）。
+        let mut stmt = stmt?;
+        stmt.set_line(line);
+        Ok(stmt)
     }
 
     // task 13（parse_if 等）与 task 14（匿名函数体）调用；task 11 经测试覆盖。
@@ -316,8 +322,8 @@ mod tests {
         // break/continue 由 parse_statement 直接处理（非 stub），验证分发 + consume_newline。
         let prog = parse("break\ncontinue\n").unwrap();
         assert_eq!(prog.statements.len(), 2);
-        assert!(matches!(prog.statements[0], Stmt::Break));
-        assert!(matches!(prog.statements[1], Stmt::Continue));
+        assert!(matches!(prog.statements[0], Stmt::Break { .. }));
+        assert!(matches!(prog.statements[1], Stmt::Continue { .. }));
     }
 
     #[test]
@@ -325,7 +331,7 @@ mod tests {
         // consume_newline 在 EOF 时安全无操作（不 panic）。
         let prog = parse("break").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(prog.statements[0], Stmt::Break));
+        assert!(matches!(prog.statements[0], Stmt::Break { .. }));
     }
 
     #[test]
@@ -347,7 +353,7 @@ mod tests {
         let mut p = parser_from("{\nbreak\n}\n");
         let block = p.parse_block().unwrap();
         assert_eq!(block.len(), 1);
-        assert!(matches!(block[0], Stmt::Break));
+        assert!(matches!(block[0], Stmt::Break { .. }));
     }
 
     #[test]
