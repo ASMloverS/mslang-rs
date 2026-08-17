@@ -951,10 +951,22 @@ MS_API void msUnroot(MsVM *vm, MsValue *val);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
- * 写屏障。MVP STW GC 无并发标记，此处为 no-op（仅指针非空校验）。
- * Phase 7.5 升级为快照-at-the-barrier。
+ * 写屏障。task 77 升级为委托 VM 内部 `write_barrier_obj`（Go 1.8+ 风格混合写屏障）。
+ *
+ * **保守近似**：C API 签名 `msWriteBarrier(vm, parent, new_val)` 缺少 `old_val` 参数
+ * （13-capi.md:642 已固化），故仅走插入屏障侧（shade new_val）+ 无条件 card marking，
+ * 不走删除屏障侧（无法 shade 被覆盖的旧值）。详见 task 77 § 写屏障。
+ *
+ * 行为：
+ * - 非并发标记阶段：仅 card marking（Old parent → Young new_val，开销极小），着色逻辑返回。
+ * - 并发标记阶段：额外将 White 的 new_val 原子标灰 + 入灰色队列。
+ *
+ * 仅对 Ref 类型（堆对象）有效；内联值（Int/Float/Bool/Nil）为安全 no-op。NULL 安全。
  */
-MS_API void msWriteBarrier(MsVM *vm, MsValue *parent, MsValue *new_val);
+MS_API
+void msWriteBarrier(MsVM *vm,
+                    MsValue *parent,
+                    MsValue *new_val);
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
@@ -1010,9 +1022,16 @@ MS_API void msGcSetPromotionAge(MsVM *vm, uint32_t age);
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
- * 设置 GC 线程数（MVP 仅存储不使用；Phase 7.5 控制 Worker 线程池）。
+ * 设置 GC 线程数。task 77 升级：写入 `heap.gc_threads_setting`，下次并发 GC 周期 Init
+ * 阶段（`init_concurrent_mark`）读取此字段写入 `gc_runtime.gc_threads`（AtomicU32），
+ * 供 Coordinator 启动 Worker 池。当前周期不生效。
+ *
+ * clamp 到 `gc_threads_max()`（CPU 核数上限），与脚本侧 `gc.set_gc_threads` 一致
+ * （Task 64 C5）。Task 64 自适应调整可能在下次 GC 收尾单调上调此值。
  */
-MS_API void msGcSetGcThreads(MsVM *vm, uint32_t threads);
+MS_API
+void msGcSetGcThreads(MsVM *vm,
+                      uint32_t threads);
 #endif
 
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
@@ -1025,8 +1044,15 @@ MS_API void msGcSetDebug(MsVM *vm, int32_t enable);
 #if (defined(MS_CAPI_ENABLED) && defined(MS_CAPI_ENABLED))
 /**
  * 返回 GC 统计快照。NULL vm 返回全零 MsGcStats。
+ *
+ * task 77：扩展并发 GC 指标。从 `MsHeap`（mutator 独占字段）+ `GcRuntime`
+ * （Arc deref 原子 load）直接组装——无 `MsHeap::get_stats()` 方法（沿用 Task 74 模式）。
+ *
+ * `gc_threads`：并发模式（`concurrent_enabled=true`）返回 `gc_runtime.gc_threads` 真实值；
+ * 降级模式（默认）返回 1（STW 单线程实际值）。
  */
-MS_API MsGcStats msGcStats(MsVM *vm);
+MS_API
+MsGcStats msGcStats(MsVM *vm);
 #endif
 
 #endif /* MSLANG_MODULE_H */
