@@ -553,7 +553,9 @@ impl VM {
             Err(msg) => {
                 // last_uncaught_exception 为 Some → MsException 路径，msg 已格式化；
                 // 否则为 VM 内部 String 错误，需构建 RuntimeError（call_stack 完好）。
-                if self.last_uncaught_exception.is_some() {
+                // task 58：os.exit 的 __EXIT__ 标记为宿主控制信号（task 48 §2、
+                // stdlib.rs native_os_exit），不参与错误格式化，逐字透传给 CLI main 消费。
+                if self.last_uncaught_exception.is_some() || msg.starts_with("__EXIT__") {
                     Err(msg)
                 } else {
                     Err(self.format_vm_internal_error(&msg))
@@ -597,6 +599,16 @@ impl VM {
         compiler.set_module_mode(true);
         let chunk = compiler.compile(&program)?;
         self.interpret(chunk).map(|_| ())
+    }
+
+    /// task 58：带源文件名的 exec（与 exec 同路径，仅 interpret → interpret_named）。
+    pub fn exec_file(&mut self, source: &str, file: &str) -> Result<(), String> {
+        self.reset_execution_state();
+        let program = parse_source(source)?;
+        let mut compiler = crate::compiler::Compiler::new();
+        compiler.set_module_mode(true);
+        let chunk = compiler.compile(&program)?;
+        self.interpret_named(chunk, Some(file.to_string())).map(|_| ())
     }
 
     /// task 56：求值表达式并返回结果。要求源码顶层为单个裸表达式（ExprStmt），
@@ -5355,14 +5367,27 @@ impl VM {
         result
     }
 
-    /// 测试用：注入模块搜索根（把指定目录置于搜索首位）。
-    #[doc(hidden)]
+    /// task 58：解析 CLI run 目标为脚本文件路径。显式文件路径（含路径分隔符 /
+    /// 以 .ms 结尾 / 目标文件已存在）直接返回；否则按模块路径经
+    /// ModuleResolver::resolve 解析（与 import 同一规则）。
+    pub fn resolve_run_target(&self, target: &str) -> Result<PathBuf, String> {
+        let p = std::path::Path::new(target);
+        if target.ends_with(".ms")
+            || target.contains('/')
+            || target.contains(std::path::MAIN_SEPARATOR)
+            || p.exists()
+        {
+            return Ok(p.to_path_buf());
+        }
+        self.module_resolver.resolve(target, false)
+    }
+
+    /// 注入模块搜索根（把指定目录置于搜索首位）。
     pub fn add_module_search_path(&mut self, path: PathBuf) {
         self.module_resolver.add_search_path(path);
     }
 
-    /// 测试用：设置安全模式。
-    #[doc(hidden)]
+    /// 设置安全模式。
     pub fn set_module_safe_mode(&mut self, on: bool) {
         self.module_resolver.safe_mode = on;
     }
