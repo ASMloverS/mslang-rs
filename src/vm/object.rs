@@ -1384,12 +1384,21 @@ impl Object {
                 let result = unsafe { read_str(*a) }.to_owned() + unsafe { read_str(*b) };
                 Ok(alloc_string(&result))
             }
+            // list + list → 新列表（02-types.md § List 操作表）
+            _ if Self::both_lists(self, other) => self.list_concat(other),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for +: '{}' and '{}'",
                 self.type_name(),
                 other.type_name()
             )),
         }
+    }
+
+    /// 两操作数是否均为 List（供 + 的拼接分派）。
+    fn both_lists(a: &Object, b: &Object) -> bool {
+        matches!((a, b), (Object::Ref(p), Object::Ref(q))
+            if unsafe { (**p).type_tag } == TypeTag::LIST as u8
+                && unsafe { (**q).type_tag } == TypeTag::LIST as u8)
     }
 
     pub fn subtract(&self, other: &Object) -> Result<Object, String> {
@@ -1401,6 +1410,8 @@ impl Object {
             (Object::Int(a), Object::Float(b)) => Ok(Object::Float(*a as f64 - b)),
             (Object::Float(a), Object::Int(b)) => Ok(Object::Float(a - *b as f64)),
             (Object::Float(a), Object::Float(b)) => Ok(Object::Float(a - b)),
+            // set - set → 差集（02-types.md § Set 操作表）
+            _ if Self::both_sets(self, other) => self.set_difference(other),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for -: '{}' and '{}'",
                 self.type_name(),
@@ -1741,6 +1752,8 @@ impl Object {
     pub fn bit_and(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
             (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a & b)),
+            // set & set → 交集（02-types.md § Set 操作表）
+            _ if Self::both_sets(self, other) => self.set_intersection(other),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for &: '{}' and '{}'",
                 self.type_name(),
@@ -1752,6 +1765,8 @@ impl Object {
     pub fn bit_or(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
             (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a | b)),
+            // set | set → 并集（02-types.md § Set 操作表）
+            _ if Self::both_sets(self, other) => self.set_union(other),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for |: '{}' and '{}'",
                 self.type_name(),
@@ -1763,12 +1778,21 @@ impl Object {
     pub fn bit_xor(&self, other: &Object) -> Result<Object, String> {
         match (self, other) {
             (Object::Int(a), Object::Int(b)) => Ok(Object::Int(a ^ b)),
+            // set ^ set → 对称差（02-types.md § Set 操作表）
+            _ if Self::both_sets(self, other) => self.set_symmetric_difference(other),
             _ => Err(format!(
                 "TypeError: unsupported operand type(s) for ^: '{}' and '{}'",
                 self.type_name(),
                 other.type_name()
             )),
         }
+    }
+
+    /// 两操作数是否均为 Set（供位运算符的集合分派）。
+    fn both_sets(a: &Object, b: &Object) -> bool {
+        matches!((a, b), (Object::Ref(p), Object::Ref(q))
+            if unsafe { (**p).type_tag } == TypeTag::SET as u8
+                && unsafe { (**q).type_tag } == TypeTag::SET as u8)
     }
 
     pub fn bit_not(&self) -> Result<Object, String> {

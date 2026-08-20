@@ -195,6 +195,16 @@ impl Compiler {
     }
 
     fn compile_identifier(&mut self, name: &str, line: usize) -> Result<(), String> {
+        // global 声明（03-syntax.md § global 声明）：名字绑定到全局作用域，
+        // 优先于局部/上值解析。
+        if self.global_names.contains(name) {
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow".to_string())?;
+            self.emit_byte(OpCode::LoadGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+            return Ok(());
+        }
         if let Some(slot) = self.resolve_local(name) {
             self.emit_byte(OpCode::LoadLocal as u8, line);
             self.emit_byte(slot as u8, line);
@@ -391,6 +401,14 @@ impl Compiler {
                         .ok_or_else(|| format!("no binding for nonlocal '{}'", name))?;
                     self.emit_byte(OpCode::StoreUpvalue as u8, line);
                     self.emit_byte(idx as u8, line);
+                } else if self.global_names.contains(name) {
+                    // global 写语义（03-syntax.md § global 声明）：绑定全局，
+                    // 不在当前作用域创建局部。
+                    let name_idx = self.add_constant(alloc_string(name));
+                    let name_idx = u16::try_from(name_idx)
+                        .map_err(|_| "constant pool overflow".to_string())?;
+                    self.emit_byte(OpCode::StoreGlobal as u8, line);
+                    self.emit_bytes(&name_idx.to_be_bytes(), line);
                 } else if let Some(slot) = self.resolve_local(name) {
                     self.emit_byte(OpCode::StoreLocal as u8, line);
                     self.emit_byte(slot as u8, line);
@@ -446,11 +464,16 @@ impl Compiler {
         else_expr: &Expr,
         line: usize,
     ) -> Result<(), String> {
+        // JumpIfFalse 为 peek 语义（不弹条件，见 if 语句/and/or 的约定），
+        // 真/假两支各需一次 POP 弹掉条件，否则三元嵌套在元组/调用等
+        // 非首元素位置时条件残留破坏栈布局。
         self.compile_expression(condition, line)?;
         let else_jump = self.emit_jump(OpCode::JumpIfFalse, line);
+        self.emit_byte(OpCode::Pop as u8, line);
         self.compile_expression(then_expr, line)?;
         let end_jump = self.emit_jump(OpCode::Jump, line);
         self.patch_jump(else_jump)?;
+        self.emit_byte(OpCode::Pop as u8, line);
         self.compile_expression(else_expr, line)?;
         self.patch_jump(end_jump)?;
         Ok(())
@@ -677,11 +700,16 @@ impl Compiler {
 
         // 换出父单元，编译函数体。parent 指向 saved_unit（裸指针，规避 self-referential
         // 借用冲突 — task 28 方案），使 resolve_upvalue_recursive 可攀爬外层。
+        // nonlocal/global 声明集合按函数体隔离保存/恢复（同具名函数路径）。
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        let saved_nonlocal = std::mem::take(&mut self.nonlocal_names);
+        let saved_global = std::mem::take(&mut self.global_names);
         self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line); // 隐式 return nil
         self.emit_return(line);
+        self.nonlocal_names = saved_nonlocal;
+        self.global_names = saved_global;
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
         // 上值捕获回填（task 28）：is_local=true 的上值对应父单元局部变量，
@@ -1025,6 +1053,8 @@ impl Compiler {
             parent: std::ptr::null(),
         };
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        let saved_nonlocal = std::mem::take(&mut self.nonlocal_names);
+        let saved_global = std::mem::take(&mut self.global_names);
         self.unit.parent = std::ptr::addr_of!(saved_unit);
 
         // 预留所有子句的 iter/target slot（Nil 占位 + declare_local）。
@@ -1055,7 +1085,9 @@ impl Compiler {
         self.emit_byte(OpCode::Nil as u8, line);
         self.emit_return(line);
 
-        // 换回父单元 + 上值回填。
+        // 换回父单元 + 声明集合恢复 + 上值回填。
+        self.nonlocal_names = saved_nonlocal;
+        self.global_names = saved_global;
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
         let captured: Vec<usize> = func_unit
             .upvalues

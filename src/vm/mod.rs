@@ -2201,9 +2201,9 @@ impl VM {
 
         let inst_obj = alloc_instance(cls_ptr);
         // §13：含 __del__ 的类，instance 置 has_finalizer（配合 task 52 run_finalizers）。
-        let has_del = unsafe { read_class(cls_ptr) }
-            .methods
-            .contains_key("__del__");
+        // __del__/__init__ 均沿继承链查找（find_method）——子类未定义时继承父类的
+        // 构造/析构（与 Python 一致，06-oop.md § 继承）。
+        let has_del = unsafe { read_class(cls_ptr).find_method("__del__") }.is_some();
         if let Object::Ref(ip) = &inst_obj {
             if has_del {
                 unsafe {
@@ -2212,10 +2212,7 @@ impl VM {
             }
         }
 
-        let init_ptr_opt = unsafe { read_class(cls_ptr) }
-            .methods
-            .get("__init__")
-            .copied();
+        let init_ptr_opt = unsafe { read_class(cls_ptr).find_method("__init__") };
         match init_ptr_opt {
             Some(init_ptr) => {
                 // task 41 §2 call_class 切换：以 BoundMethod 为 callee，self 由 CALL
@@ -3432,8 +3429,29 @@ impl VM {
                             return Err("argument of type 'instance' is not iterable".into());
                         }
                     } else {
-                        // task 22/24 内置成员判断（String 子串、List/Set/Dict 成员）。
-                        self.push(container.contains_str(&item)?)?;
+                        // task 22/24 内置成员判断：String 子串 + List/Dict/Tuple/Set
+                        // 成员（object.rs 的 *_contains 已实现，按容器类型标签分派）。
+                        // 非容器类型落入 contains_str 的报错路径。
+                        let result = if let Object::Ref(ptr) = &container {
+                            match unsafe { (**ptr).type_tag } {
+                                t if t == TypeTag::LIST as u8 => {
+                                    container.list_contains(&item)
+                                }
+                                t if t == TypeTag::DICT as u8 => {
+                                    container.dict_contains(&item)
+                                }
+                                t if t == TypeTag::TUPLE as u8 => {
+                                    container.tuple_contains(&item)
+                                }
+                                t if t == TypeTag::SET as u8 => {
+                                    container.set_contains(&item)
+                                }
+                                _ => container.contains_str(&item),
+                            }
+                        } else {
+                            container.contains_str(&item)
+                        };
+                        self.push(result?)?;
                     }
                 }
 
@@ -4877,15 +4895,38 @@ impl VM {
                             ))
                         }
                     };
-                    // task 55：关闭闭包捕获的所有开放上值。go 协程运行在独立栈上，
-                    // 开放上值指向当前协程栈槽，协程切换后失效。关闭上值将栈值快照到
-                    // MsUpvalue.closed，使 go 协程安全访问捕获变量（参照 HALT 的 close 逻辑）。
+                    // task 55：协程运行在独立栈上，闭包捕获的开放上值指向当前
+                    // 协程栈槽，切换后失效。为协程克隆闭包并以当前栈值快照开放
+                    // 上值——不能直接 close 共享上值对象：同位置的后续闭包（如
+                    // 循环内每轮 go 的 thunk）会复用首次快照的陈旧值。
+                    let mut go_closure_ptr = closure_ptr;
                     {
                         let closure = unsafe { read_closure(closure_ptr) };
+                        let func_ptr = closure.function;
+                        let mut new_uvs: Vec<*mut MsObjHeader> =
+                            Vec::with_capacity(closure.upvalues.len());
+                        let mut has_open = false;
                         for &uv_ptr in closure.upvalues.iter() {
                             let uv = unsafe { read_upvalue(uv_ptr) };
                             if uv.closed.is_none() {
-                                uv.close(&self.stack);
+                                has_open = true;
+                                let snap = alloc_upvalue(uv.location);
+                                if let Object::Ref(sp) = snap {
+                                    unsafe {
+                                        read_upvalue(sp).closed =
+                                            Some(self.stack[uv.location].clone());
+                                    }
+                                    new_uvs.push(sp);
+                                }
+                            } else {
+                                new_uvs.push(uv_ptr);
+                            }
+                        }
+                        if has_open {
+                            if let Object::Ref(np) =
+                                alloc_closure(Object::Ref(func_ptr), new_uvs)
+                            {
+                                go_closure_ptr = np;
                             }
                         }
                     }
@@ -4896,10 +4937,10 @@ impl VM {
                         _ => unreachable!(),
                     };
                     // 创建协程：slot 0 = callee（closure 自身），frame 从地址 0 开始
-                    let frame = CallFrame::new(closure_ptr, 0, 0);
+                    let frame = CallFrame::new(go_closure_ptr, 0, 0);
                     let coroutine = Coroutine {
                         call_stack: vec![frame],
-                        stack: vec![callable],
+                        stack: vec![Object::Ref(go_closure_ptr)],
                         defer_stack: Vec::new(),
                         open_upvalues: Vec::new(),
                         exception_handlers: Vec::new(),

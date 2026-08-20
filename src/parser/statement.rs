@@ -133,10 +133,19 @@ impl Parser {
             }
         }
 
+        // 值侧：多表达式构造元组解包（a, b = 1, 2）；恰好一个表达式时
+        // 直接用其值解包（a, b, c = fn() / = [1,2,3]，03-syntax.md:150
+        // 元组解包语义，VM UNPACK 接受 tuple/list）。
+        let value = if values.len() == 1 {
+            values.pop().unwrap()
+        } else {
+            Expr::TupleLiteral { elements: values }
+        };
+
         Ok(Stmt::Assign {
             target: Expr::TupleLiteral { elements: targets },
             op: AssignOp::Assign,
-            value: Expr::TupleLiteral { elements: values },
+            value,
             line: 0,
         })
     }

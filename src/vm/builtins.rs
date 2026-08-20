@@ -342,6 +342,47 @@ pub(crate) fn object_to_string(vm: &mut VM, obj: &Object) -> Result<String, Stri
             }
             return Ok(format!("<{} instance>", name));
         }
+        // 容器内嵌套 Instance：递归经本函数渲染（fmt::Display 无 VM 访问，
+        // 嵌套实例会显示 <object:N>）；标量路径结果与 Display 一致。
+        let tag = unsafe { (**ptr).type_tag };
+        if tag == TypeTag::LIST as u8 {
+            let items = unsafe { read_list(*ptr) };
+            let parts: Vec<String> = items
+                .iter()
+                .map(|it| object_to_string(vm, it))
+                .collect::<Result<_, _>>()?;
+            return Ok(format!("[{}]", parts.join(", ")));
+        }
+        if tag == TypeTag::TUPLE as u8 {
+            let items = unsafe { read_tuple(*ptr) };
+            let parts: Vec<String> = items
+                .iter()
+                .map(|it| object_to_string(vm, it))
+                .collect::<Result<_, _>>()?;
+            if parts.len() == 1 {
+                return Ok(format!("({},)", parts[0]));
+            }
+            return Ok(format!("({})", parts.join(", ")));
+        }
+        if tag == TypeTag::DICT as u8 {
+            let map = unsafe { read_dict(*ptr) };
+            let parts: Vec<String> = map
+                .items()
+                .iter()
+                .map(|(k, v)| {
+                    Ok::<String, String>(format!("{}: {}", k, object_to_string(vm, v)?))
+                })
+                .collect::<Result<_, _>>()?;
+            return Ok(format!("{{{}}}", parts.join(", ")));
+        }
+        if tag == TypeTag::SET as u8 {
+            let set = unsafe { read_set(*ptr) };
+            let parts: Vec<String> = set
+                .iter()
+                .map(|it| object_to_string(vm, it))
+                .collect::<Result<_, _>>()?;
+            return Ok(format!("{{{}}}", parts.join(", ")));
+        }
     }
     Ok(format!("{}", obj))
 }
@@ -730,6 +771,9 @@ fn builtin_isinstance(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
                 }
             } else if tag == TypeTag::STRING as u8 {
                 unsafe { read_str(*ptr) }.to_owned()
+            } else if tag == TypeTag::CLASS as u8 {
+                // task 40：用户类作为类型对象，读取类名
+                unsafe { read_class(*ptr) }.name.clone()
             } else {
                 return Err("isinstance(): second argument must be a type".to_string());
             }
@@ -737,7 +781,24 @@ fn builtin_isinstance(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
         _ => return Err("isinstance(): second argument must be a type".to_string()),
     };
 
-    // INSTANCE 继承链匹配由 task 40/41 实现；MVP 仅比较 type_name。
+    // INSTANCE 沿继承链匹配类名（task 40/41）；其余仅比较 type_name。
+    if let Object::Ref(ptr) = val {
+        debug_assert!(!ptr.is_null(), "null Object::Ref");
+        if unsafe { (**ptr).type_tag } == TypeTag::INSTANCE as u8 {
+            let mut class_ptr = unsafe { read_instance(*ptr) }.class;
+            loop {
+                let c = unsafe { read_class(class_ptr) };
+                if c.name == expected_type_name {
+                    return Ok(Object::Bool(true));
+                }
+                match c.parent {
+                    Some(p) => class_ptr = p,
+                    None => break,
+                }
+            }
+            return Ok(Object::Bool(false));
+        }
+    }
     Ok(Object::Bool(val.type_name() == expected_type_name.as_str()))
 }
 
@@ -965,18 +1026,31 @@ fn builtin_zip(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 
 /// map(fn, iterable) -> 列表。急切求值（10-builtins.md:104-105）。
 /// 依赖用户函数调用（task 27/28），本 task 以存根返回 Err。
-fn builtin_map(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let _fn_arg = args.get(0).ok_or("map() requires 2 arguments")?;
-    let _iterable = args.get(1).ok_or("map() requires 2 arguments")?;
-    Err("map() requires function call support (Phase 3)".to_string())
+fn builtin_map(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let fn_arg = args.get(0).ok_or("map() requires 2 arguments")?;
+    let iterable = args.get(1).ok_or("map() requires 2 arguments")?;
+    // 急切求值（10-builtins.md:104）：逐元素经 call_function 调用映射函数。
+    let mut iter = to_iterator(iterable)?;
+    let mut out: Vec<Object> = Vec::new();
+    while let Some(val) = iter.next() {
+        out.push(vm.call_function(fn_arg, &[val])?);
+    }
+    Ok(alloc_list(out))
 }
 
 /// filter(fn, iterable) -> 列表。急切求值（10-builtins.md:104-105）。
-/// 依赖用户函数调用（task 27/28），本 task 以存根返回 Err。
-fn builtin_filter(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let _fn_arg = args.get(0).ok_or("filter() requires 2 arguments")?;
-    let _iterable = args.get(1).ok_or("filter() requires 2 arguments")?;
-    Err("filter() requires function call support (Phase 3)".to_string())
+fn builtin_filter(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let fn_arg = args.get(0).ok_or("filter() requires 2 arguments")?;
+    let iterable = args.get(1).ok_or("filter() requires 2 arguments")?;
+    let mut iter = to_iterator(iterable)?;
+    let mut out: Vec<Object> = Vec::new();
+    while let Some(val) = iter.next() {
+        let keep = vm.call_function(fn_arg, std::slice::from_ref(&val))?;
+        if keep.is_truthy() {
+            out.push(val);
+        }
+    }
+    Ok(alloc_list(out))
 }
 
 /// any(iterable) -> 任一为 truthy 即 true。

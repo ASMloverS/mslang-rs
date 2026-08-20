@@ -61,6 +61,22 @@ cargo build
 cargo test
 ```
 
+## Tests
+
+The `.ms` corpus lives under `tests/ms/` (core / functions / advanced / oop /
+errors / stdlib / concurrency / modules / negative), executed one by one via
+`ms run` by the `tests/ms_corpus.rs` harness:
+
+```
+cargo test --test ms_corpus
+```
+
+- Regular cases: must pass (exit 0); cases with a `.expected` sidecar have
+  stdout compared
+- `negative/` cases: expected to fail, stderr must contain the substrings
+  from the `.expected` file
+- Demo scripts live in `examples/`
+
 ## Documentation
 
 | Doc | Content |

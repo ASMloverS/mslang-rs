@@ -237,6 +237,17 @@ impl Compiler {
                 None => Err(format!("no binding for nonlocal '{}'", name)),
             };
         }
+        // global 写语义（03-syntax.md § global 声明）：语句级 `=` 对 global 名字
+        // 写全局，不在当前作用域创建新局部（parse 层把简单赋值解析为 VarDecl，
+        // 无此检查会遮蔽全局）。
+        if self.global_names.contains(name) {
+            let name_idx = self.add_constant(alloc_string(name));
+            let name_idx = u16::try_from(name_idx)
+                .map_err(|_| "constant pool overflow".to_string())?;
+            self.emit_byte(OpCode::StoreGlobal as u8, line);
+            self.emit_bytes(&name_idx.to_be_bytes(), line);
+            return Ok(());
+        }
         // task 45 §7：模块模式下顶层（无父单元）const/var/`=` 走 STORE_GLOBAL，
         // 使 execute_module 能经 globals 捕获模块顶层定义（与 fn/class 顶层一致）。
         // 函数体内（有父单元）不受影响，仍走局部 slot。
@@ -415,11 +426,17 @@ impl Compiler {
 
         // 换出父单元，编译函数体。期间 func_unit.parent 指向 saved_unit（裸指针，
         // 规避 self-referential 借用冲突，见 CompilationUnit.parent 字段注释）。
+        // nonlocal/global 声明集合按函数体隔离保存/恢复：声明仅在所属函数内生效，
+        // 不泄漏到随后编译的兄弟函数。
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
+        let saved_nonlocal = std::mem::take(&mut self.nonlocal_names);
+        let saved_global = std::mem::take(&mut self.global_names);
         self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line);
         self.emit_return(line);
+        self.nonlocal_names = saved_nonlocal;
+        self.global_names = saved_global;
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
         // 上值捕获回填：函数体中 is_local=true 的上值对应父单元的局部变量，
@@ -685,8 +702,20 @@ impl Compiler {
                 self.emit_byte(count, line);
             }
         }
-        // task 37：try body 内 return 须先注销所有外层 try 的 handler。
+        // task 37：try body 内 return 须先注销所有外层 try 的 handler；
+        // 补全（05-control-flow.md:85）：注销后按内→外内联各层 finally，
+        // finally 语句净零栈效应，return 值保持栈顶；finally 体内抛出的
+        // 异常向外传播（不被本层 except 捕获，与 Python 一致）。
         self.emit_early_exit_try_exits(line);
+        let inlined: Vec<crate::ast::Stmt> = self
+            .finally_stack
+            .iter()
+            .rev()
+            .flat_map(|(_, fb)| fb.iter().cloned())
+            .collect();
+        for stmt in &inlined {
+            self.compile_statement(stmt, line)?;
+        }
         self.emit_return(line);
         Ok(())
     }
@@ -765,7 +794,11 @@ impl Compiler {
         let body_start = self.current_offset(); // TRY_ENTER 执行后 frame.ip 指向此处
 
         // try body（try_depth++ 使内部 return/break/continue 注销 handler）。
+        // 含 finally 的 try 压入 finally_stack，供 early-exit 内联执行。
         self.try_depth += 1;
+        if let Some(fb) = finally_block {
+            self.finally_stack.push((self.try_depth, fb.to_vec()));
+        }
         for stmt in try_block {
             self.compile_statement(stmt, line)?;
         }
@@ -830,7 +863,10 @@ impl Compiler {
         self.patch_jump(normal_exit_jump)?;
 
         // finally 体（若有）：执行后 FINALLY_END 决定续抛或 fall-through 到 end。
+        // 编译 finally 体前弹出 finally_stack 条目——finally 内的 return 不再
+        // 递归内联自身（只内联更外层）。
         if let Some(fb) = finally_block {
+            self.finally_stack.pop();
             for stmt in fb {
                 self.compile_statement(stmt, line)?;
             }
@@ -1143,6 +1179,7 @@ impl Compiler {
         self.current_loop.push(super::LoopContext {
             loop_start,
             break_jumps: Vec::new(),
+            enclosing_try_depth: self.try_depth,
         });
 
         for stmt in body {
@@ -1191,29 +1228,17 @@ impl Compiler {
         body: &[Stmt],
         line: usize,
     ) -> Result<(), String> {
-        // 1. 预留迭代器 slot：发射 Nil 占位 + 声明隐藏局部
-        self.emit_byte(OpCode::Nil as u8, line);
+        // 1. 预留迭代器 slot（Nil 占位 + 声明隐藏局部；同名循环复用 slot）
         let iter_name = format!("__for_iter_{}", variable);
-        self.declare_local(&iter_name, line)?;
-        let iter_slot = self
-            .resolve_local(&iter_name)
-            .ok_or("internal: for-iter local not found after declare")?;
+        let iter_slot = self.reserve_local_slot(&iter_name, line)?;
 
         let loop_start;
         let for_iter_exit;
 
         if let Some(var2) = second_variable {
             // 双变量：预留两个 slot
-            self.emit_byte(OpCode::Nil as u8, line); // reserve var1 slot
-            self.declare_local(variable, line)?;
-            let slot1 = self
-                .resolve_local(variable)
-                .ok_or("internal: loop var not found after declare")?;
-            self.emit_byte(OpCode::Nil as u8, line); // reserve var2 slot
-            self.declare_local(var2, line)?;
-            let slot2 = self
-                .resolve_local(var2)
-                .ok_or("internal: loop var not found after declare")?;
+            let slot1 = self.reserve_local_slot(variable, line)?;
+            let slot2 = self.reserve_local_slot(var2, line)?;
 
             // 2. 编译 iterable → ITERATOR → StoreLocal iter_slot
             self.compile_expression(iterable, line)?;
@@ -1231,12 +1256,8 @@ impl Compiler {
             self.emit_byte(OpCode::StoreLocal as u8, line);
             self.emit_byte(slot2 as u8, line);
         } else {
-            // 单变量：预留一个 slot
-            self.emit_byte(OpCode::Nil as u8, line); // reserve var slot
-            self.declare_local(variable, line)?;
-            let slot = self
-                .resolve_local(variable)
-                .ok_or("internal: loop var not found after declare")?;
+            // 单变量：预留一个 slot（同名循环复用）
+            let slot = self.reserve_local_slot(variable, line)?;
 
             // 2. 编译 iterable → ITERATOR → StoreLocal iter_slot
             self.compile_expression(iterable, line)?;
@@ -1254,6 +1275,7 @@ impl Compiler {
         self.current_loop.push(super::LoopContext {
             loop_start,
             break_jumps: Vec::new(),
+            enclosing_try_depth: self.try_depth,
         });
 
         for stmt in body {
@@ -1280,26 +1302,56 @@ impl Compiler {
 
     /// 编译 break：前向跳转到循环出口（由循环编译末尾统一 patch）。
     fn compile_break(&mut self, line: usize) -> Result<(), String> {
-        // task 37：try body 内 break 须先注销所有外层 try 的 handler。
-        self.emit_early_exit_try_exits(line);
-        let jump = self.emit_jump(OpCode::Break, line);
-        let ctx = self
+        let loop_base = self
             .current_loop
+            .last()
+            .ok_or_else(|| format!("line {}: 'break' outside loop", line))?
+            .enclosing_try_depth;
+        // 只注销循环体内注册的 handler（外层 try 的 handler 仍须保持活跃），
+        // 并内联循环体内侧各层的 finally（depth > loop_base）。
+        for _ in 0..(self.try_depth - loop_base) {
+            self.emit_byte(OpCode::TryExit as u8, line);
+        }
+        let inlined: Vec<crate::ast::Stmt> = self
+            .finally_stack
+            .iter()
+            .rev()
+            .filter(|(depth, _)| *depth > loop_base)
+            .flat_map(|(_, fb)| fb.iter().cloned())
+            .collect();
+        for stmt in &inlined {
+            self.compile_statement(stmt, line)?;
+        }
+        let jump = self.emit_jump(OpCode::Break, line);
+        self.current_loop
             .last_mut()
-            .ok_or_else(|| format!("line {}: 'break' outside loop", line))?;
-        ctx.break_jumps.push(jump);
+            .expect("loop context checked above")
+            .break_jumps
+            .push(jump);
         Ok(())
     }
 
-    /// 编译 continue：后向跳转到循环头（立即 patch）。
     fn compile_continue(&mut self, line: usize) -> Result<(), String> {
-        // task 37：try body 内 continue 须先注销所有外层 try 的 handler。
-        self.emit_early_exit_try_exits(line);
-        let loop_start = self
-            .current_loop
-            .last()
-            .map(|ctx| ctx.loop_start)
-            .ok_or_else(|| format!("line {}: 'continue' outside loop", line))?;
+        let (loop_start, loop_base) = {
+            let ctx = self
+                .current_loop
+                .last()
+                .ok_or_else(|| format!("line {}: 'continue' outside loop", line))?;
+            (ctx.loop_start, ctx.enclosing_try_depth)
+        };
+        for _ in 0..(self.try_depth - loop_base) {
+            self.emit_byte(OpCode::TryExit as u8, line);
+        }
+        let inlined: Vec<crate::ast::Stmt> = self
+            .finally_stack
+            .iter()
+            .rev()
+            .filter(|(depth, _)| *depth > loop_base)
+            .flat_map(|(_, fb)| fb.iter().cloned())
+            .collect();
+        for stmt in &inlined {
+            self.compile_statement(stmt, line)?;
+        }
         let back = self.emit_jump(OpCode::Continue, line);
         self.patch_jump_back(back, loop_start)?;
         Ok(())
@@ -1344,10 +1396,11 @@ impl Compiler {
                 }
                 SelectOp::Send { channel, value } => {
                     let ch_slot = self.resolve_or_emit_channel_slot(channel, line)?;
-                    self.compile_expression(value, line)?;
+                    // 同作用域多个 select 复用隐藏值 slot（同 for 循环的处理）；
+                    // 占位 Nil 须在编译 value 前压栈，保证 StoreLocal 弹到 value 本体
                     let val_name = format!("__sel_val_{}", i);
-                    self.declare_local(&val_name, line)?;
-                    let val_slot = (self.unit.locals.len() - 1) as u8;
+                    let val_slot = self.reserve_local_slot(&val_name, line)? as u8;
+                    self.compile_expression(value, line)?;
                     self.emit_byte(OpCode::StoreLocal as u8, line);
                     self.emit_byte(val_slot, line);
                     descs.push(CaseDesc {

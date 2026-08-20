@@ -104,6 +104,12 @@ pub struct Compiler {
     /// task 37：当前正编译其 try body 的嵌套 try 数量。return/break/continue 在
     /// try body 内的 early-exit 出口须先 emit 等量 TRY_EXIT（注销已注册的 handler）。
     try_depth: usize,
+    /// task 37 补全（05-control-flow.md:85「finally 总是执行」）：当前编译点外层
+    /// 「含 finally 的 try」上下文栈（内→外）。early-exit（return/break/continue）
+    /// 在注销 handler 后内联执行相应层的 finally 语句（语句净零栈效应，不扰动
+    /// 已在栈顶的 return 值）。return 内联全部层；break/continue 仅内联位于
+    /// 最内层循环体内侧的层（depth > 循环入口的 try_depth）。
+    finally_stack: Vec<(usize, Vec<crate::ast::Stmt>)>,
     /// task 38：with 语句临时局部（保存上下文管理器）的唯一名计数器。每条 with 分配
     /// `_with_ctx_N`，使同函数作用域内嵌套 with 不冲突（with 不创建新作用域）。
     with_temp_counter: usize,
@@ -123,6 +129,9 @@ struct LoopContext {
     loop_start: usize,
     /// 待 patch 的 break 跳转操作数位置列表。
     break_jumps: Vec<usize>,
+    /// 进入循环时的 try_depth。break/continue 只注销循环体内注册的 handler
+    /// （try_depth - 此值），并只内联 depth 大于此值的 finally。
+    enclosing_try_depth: usize,
 }
 
 impl Compiler {
@@ -150,6 +159,7 @@ impl Compiler {
             module_mode: false,
             current_loop: Vec::new(),
             try_depth: 0,
+            finally_stack: Vec::new(),
             with_temp_counter: 0,
             gen_expr_counter: 0,
             nonlocal_names: std::collections::HashSet::new(),
@@ -177,7 +187,16 @@ impl Default for Compiler {
 impl Compiler {
     /// 添加常量到常量池（自动去重），返回索引。
     pub fn add_constant(&mut self, value: Object) -> usize {
-        if let Some(idx) = self.unit.chunk.constants.iter().position(|c| c == &value) {
+        // 去重必须区分 Int/Float：PartialEq 对 Int(1)==Float(1.0) 数值相等返回
+        // true，若按其去重会使 type(1) 复用 Float(1.0) 常量、静默改变语义。
+        // 按类型标签严格匹配后再做相等比较。
+        if let Some(idx) = self
+            .unit
+            .chunk
+            .constants
+            .iter()
+            .position(|c| std::mem::discriminant(c) == std::mem::discriminant(&value) && c == &value)
+        {
             return idx;
         }
         let idx = self.unit.chunk.constants.len();
@@ -335,6 +354,26 @@ impl Compiler {
     /// 解析局部变量，返回在局部变量表中的索引（最内层优先）。
     pub fn resolve_local(&self, name: &str) -> Option<usize> {
         self.unit.locals.iter().rposition(|l| l.name == name)
+    }
+
+    /// 预留局部 slot（发射 Nil 占位 + 声明），或复用当前作用域同名 slot。
+    ///
+    /// for 循环降低（task 32）为隐藏迭代器 `__for_iter_<var>` 与循环变量声明
+    /// 局部；同一作用域内两个同名循环（`for v in a {}` 后 `for v in b {}`）
+    /// 会因重复声明报错。同名复用既有 slot：前一循环已结束，覆写语义正确，
+    /// 且避免栈随循环次数泄漏增长。新声明时发射 Nil 占位（栈位与 slot 对齐）。
+    pub fn reserve_local_slot(&mut self, name: &str, line: usize) -> Result<usize, String> {
+        if let Some(idx) = self
+            .unit
+            .locals
+            .iter()
+            .rposition(|l| l.depth == self.unit.scope_depth && l.name == name)
+        {
+            return Ok(idx);
+        }
+        self.emit_byte(OpCode::Nil as u8, line);
+        self.declare_local(name, line)?;
+        Ok(self.unit.locals.len() - 1)
     }
 
     /// 解析上值。委托给自由函数 `resolve_upvalue_in_unit`，后者沿 parent 链递归

@@ -61,6 +61,20 @@ cargo build
 cargo test
 ```
 
+## 测试
+
+`.ms` 语料测试位于 `tests/ms/`（core / functions / advanced / oop / errors /
+stdlib / concurrency / modules / negative 九类），由 `tests/ms_corpus.rs`
+harness 子进程执行 `ms run` 逐个校验：
+
+```
+cargo test --test ms_corpus
+```
+
+- 普通用例：断言通过（退出码 0）；配 `.expected` 的用例比对 stdout
+- `negative/` 用例：预期失败，stderr 须包含 `.expected` 中的子串
+- 演示脚本见 `examples/`
+
 ## 文档
 
 | 文档 | 内容 |

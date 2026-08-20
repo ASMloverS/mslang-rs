@@ -74,7 +74,12 @@ impl Parser {
     pub(super) fn parse_ternary(&mut self) -> Result<Expr> {
         let expr = self.parse_or()?;
 
-        if self.check(&TokenKind::If) {
+        // 三元的 `if` 必须与前一 token 同行：块内换行被 lexer 抑制（花括号
+        // 深度规则为集合字面量设计，波及代码块），`x = 1` 换行 `if ...`
+        // 会被误并成三元。跨行的 if 是语句边界，交还语句层解析。
+        if self.check(&TokenKind::If)
+            && self.peek().span.start.line == self.previous().span.end.line
+        {
             self.advance();
             let condition = self.parse_or()?;
             self.expect(TokenKind::Else, "expected 'else' in ternary expression")?;

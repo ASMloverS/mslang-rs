@@ -1,0 +1,5 @@
+# 预期 stderr 子串（每行一个，harness 逐行包含匹配）
+ZeroDivisionError: division by zero
+at divide
+at calculate
+at <main>
