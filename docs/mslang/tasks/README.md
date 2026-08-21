@@ -147,3 +147,22 @@
 | 56 | [REPL 交互式命令行](56-repl.md) | ✅ |
 | 57 | [友好错误信息与堆栈跟踪](57-error-messages.md) | ✅ |
 | 58 | [CLI 工具链](58-cli.md) | ✅ |
+
+## Phase 9 — 标准库扩展
+
+> 设计总纲见 [16-stdlib-expansion](../16-stdlib-expansion.md)。
+> 顺序依赖：78 → 79 → 80 → 84（.ms 机制与 sorted_by 为 84 前置）；
+> 81/82/83/85 相对独立，86 依赖 78（并复用 61 的 Future/EventLoop）。
+
+| # | 任务 | 状态 |
+|---|---|---|
+| 78 | [stdlib.rs 目录拆分（纯移动重构）](78-stdlib-split.md) | ⬜ |
+| 79 | [嵌入式 .ms 标准库机制](79-embedded-ms.md) | ⬜ |
+| 80 | [标准库 - math/string 扩充与排序增强](80-stdlib-math-string-sort.md) | ⬜ |
+| 81 | [标准库 - random/encoding/uuid 模块](81-stdlib-random-encoding-uuid.md) | ⬜ |
+| 82 | [标准库 - fs 模块 / os 扩充 / sys 模块](82-stdlib-fs-os-sys.md) | ⬜ |
+| 83 | [标准库 - time 模块扩充](83-stdlib-time.md) | ⬜ |
+| 84 | [标准库 - heapq/collections/itertools/functools/test](84-stdlib-collections-itertools-functools-test.md) | ⬜ |
+| 85 | [标准库 - regex/hash 模块](85-stdlib-regex-hash.md) | ⬜ |
+| 86 | [标准库 - http 模块与 external completion 架构](86-stdlib-http.md) | ⬜ |
+
