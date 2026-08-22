@@ -7,7 +7,7 @@
 
 ## 0. 摘要
 
-- 拆分 `src/vm/stdlib.rs`（5312 行）为 `src/vm/stdlib/` 目录，每模块一文件（M0）。
+- 拆分 `src/vm/stdlib.rs`（5010 行）为 `src/vm/stdlib/` 目录，每模块一文件（M0）。
 - 新增嵌入式 `.ms` 标准库机制：`include_str!` 内置源码模块，单二进制自足（M1）。
 - 零依赖新增/扩充 12 项：math、string、排序（sorted key）、random、encoding、uuid、
   fs、os、sys、time、heapq（原生）；collections、itertools、functools、test（.ms 嵌入）（M2-M6）。
@@ -109,9 +109,10 @@ rand_distr（gauss 用 Box–Muller 手写）。random 复用既有 rand 依赖�
 
 ```
 src/vm/stdlib/
-├── mod.rs        # 公共 helper（expect_string/expect_number/float_to_int 等）
-│                 # + pub use 各子模块 register_*；vm/mod.rs 引用路径不变
+├── mod.rs        # 公共 helper（expect_string/expect_number/float_to_int/expect_int/hash_key/expect_list_ref 等）
+│                 # + pub use 各子模块 register_* 与 lookup_*；vm/mod.rs 引用路径不变
 ├── io.rs  math.rs  os.rs  string.rs  time.rs  path.rs  json.rs  gc.rs  async.rs
+├── list.rs  dict.rs  set.rs   # 内建类型方法（lookup_list/dict/set_method + native_list/dict/set_*）
 └── ms/           # 嵌入式 .ms 源码（M1 起）
     ├── collections.ms  itertools.ms  functools.ms  test.ms
 ```
@@ -424,7 +425,7 @@ http.get(url)
 
 | # | task 文档 | 内容 | 涉及章节 | 规模估计 |
 |---|---|---|---|---|
-| M0 | 78-stdlib-split.md | stdlib.rs 拆分为目录 + 测试迁移 | §3.1 | ~5300 行移动 |
+| M0 | 78-stdlib-split.md | stdlib.rs 拆分为目录 + 测试迁移 | §3.1 | ~5000 行移动 |
 | M1 | 79-embedded-ms.md | 嵌入式 .ms 机制（注册/优先级/缓存/单测） | §3.2 | ~150 行 |
 | M2 | 80-stdlib-math-string-sort.md | math/string 扩充 + sorted key | §4.1-4.3 | ~700 行 |
 | M3 | 81-stdlib-random-encoding-uuid.md | random/encoding/uuid | §4.4-4.6 | ~450 行 |
