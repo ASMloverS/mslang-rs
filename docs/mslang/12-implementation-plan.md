@@ -36,7 +36,20 @@ mslang-rs/
 │   │   ├── object.rs           # Object 系统 + MsObjHeader
 │   │   ├── frame.rs            # 调用帧
 │   │   ├── builtins.rs         # 内置函数
-│   │   └── stdlib.rs           # 内置类型方法
+│   │   └── stdlib/               # 标准库原生模块（task 78 拆分）
+│   │       ├── mod.rs            # 公共 helper + pub use 转发
+│   │       ├── io.rs             # io 模块 + FileHandle 方法
+│   │       ├── math.rs           # math 模块
+│   │       ├── os.rs             # os 模块
+│   │       ├── string.rs         # string 模块 + String 方法
+│   │       ├── time.rs           # time 模块
+│   │       ├── path.rs           # path 模块
+│   │       ├── json.rs           # json 模块（解析器/序列化器）
+│   │       ├── gc.rs             # gc 模块
+│   │       ├── list.rs           # List 方法
+│   │       ├── dict.rs           # Dict 方法
+│   │       ├── set.rs            # Set 方法
+│   │       └── async.rs          # async 模块
 │   ├── gc/
 │   │   ├── mod.rs              # GC 公共接口
 │   │   ├── heap.rs             # 堆管理（Young/Old/LOS）
