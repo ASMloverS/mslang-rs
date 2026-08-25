@@ -157,7 +157,7 @@
 | # | 任务 | 状态 |
 |---|---|---|
 | 78 | [stdlib.rs 目录拆分（纯移动重构）](78-stdlib-split.md) | ✅ |
-| 79 | [嵌入式 .ms 标准库机制](79-embedded-ms.md) | ⬜ |
+| 79 | [嵌入式 .ms 标准库机制](79-embedded-ms.md) | ✅ |
 | 80 | [标准库 - math/string 扩充与排序增强](80-stdlib-math-string-sort.md) | ⬜ |
 | 81 | [标准库 - random/encoding/uuid 模块](81-stdlib-random-encoding-uuid.md) | ⬜ |
 | 82 | [标准库 - fs 模块 / os 扩充 / sys 模块](82-stdlib-fs-os-sys.md) | ⬜ |

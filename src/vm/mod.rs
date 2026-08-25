@@ -508,6 +508,10 @@ impl VM {
         vm.native_arities.insert("sleep".to_string(), 1);
         vm.native_arities.insert("timeout".to_string(), 2);
 
+        // task 79：填充嵌入式 .ms 模块注册表（collections/itertools/functools/test
+        // 占位，内容由 task 84 填充）。磁盘解析未命中后兜底。
+        vm.module_resolver.embedded_modules = stdlib::embedded_sources();
+
         vm
     }
 
@@ -5220,6 +5224,9 @@ impl VM {
     /// 解析/缓存登记（持 `&mut self.module_resolver`）与模块执行（持 `&mut self`）
     /// 严格串行。嵌套 IMPORT（执行期触发）可重入：执行阶段 resolver 不被独占持有。
     ///
+    /// task 79：解析链为 native → 磁盘 → embedded（兜底）；safe_mode 下非 @std
+    /// import 收窄为 native → stdlib_dir → embedded（跳过用户可写根）。
+    ///
     /// 返回指向 MsModule 的裸指针（TypeTag::MODULE）。失败返回 ImportError 消息。
     pub fn load_module(&mut self, name: &str) -> Result<*mut MsObjHeader, String> {
         let (stdlib_only, mod_name) = module::parse_std_prefix(name);
@@ -5230,10 +5237,10 @@ impl VM {
             return Ok(ptr);
         }
 
-        // 1. 安全模式：仅允许 @std import。
-        if self.module_resolver.safe_mode && !stdlib_only {
-            return Err(format!("安全模式下仅允许 import @std（拒绝 {}）", mod_name));
-        }
+        // 1. 安全模式（task 79 调整）：非 @std import 不再无条件拒绝，改为按来源
+        //    放行——解析链收窄为 native（上方已查）→ stdlib_dir → embedded，
+        //    跳过用户可写根（当前目录、MS_PATH），防伪造同名磁盘模块借嵌入名旁路。
+        let safe_restricted = self.module_resolver.safe_mode && !stdlib_only;
         // 2. 递归深度限制：load → execute_module → IMPORT → load 链。
         if self.module_resolver.loading_stack.len() >= module::MAX_IMPORT_DEPTH {
             return Err(format!(
@@ -5241,31 +5248,51 @@ impl VM {
                 module::MAX_IMPORT_DEPTH
             ));
         }
-        // 3. 解析为规范化绝对路径（兼作缓存键）。
-        //    task 72：resolve 失败（无 .ms 文件）时，尝试动态库加载（capi feature）。
-        let canon = match self.module_resolver.resolve(mod_name, stdlib_only) {
-            Ok(c) => c,
+        // 3. 解析为缓存键：磁盘规范化绝对路径；resolve 失败时先查嵌入式兜底
+        //    （伪路径 `@embedded/<name>.ms`），再走 task 72 的 capi 动态库兜底。
+        let (canon, embedded_src) = match self
+            .module_resolver
+            .resolve(mod_name, stdlib_only || safe_restricted)
+        {
+            Ok(c) => (c, None),
             Err(resolve_err) => {
-                #[cfg(feature = "capi")]
-                {
-                    if !self.capi_vm_ptr.is_null() {
-                        let vm_ptr = self.capi_vm_ptr as *mut crate::capi::vm::MsVM;
-                        if crate::capi::module::load_native_module(vm_ptr, mod_name).is_ok() {
-                            if let Some(&ptr) = self.module_resolver.native_modules.get(mod_name) {
-                                return Ok(ptr);
+                if let Some(src) = self.module_resolver.resolve_embedded(mod_name) {
+                    (
+                        PathBuf::from(format!("@embedded/{}.ms", mod_name)),
+                        Some(src),
+                    )
+                } else if safe_restricted {
+                    // safe_mode 放行集合（@std / native / stdlib_dir / embedded）
+                    // 皆未命中 → ImportError（用户可写根已被跳过，不再兜底）。
+                    return Err(format!(
+                            "ImportError: 安全模式下找不到模块 '{}'（仅允许 @std / 标准库目录 / 嵌入式模块）",
+                            mod_name
+                        ));
+                } else {
+                    #[cfg(feature = "capi")]
+                    {
+                        if !self.capi_vm_ptr.is_null() {
+                            let vm_ptr = self.capi_vm_ptr as *mut crate::capi::vm::MsVM;
+                            if crate::capi::module::load_native_module(vm_ptr, mod_name).is_ok() {
+                                if let Some(&ptr) =
+                                    self.module_resolver.native_modules.get(mod_name)
+                                {
+                                    return Ok(ptr);
+                                }
                             }
                         }
                     }
+                    #[cfg(not(feature = "capi"))]
+                    {
+                        let _ = &resolve_err;
+                    }
+                    return Err(resolve_err);
                 }
-                #[cfg(not(feature = "capi"))]
-                {
-                    let _ = &resolve_err;
-                }
-                return Err(resolve_err);
             }
         };
 
-        // 4. 缓存命中：已加载完成，或循环导入下尚未填充的空壳 Module。
+        // 4. 缓存命中：已加载完成，或循环导入下尚未填充的空壳 Module
+        //    （嵌入模块与磁盘模块共用 cache，键为伪路径）。
         if let Some(&ptr) = self.module_resolver.cache.get(&canon) {
             return Ok(ptr);
         }
@@ -5281,11 +5308,15 @@ impl VM {
             .insert(canon.clone(), partial_ptr);
         self.module_resolver.loading_stack.insert(canon.clone());
 
-        // 6. 读取 + 编译（本地操作，不持 vm/resolver 跨调用借用）。
-        let source = std::fs::read_to_string(&canon).map_err(|e| {
-            self.cleanup_failed_load(&canon);
-            format!("无法加载 '{}': {}", mod_name, e)
-        })?;
+        // 6. 获取源码：嵌入命中直接使用编译期源码；磁盘模块读文件。
+        //    （本地操作，不持 vm/resolver 跨调用借用。）
+        let source = match embedded_src {
+            Some(src) => src.to_string(),
+            None => std::fs::read_to_string(&canon).map_err(|e| {
+                self.cleanup_failed_load(&canon);
+                format!("无法加载 '{}': {}", mod_name, e)
+            })?,
+        };
         let (chunk, export_names, private_names) = module::compile_module_source(&source, mod_name)
             .map_err(|e| {
                 self.cleanup_failed_load(&canon);
@@ -11695,6 +11726,157 @@ assert(make() == 111)
         let m = alloc_module("demo");
         assert_eq!(m.type_name(), "module");
         assert_eq!(format!("{}", m), "<module \"demo\">");
+    }
+
+    // -----------------------------------------------------------------------
+    // task 79：嵌入式 .ms 标准库测试
+    // -----------------------------------------------------------------------
+
+    /// 注册临时嵌入模块并编译运行 import 源码。
+    /// embedded 源码须为 'static（测试传字面量），与注册表值类型一致。
+    fn run_with_embedded(
+        source: &str,
+        embedded: &[(&'static str, &'static str)],
+    ) -> Result<Object, String> {
+        let program = parse(source);
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&program).unwrap();
+        let mut vm = VM::new();
+        for (name, src) in embedded {
+            vm.module_resolver
+                .embedded_modules
+                .insert(name.to_string(), src);
+        }
+        vm.interpret(chunk)
+    }
+
+    #[test]
+    fn test_embedded_basic() {
+        // 标准 1：占位/临时嵌入模块可 import，导出常量可访问。
+        let src = "import emb_basic\nassert(emb_basic.VERSION == \"9.9\")\nassert(emb_basic.double(21) == 42)";
+        let r = run_with_embedded(
+            src,
+            &[(
+                "emb_basic",
+                "const VERSION = \"9.9\"\nfn double(x) { return x * 2 }",
+            )],
+        );
+        assert!(r.is_ok(), "embedded basic import failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_embedded_real_placeholders_registered() {
+        // 标准 1 补充：VM::new 内建注册的 4 个占位模块（collections/itertools/
+        // functools/test）随 include_str! 嵌入，源码含 VERSION 占位常量。
+        let vm = VM::new();
+        for name in ["collections", "itertools", "functools", "test"] {
+            let src = vm.module_resolver.resolve_embedded(name).unwrap();
+            assert!(
+                src.contains("VERSION"),
+                "{} placeholder missing VERSION",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_disk_overrides_embedded() {
+        // 标准 2：同名磁盘模块优先于嵌入版（当前目录可覆盖，便于调试/热修）。
+        let dir = write_module(
+            "mslang_mod_emb_override",
+            // 磁盘版：DISK 标记且无 VERSION——若被加载，VERSION 访问应失败。
+            &[("emb_override.ms", "const DISK = true")],
+        );
+        let src = "import emb_override\nassert(emb_override.DISK == true)";
+        let program = parse(src);
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&program).unwrap();
+        let mut vm = VM::new();
+        vm.add_module_search_path(dir.clone());
+        vm.module_resolver
+            .embedded_modules
+            .insert("emb_override".to_string(), "const VERSION = \"0.1.0\"");
+        let r = vm.interpret(chunk);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(r.is_ok(), "disk should override embedded: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_embedded_cache_hit() {
+        // 标准 3：重复 import 返回同一 Module 指针（伪路径缓存键，模块只执行一次）。
+        let mut vm = VM::new();
+        vm.module_resolver
+            .embedded_modules
+            .insert("emb_cache".to_string(), "const X = 1");
+        let p1 = vm.load_module("emb_cache").unwrap();
+        let p2 = vm.load_module("emb_cache").unwrap();
+        assert_eq!(p1, p2, "second load should hit cache with same pointer");
+        // 缓存键为伪路径 @embedded/emb_cache.ms，且仅登记一条。
+        assert_eq!(vm.module_resolver.cache.len(), 1);
+        assert!(vm
+            .module_resolver
+            .cache
+            .contains_key(std::path::Path::new("@embedded/emb_cache.ms")));
+    }
+
+    #[test]
+    fn test_embedded_failure_cleanup() {
+        // 标准 4：嵌入模块加载失败（编译错误）清理与磁盘一致——空壳移除、可重试。
+        let mut vm = VM::new();
+        vm.module_resolver
+            .embedded_modules
+            .insert("emb_broken".to_string(), "fn (bad syntax here");
+        let err = vm.load_module("emb_broken").unwrap_err();
+        assert!(err.contains("编译"), "expected compile error, got: {}", err);
+        assert!(
+            vm.module_resolver.cache.is_empty(),
+            "failed load must remove cache entry"
+        );
+        assert!(
+            vm.module_resolver.loading_stack.is_empty(),
+            "failed load must clear loading stack"
+        );
+    }
+
+    #[test]
+    fn test_embedded_safe_mode() {
+        // 标准 5：safe_mode 下嵌入模块可导入（native → stdlib_dir → embedded 链，
+        // 跳过当前目录与 MS_PATH）——伪造同名磁盘模块不得旁路；非白名单用户模块被拒。
+        let dir = write_module(
+            "mslang_mod_emb_safe",
+            &[
+                // 伪造磁盘版：仅含 FAKE 无 VERSION——若被加载，VERSION 访问失败。
+                ("emb_safe.ms", "const FAKE = true"),
+                // 非白名单用户模块：safe_mode 下应被拒。
+                ("user_mod.ms", "const X = 1"),
+            ],
+        );
+
+        // (a) safe_mode 下嵌入版可用且磁盘伪造版被跳过。
+        let program = parse("import emb_safe\nassert(emb_safe.VERSION == \"0.1.0\")");
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&program).unwrap();
+        let mut vm = VM::new();
+        vm.add_module_search_path(dir.clone());
+        vm.module_resolver
+            .embedded_modules
+            .insert("emb_safe".to_string(), "const VERSION = \"0.1.0\"");
+        vm.set_module_safe_mode(true);
+        let r = vm.interpret(chunk);
+        assert!(r.is_ok(), "safe mode embedded import failed: {:?}", r.err());
+
+        // (b) safe_mode 下非白名单用户模块仍被拒（ImportError + 安全模式提示）。
+        let program = parse("import user_mod");
+        let mut compiler = Compiler::new();
+        let chunk = compiler.compile(&program).unwrap();
+        let mut vm = VM::new();
+        vm.add_module_search_path(dir.clone());
+        vm.set_module_safe_mode(true);
+        let r = vm.interpret(chunk);
+        std::fs::remove_dir_all(&dir).ok();
+        let err = r.unwrap_err();
+        assert!(err.contains("ImportError"), "got: {}", err);
+        assert!(err.contains("安全模式"), "got: {}", err);
     }
 
     // -----------------------------------------------------------------------

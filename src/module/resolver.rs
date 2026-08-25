@@ -39,6 +39,10 @@ pub struct ModuleResolver {
     /// task 46：原生模块注册表（键为规范模块名，如 "io"）。命中则直接返回缓存指针，
     /// 跳过磁盘搜索与执行。注册表查找在 `@std:` 前缀剥离之后。
     pub native_modules: HashMap<String, *mut MsObjHeader>,
+    /// task 79：嵌入式 .ms 标准库注册表（模块名 → `include_str!` 源码）。磁盘解析
+    /// 未命中后的兜底层；缓存键为伪路径 `@embedded/<name>.ms`。由 `VM::new` 经
+    /// [`crate::vm::stdlib::embedded_sources`] 填充。
+    pub embedded_modules: HashMap<String, &'static str>,
 }
 
 impl ModuleResolver {
@@ -75,6 +79,7 @@ impl ModuleResolver {
             loading_stack: HashSet::new(),
             safe_mode,
             native_modules: HashMap::new(),
+            embedded_modules: HashMap::new(),
         }
     }
 
@@ -89,6 +94,7 @@ impl ModuleResolver {
             loading_stack: HashSet::new(),
             safe_mode,
             native_modules: HashMap::new(),
+            embedded_modules: HashMap::new(),
         }
     }
 
@@ -128,6 +134,11 @@ impl ModuleResolver {
             }
         }
         Err(format!("ImportError: 找不到模块 '{}'", name))
+    }
+
+    /// task 79：查嵌入式模块源码（兜底层，磁盘解析未命中后由 `VM::load_module` 调用）。
+    pub fn resolve_embedded(&self, name: &str) -> Option<&'static str> {
+        self.embedded_modules.get(name).copied()
     }
 }
 

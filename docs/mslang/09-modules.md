@@ -49,16 +49,25 @@ import_target = IDENTIFIER ("as" IDENTIFIER)?
 
 ### 搜索路径
 
-import 时按以下顺序搜索模块：
+import 时按以下顺序解析模块：
 
-1. **当前目录** — 脚本所在目录
-2. **标准库目录** — mslang 安装目录下的 `stdlib/`
-3. **MS_PATH** — 环境变量指定的路径（用 `;` 分隔）
+1. **原生模块**（native）— Rust 实现的内建模块（io/math/os/string/time/path/json/gc/async），命中即返回，不触磁盘
+2. **磁盘** — 依次搜索：
+   1. **当前目录** — 脚本所在目录
+   2. **标准库目录** — mslang 安装目录下的 `stdlib/`
+   3. **MS_PATH** — 环境变量指定的路径（用 `;` 分隔）
+3. **嵌入式模块**（embedded）— `include_str!` 编入二进制的 `.ms` 源码（collections/itertools/functools/test），磁盘未命中后的兜底层
 
-> **安全提示**：当前目录优先于标准库，本地同名文件（如 `math.ms`）会覆盖标准库模块。在不可信目录中运行脚本时注意此风险。缓解措施：
-> 1. `MS_SAFE=1` 环境变量：启用安全模式，跳过当前目录，仅搜索标准库和 `MS_PATH`
+> 当前目录同名 `.ms` 文件可**覆盖**嵌入式版本（便于调试与热修）。
+
+嵌入式模块在模块缓存中的键为伪路径 `@embedded/<name>.ms`（不对应磁盘文件），与磁盘模块共用同一缓存机制（模块只执行一次，重复 import 返回同一 Module 对象）。
+
+> **安全提示**：当前目录优先于标准库与嵌入式层，本地同名文件（如 `math.ms`）会覆盖标准库模块。在不可信目录中运行脚本时注意此风险。缓解措施：
+> 1. `MS_SAFE=1` 环境变量：启用安全模式
 > 2. `ms run --safe script.ms`：CLI 安全模式标志
 > 3. 代码中可用 `import @std math` 语法强制加载标准库模块（`@std` 前缀跳过当前目录搜索）
+>
+> 安全模式下的放行集合：`@std` 前缀导入、原生模块（native）、标准库目录（stdlib/）与嵌入式模块（embedded）。非 `@std` import 的解析链为 native → stdlib_dir → embedded，**跳过当前目录与 MS_PATH 等用户可写根**，防止恶意磁盘同名文件借嵌入式模块名旁路；放行集合皆未命中时抛 ImportError。
 
 ### 搜索规则
 

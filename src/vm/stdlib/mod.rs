@@ -38,7 +38,27 @@ pub use set::lookup_set_method;
 pub use string::{lookup_string_method, register_string_module};
 pub use time::register_time_module;
 
+use std::collections::HashMap;
+
 use super::object::{read_str, MsObjHeader, Object, TypeTag};
+
+// ---------------------------------------------------------------------------
+// task 79：嵌入式 .ms 标准库
+// ---------------------------------------------------------------------------
+
+/// 嵌入式 `.ms` 标准库源码注册表（[16-stdlib-expansion](../../docs/mslang/16-stdlib-expansion.md) §3.2）。
+///
+/// 源码位于本目录 `ms/` 子目录，经 `include_str!` 编入二进制（路径以本文件为基准），
+/// 单二进制自足发行。`VM::load_module` 在磁盘解析未命中后查此表兜底；当前为
+/// 占位模块（仅导出 `VERSION`），内容由 task 84 填充。
+pub fn embedded_sources() -> HashMap<String, &'static str> {
+    HashMap::from([
+        ("collections".to_string(), include_str!("ms/collections.ms")),
+        ("itertools".to_string(), include_str!("ms/itertools.ms")),
+        ("functools".to_string(), include_str!("ms/functools.ms")),
+        ("test".to_string(), include_str!("ms/test.ms")),
+    ])
+}
 
 // ---------------------------------------------------------------------------
 // 公共辅助函数（被 ≥2 个子模块使用；仅单模块使用的 helper 留在各模块文件内）

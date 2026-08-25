@@ -1,0 +1,3 @@
+# itertools — 嵌入式 .ms 标准库占位模块（task 79 机制验证）。
+# 实际内容（count/cycle/chain 等生成器函数）由 task 84 实现。
+const VERSION = "0.1.0"

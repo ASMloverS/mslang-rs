@@ -49,7 +49,12 @@ mslang-rs/
 │   │       ├── list.rs           # List 方法
 │   │       ├── dict.rs           # Dict 方法
 │   │       ├── set.rs            # Set 方法
-│   │       └── async.rs          # async 模块
+│   │       ├── async.rs          # async 模块
+│   │       └── ms/               # 嵌入式 .ms 源码（include_str! 编入二进制，task 79）
+│   │           ├── collections.ms  # 占位，task 84 填充
+│   │           ├── itertools.ms    # 占位，task 84 填充
+│   │           ├── functools.ms    # 占位，task 84 填充
+│   │           └── test.ms         # 占位，task 84 填充
 │   ├── gc/
 │   │   ├── mod.rs              # GC 公共接口
 │   │   ├── heap.rs             # 堆管理（Young/Old/LOS）
