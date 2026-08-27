@@ -6,8 +6,8 @@
 use super::{expect_int, expect_list_ref, expect_string};
 use crate::vm::builtins::{alloc_native_function, NativeFunction, NativeFn};
 use crate::vm::object::{
-    alloc_list, alloc_module, alloc_string, read_list, read_module_mut, read_str, MsObjHeader,
-    Object, TypeTag,
+    alloc_list, alloc_module, alloc_string, alloc_tuple, read_list, read_module_mut, read_str,
+    MsObjHeader, Object, TypeTag,
 };
 use crate::vm::VM;
 
@@ -180,15 +180,34 @@ fn native_str_slice(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 // ---------------------------------------------------------------------------
 
 /// 构造 `string` 原生模块，返回指向 MsModule 的裸指针（TypeTag::MODULE）。
-/// exports 含 format/repeat/reverse/is_alpha/is_digit 五个原生函数。
+/// exports 含 5 个原有函数 + 18 个扩充函数（task 80，16-stdlib-expansion.md §4.2）。
 pub fn register_string_module() -> *mut MsObjHeader {
     let mut exports = std::collections::HashMap::new();
-    let funcs: [(&str, NativeFn); 5] = [
+    let funcs: [(&str, NativeFn); 23] = [
         ("format", native_string_format),
         ("repeat", native_string_repeat),
         ("reverse", native_string_reverse),
         ("is_alpha", native_string_is_alpha),
         ("is_digit", native_string_is_digit),
+        // task 80 扩充
+        ("count", native_string_count),
+        ("find", native_string_find),
+        ("title", native_string_title),
+        ("capitalize", native_string_capitalize),
+        ("pad_start", native_string_pad_start),
+        ("pad_end", native_string_pad_end),
+        ("center", native_string_center),
+        ("zfill", native_string_zfill),
+        ("split_lines", native_string_split_lines),
+        ("trim_start", native_string_trim_start),
+        ("trim_end", native_string_trim_end),
+        ("is_alnum", native_string_is_alnum),
+        ("is_space", native_string_is_space),
+        ("is_upper", native_string_is_upper),
+        ("is_lower", native_string_is_lower),
+        ("cut", native_string_cut),
+        ("fields", native_string_fields),
+        ("join", native_string_join),
     ];
     for (name, func) in funcs {
         exports.insert(
@@ -212,27 +231,111 @@ pub fn register_string_module() -> *mut MsObjHeader {
     }
 }
 
-/// string.format(template, *args) → 替换 {} 占位符。
-/// 非 string 参数经 object_to_string 转换（与 print/str 一致）：
-///   Int→"42", Float→"3.14", Bool→"true"/"false", Nil→"nil", String→原串。
+/// string.format(template, *args) → 占位符替换（task 80 增强）。
+///
+/// - `{}` 顺序替换：非 string 参数经 object_to_string 转换（与 print/str 一致）；
+/// - `{{` / `}}` 输出字面花括号；
+/// - `{:.Nf}` 定点（N ∈ 0..=9）：接受 Float 与 Int（Int 按 Float 格式化），
+///   其余类型 → TypeError；
+/// - 其余任何 `{x`/未闭合/非法规格 → ValueError 附原文片段；单独 `}` → ValueError
+///   （Python 对齐：Single '}' encountered）。
+///
+/// 解析为单遍字符扫描状态机（见 task 80 §format 解析状态机）。
 fn native_string_format(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let template = expect_string(args.get(0), "format(template, ...)")?;
     let mut result = String::new();
     let mut arg_idx = 1usize;
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '{' && chars.peek() == Some(&'}') {
-            chars.next(); // 消费 '}'
-            let val = args.get(arg_idx).ok_or_else(|| {
-                format!(
-                    "ValueError: format: not enough arguments for placeholder #{}",
-                    arg_idx
-                )
-            })?;
-            result.push_str(&crate::vm::builtins::object_to_string(vm, val)?);
-            arg_idx += 1;
-        } else {
-            result.push(c);
+        match c {
+            '{' => match chars.peek() {
+                Some('}') => {
+                    // `{}` 占位：顺序替换。
+                    chars.next(); // 消费 '}'
+                    let val = args.get(arg_idx).ok_or_else(|| {
+                        format!(
+                            "ValueError: format: not enough arguments for placeholder #{}",
+                            arg_idx
+                        )
+                    })?;
+                    result.push_str(&crate::vm::builtins::object_to_string(vm, val)?);
+                    arg_idx += 1;
+                }
+                Some('{') => {
+                    // `{{` 转义：输出字面 `{`（消费两个字符）。
+                    chars.next();
+                    result.push('{');
+                }
+                Some(':') => {
+                    // 格式段：读至 `}`，段内须为 `.` + 1 位数字 + `f`（{:.Nf}）。
+                    chars.next(); // 消费 ':'
+                    let mut seg = String::new();
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some(ch) => seg.push(ch),
+                            None => {
+                                return Err(format!(
+                                    "ValueError: format: unclosed format spec '{{:{}'",
+                                    seg
+                                ))
+                            }
+                        }
+                    }
+                    let seg_chars: Vec<char> = seg.chars().collect();
+                    let precision = match seg_chars.as_slice() {
+                        ['.', d, 'f'] if d.is_ascii_digit() => *d as u8 - b'0',
+                        _ => {
+                            return Err(format!(
+                                "ValueError: format: invalid format spec '{{:{}{}'",
+                                seg, '}'
+                            ))
+                        }
+                    };
+                    let val = args.get(arg_idx).ok_or_else(|| {
+                        format!(
+                            "ValueError: format: not enough arguments for placeholder #{}",
+                            arg_idx
+                        )
+                    })?;
+                    let f = match val {
+                        Object::Int(i) => *i as f64,
+                        Object::Float(x) => *x,
+                        other => {
+                            return Err(format!(
+                                "TypeError: format spec '{{:.{}f}}' expects number, got {}",
+                                precision,
+                                other.type_name()
+                            ))
+                        }
+                    };
+                    result.push_str(&format!("{:.*}", precision as usize, f));
+                    arg_idx += 1;
+                }
+                other => {
+                    // `{` 后其余任何字符（含 `{` 嵌套）或未闭合 → ValueError 附片段。
+                    return match other {
+                        Some(ch) => Err(format!(
+                            "ValueError: format: unexpected '{{{}' in format string",
+                            ch
+                        )),
+                        None => Err("ValueError: format: unclosed '{' in format string".to_string()),
+                    };
+                }
+            },
+            '}' => match chars.peek() {
+                Some('}') => {
+                    // `}}` 转义：输出字面 `}`（消费两个字符）。
+                    chars.next();
+                    result.push('}');
+                }
+                _ => {
+                    return Err(
+                        "ValueError: format: single '}' encountered in format string".to_string()
+                    )
+                }
+            },
+            c => result.push(c),
         }
     }
     Ok(alloc_string(&result))
@@ -274,10 +377,306 @@ fn native_string_is_digit(_vm: &mut VM, args: &[Object]) -> Result<Object, Strin
     Ok(Object::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())))
 }
 
+// ---------------------------------------------------------------------------
+// task 80 扩充（16-stdlib-expansion.md §4.2）
+// ---------------------------------------------------------------------------
+
+/// count(s, sub) → 非重叠出现次数；空 sub → 0。
+/// arity MAX（与 gc.count=0 共享名）：native 内自校验恰 2 参。
+fn native_string_count(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "TypeError: count(s, sub) takes exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let s = expect_string(args.get(0), "count(s, sub)")?;
+    let sub = expect_string(args.get(1), "count(s, sub)")?;
+    if sub.is_empty() {
+        return Ok(Object::Int(0));
+    }
+    Ok(Object::Int(s.matches(&sub).count() as i64))
+}
+
+/// find(s, sub) → 首个字符索引；未找到 -1（与 `s.index()` 抛 ValueError 区分）。
+fn native_string_find(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "find(s, sub)")?;
+    let sub = expect_string(args.get(1), "find(s, sub)")?;
+    match s.find(&sub) {
+        // find 返回字节位置，转字符位置（与 length/index/slice 一致）。
+        Some(byte_pos) => Ok(Object::Int(s[..byte_pos].chars().count() as i64)),
+        None => Ok(Object::Int(-1)),
+    }
+}
+
+/// title(s) → 每个词首字母大写其余小写（Python 语义：非字母后的字符大写）。
+fn native_string_title(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "title(s)")?;
+    let mut out = String::with_capacity(s.len());
+    let mut prev_alpha = false;
+    for c in s.chars() {
+        if prev_alpha {
+            out.extend(c.to_lowercase());
+        } else {
+            out.extend(c.to_uppercase());
+        }
+        prev_alpha = c.is_alphabetic();
+    }
+    Ok(alloc_string(&out))
+}
+
+/// capitalize(s) → 首字符大写其余小写。
+fn native_string_capitalize(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "capitalize(s)")?;
+    let mut chars = s.chars();
+    let mut out = String::with_capacity(s.len());
+    if let Some(first) = chars.next() {
+        out.extend(first.to_uppercase());
+        out.extend(chars.flat_map(|c| c.to_lowercase()));
+    }
+    Ok(alloc_string(&out))
+}
+
+/// pad 校验与公共参数：n 为结果总长（字符数）；pad 取首字符循环。
+/// 已长于 n（或 n 为负）返回 None（调用方返回 s 副本）；
+/// Some((pad 字符, 填充数))。
+fn pad_args(
+    s: &str,
+    n: i64,
+    pad: Option<&Object>,
+    who: &str,
+) -> Result<Option<(char, usize)>, String> {
+    let len = s.chars().count();
+    let target = if n < 0 { 0 } else { n as usize };
+    if target <= len {
+        return Ok(None);
+    }
+    let pad_str = match pad {
+        None => " ".to_string(),
+        Some(_) => expect_string(pad, who)?,
+    };
+    let pad_char = pad_str
+        .chars()
+        .next()
+        .ok_or_else(|| "ValueError: pad string must not be empty".to_string())?;
+    Ok(Some((pad_char, target - len)))
+}
+
+/// pad_start(s, n, pad=" ") → 左填充至总长 n（Python rjust 语义）。arity MAX（2-3 参）。
+fn native_string_pad_start(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "TypeError: pad_start(s, n, pad?) takes 2-3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let s = expect_string(args.get(0), "pad_start(s, n, pad?)")?;
+    let n = expect_int(args.get(1), "pad_start(s, n, pad?)")?;
+    match pad_args(&s, n, args.get(2), "pad_start(s, n, pad?)")? {
+        None => Ok(alloc_string(&s)),
+        Some((pad_char, pad_n)) => {
+            let mut out = String::with_capacity(s.len() + pad_n);
+            out.extend(std::iter::repeat_n(pad_char, pad_n));
+            out.push_str(&s);
+            Ok(alloc_string(&out))
+        }
+    }
+}
+
+/// pad_end(s, n, pad=" ") → 右填充至总长 n（Python ljust 语义）。arity MAX（2-3 参）。
+fn native_string_pad_end(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "TypeError: pad_end(s, n, pad?) takes 2-3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let s = expect_string(args.get(0), "pad_end(s, n, pad?)")?;
+    let n = expect_int(args.get(1), "pad_end(s, n, pad?)")?;
+    match pad_args(&s, n, args.get(2), "pad_end(s, n, pad?)")? {
+        None => Ok(alloc_string(&s)),
+        Some((pad_char, pad_n)) => {
+            let mut out = String::with_capacity(s.len() + pad_n);
+            out.push_str(&s);
+            out.extend(std::iter::repeat_n(pad_char, pad_n));
+            Ok(alloc_string(&out))
+        }
+    }
+}
+
+/// center(s, n, pad=" ") → 居中，左短右长（Python 语义）。arity MAX（2-3 参）。
+fn native_string_center(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "TypeError: center(s, n, pad?) takes 2-3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let s = expect_string(args.get(0), "center(s, n, pad?)")?;
+    let n = expect_int(args.get(1), "center(s, n, pad?)")?;
+    match pad_args(&s, n, args.get(2), "center(s, n, pad?)")? {
+        None => Ok(alloc_string(&s)),
+        Some((pad_char, pad_n)) => {
+            let left = pad_n / 2; // 左短右长
+            let right = pad_n - left;
+            let mut out = String::with_capacity(s.len() + pad_n);
+            out.extend(std::iter::repeat_n(pad_char, left));
+            out.push_str(&s);
+            out.extend(std::iter::repeat_n(pad_char, right));
+            Ok(alloc_string(&out))
+        }
+    }
+}
+
+/// zfill(s, n) → 左补零至长 n，保留符号位（"-42" → "-0042"）。
+fn native_string_zfill(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "zfill(s, n)")?;
+    let n = expect_int(args.get(1), "zfill(s, n)")?;
+    let len = s.chars().count();
+    if n <= len as i64 {
+        return Ok(alloc_string(&s));
+    }
+    let pad_n = (n - len as i64) as usize;
+    // 符号位（-/+）后补零（Python zfill 语义）。
+    let (sign, digits) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => match s.strip_prefix('+') {
+            Some(rest) => ("+", rest),
+            None => ("", s.as_str()),
+        },
+    };
+    let mut out = String::with_capacity(s.len() + pad_n);
+    out.push_str(sign);
+    out.extend(std::iter::repeat_n('0', pad_n));
+    out.push_str(digits);
+    Ok(alloc_string(&out))
+}
+
+/// split_lines(s) → 按行分割去除行尾；`\n`/`\r\n`/`\r` 均识别。
+/// 尾部行尾不产生额外空行；空串 → 空 list（Python splitlines 语义）。
+fn native_string_split_lines(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "split_lines(s)")?;
+    let mut lines: Vec<Object> = Vec::new();
+    if s.is_empty() {
+        return Ok(alloc_list(lines));
+    }
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                lines.push(alloc_string(&current));
+                current.clear();
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next(); // 消费 \r\n 的 \n
+                }
+                lines.push(alloc_string(&current));
+                current.clear();
+            }
+            c => current.push(c),
+        }
+    }
+    // 尾部无行尾的残余内容（空则丢弃：尾行尾不产生空行）。
+    if !current.is_empty() {
+        lines.push(alloc_string(&current));
+    }
+    Ok(alloc_list(lines))
+}
+
+fn native_string_trim_start(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "trim_start(s)")?;
+    Ok(alloc_string(s.trim_start()))
+}
+
+fn native_string_trim_end(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "trim_end(s)")?;
+    Ok(alloc_string(s.trim_end()))
+}
+
+fn native_string_is_alnum(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "is_alnum(s)")?;
+    Ok(Object::Bool(!s.is_empty() && s.chars().all(|c| c.is_alphanumeric())))
+}
+
+fn native_string_is_space(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "is_space(s)")?;
+    Ok(Object::Bool(!s.is_empty() && s.chars().all(|c| c.is_whitespace())))
+}
+
+/// is_upper(s)：所有有大小写字符为大写，且至少一个（Python 语义）。
+fn native_string_is_upper(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "is_upper(s)")?;
+    let mut has_cased = false;
+    let mut all_upper = true;
+    for c in s.chars() {
+        if c.is_lowercase() {
+            has_cased = true;
+            all_upper = false;
+        } else if c.is_uppercase() {
+            has_cased = true;
+        }
+    }
+    Ok(Object::Bool(has_cased && all_upper))
+}
+
+/// is_lower(s)：所有有大小写字符为小写，且至少一个（Python 语义）。
+fn native_string_is_lower(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "is_lower(s)")?;
+    let mut has_cased = false;
+    let mut all_lower = true;
+    for c in s.chars() {
+        if c.is_uppercase() {
+            has_cased = true;
+            all_lower = false;
+        } else if c.is_lowercase() {
+            has_cased = true;
+        }
+    }
+    Ok(Object::Bool(has_cased && all_lower))
+}
+
+/// cut(s, sep) → tuple(before, after)：以第一个 sep 切两段；无 sep → (s, "")
+/// （Go strings.Cut 去 found 布尔）。空 sep → ValueError（与 split 一致）。
+fn native_string_cut(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "cut(s, sep)")?;
+    let sep = expect_string(args.get(1), "cut(s, sep)")?;
+    if sep.is_empty() {
+        return Err("ValueError: empty separator".to_string());
+    }
+    match s.find(&sep) {
+        Some(byte_pos) => Ok(alloc_tuple(vec![
+            alloc_string(&s[..byte_pos]),
+            alloc_string(&s[byte_pos + sep.len()..]),
+        ])),
+        None => Ok(alloc_tuple(vec![alloc_string(&s), alloc_string("")])),
+    }
+}
+
+/// fields(s) → 按连续空白分割（Go strings.Fields）。
+fn native_string_fields(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    let s = expect_string(args.get(0), "fields(s)")?;
+    Ok(alloc_list(s.split_whitespace().map(alloc_string).collect()))
+}
+
+/// join(sep, list) → 模块级 join，与 `sep.join(list)` 方法等价。
+/// arity MAX（与 path.join 共享名）：native 内自校验恰 2 参。
+fn native_string_join(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() != 2 {
+        return Err(format!(
+            "TypeError: join(sep, list) takes exactly 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    native_str_join(vm, args)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::test_util::{run_source, s, strval, vm};
+    use crate::vm::object::read_tuple;
 
     // ---- String 方法单元测试（task 50）----
 
@@ -687,5 +1086,299 @@ assert(not string.is_digit(""))
 "#;
         let r = run_source(src);
         assert!(r.is_ok(), "string integration failed: {:?}", r.err());
+    }
+
+    // ---- task 80：format 增强（状态机全分支）----
+
+    #[test]
+    // 3.14159 为设计文档示例值（非 PI 近似），spec 指定保留。
+    #[allow(clippy::approx_constant)]
+    fn test_format_precision() {
+        let mut v = vm();
+        assert_eq!(
+            native_string_format(&mut v, &[s("{:.2f}"), Object::Float(3.14159)]).unwrap(),
+            s("3.14")
+        );
+        // Int 按 Float 格式化：{:.2f} 于 3 → "3.00"
+        assert_eq!(
+            native_string_format(&mut v, &[s("{:.2f}"), Object::Int(3)]).unwrap(),
+            s("3.00")
+        );
+        // N=0 与 N=9 边界
+        assert_eq!(
+            native_string_format(&mut v, &[s("{:.0f}"), Object::Float(3.7)]).unwrap(),
+            s("4")
+        );
+        assert_eq!(
+            native_string_format(&mut v, &[s("{:.9f}"), Object::Float(1.0)]).unwrap(),
+            s("1.000000000")
+        );
+        // 混合占位：顺序消费参数
+        assert_eq!(
+            native_string_format(&mut v, &[s("x = {:.1f}, y = {}"), Object::Float(2.26), Object::Int(7)]).unwrap(),
+            s("x = 2.3, y = 7")
+        );
+    }
+
+    #[test]
+    fn test_format_brace_escapes() {
+        let mut v = vm();
+        assert_eq!(native_string_format(&mut v, &[s("{{}}")]).unwrap(), s("{}"));
+        assert_eq!(native_string_format(&mut v, &[s("{{a}}")]).unwrap(), s("{a}"));
+        assert_eq!(native_string_format(&mut v, &[s("{{")]).unwrap(), s("{"));
+        assert_eq!(native_string_format(&mut v, &[s("}}")]).unwrap(), s("}"));
+        // 转义与占位混合
+        assert_eq!(
+            native_string_format(&mut v, &[s("{{{}}}"), Object::Int(1)]).unwrap(),
+            s("{1}")
+        );
+    }
+
+    #[test]
+    fn test_format_errors() {
+        let mut v = vm();
+        // {:.Nf} 于非数值 → TypeError
+        let err = native_string_format(&mut v, &[s("{:.2f}"), s("x")]).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        // 单独 } → ValueError（Python 对齐：Single '}' encountered）
+        let err = native_string_format(&mut v, &[s("a}b")]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("'}'"), "got: {}", err);
+        // 非法规格 {:x}
+        let err = native_string_format(&mut v, &[s("{:x}"), Object::Int(1)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("{:x"), "got: {}", err);
+        // 超范围精度 {:.10f}（N ∈ 0..=9）
+        let err = native_string_format(&mut v, &[s("{:.10f}"), Object::Float(1.0)]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("{:.10f"), "got: {}", err);
+        // { 后非法字符
+        let err = native_string_format(&mut v, &[s("{a}")]).unwrap_err();
+        assert!(err.contains("ValueError"), "got: {}", err);
+        // 未闭合 {:
+        let err = native_string_format(&mut v, &[s("{:.2")]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("unclosed"), "got: {}", err);
+        // 未闭合 lone {
+        let err = native_string_format(&mut v, &[s("ab{")]).unwrap_err();
+        assert!(err.contains("ValueError"), "got: {}", err);
+        // 占位参数不足（规格段同样计数）
+        let err = native_string_format(&mut v, &[s("{:.2f}")]).unwrap_err();
+        assert!(err.contains("ValueError") && err.contains("not enough"), "got: {}", err);
+    }
+
+    // ---- task 80：string 扩充函数 ----
+
+    /// 从 Object 提取 list 的 Vec 拷贝（测试辅助）。
+    fn list_items(o: &Object) -> Vec<Object> {
+        match o {
+            Object::Ref(p) => unsafe { read_list(*p) }.clone(),
+            _ => panic!("expected list ref"),
+        }
+    }
+
+    /// 从 Object 提取 tuple 的 Vec 拷贝（测试辅助）。
+    fn tuple_items(o: &Object) -> Vec<Object> {
+        match o {
+            Object::Ref(p) => unsafe { read_tuple(*p) }.clone(),
+            _ => panic!("expected tuple ref"),
+        }
+    }
+
+    #[test]
+    fn test_string_count_and_find() {
+        let mut v = vm();
+        assert_eq!(
+            native_string_count(&mut v, &[s("aaa"), s("a")]).unwrap(),
+            Object::Int(3)
+        );
+        // 非重叠
+        assert_eq!(
+            native_string_count(&mut v, &[s("aaaa"), s("aa")]).unwrap(),
+            Object::Int(2)
+        );
+        // 空 sub → 0
+        assert_eq!(
+            native_string_count(&mut v, &[s("abc"), s("")]).unwrap(),
+            Object::Int(0)
+        );
+        // arity 自校验（MAX，与 gc.count 共享名）
+        let err = native_string_count(&mut v, &[s("a")]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("exactly 2"), "got: {}", err);
+        let err = native_string_count(&mut v, &[]).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        // find：字符位置；未找到 -1
+        assert_eq!(
+            native_string_find(&mut v, &[s("hello"), s("ll")]).unwrap(),
+            Object::Int(2)
+        );
+        assert_eq!(
+            native_string_find(&mut v, &[s("日本語"), s("本")]).unwrap(),
+            Object::Int(1)
+        );
+        assert_eq!(
+            native_string_find(&mut v, &[s("hello"), s("xx")]).unwrap(),
+            Object::Int(-1)
+        );
+    }
+
+    #[test]
+    fn test_string_title_and_capitalize() {
+        let mut v = vm();
+        assert_eq!(as_str(&native_string_title(&mut v, &[s("hello world")]).unwrap()), "Hello World");
+        // 非字母后首字母大写（Python 语义）
+        assert_eq!(as_str(&native_string_title(&mut v, &[s("they're")]).unwrap()), "They'Re");
+        assert_eq!(as_str(&native_string_title(&mut v, &[s("")]).unwrap()), "");
+        assert_eq!(
+            as_str(&native_string_capitalize(&mut v, &[s("hello WORLD")]).unwrap()),
+            "Hello world"
+        );
+        assert_eq!(as_str(&native_string_capitalize(&mut v, &[s("")]).unwrap()), "");
+    }
+
+    #[test]
+    fn test_string_padding() {
+        let mut v = vm();
+        // n 为结果总长（Python rjust/ljust 语义）
+        assert_eq!(as_str(&native_string_pad_start(&mut v, &[s("42"), Object::Int(5)]).unwrap()), "   42");
+        assert_eq!(
+            as_str(&native_string_pad_start(&mut v, &[s("42"), Object::Int(5), s("0")]).unwrap()),
+            "00042"
+        );
+        assert_eq!(
+            as_str(&native_string_pad_end(&mut v, &[s("42"), Object::Int(5), s("*")]).unwrap()),
+            "42***"
+        );
+        // 已长于 n → 返回 s 副本；n 负 → 同
+        assert_eq!(as_str(&native_string_pad_start(&mut v, &[s("hello"), Object::Int(3)]).unwrap()), "hello");
+        assert_eq!(as_str(&native_string_pad_end(&mut v, &[s("hello"), Object::Int(-1)]).unwrap()), "hello");
+        // center：左短右长
+        assert_eq!(as_str(&native_string_center(&mut v, &[s("abc"), Object::Int(10)]).unwrap()), "   abc    ");
+        assert_eq!(
+            as_str(&native_string_center(&mut v, &[s("abc"), Object::Int(7), s("-")]).unwrap()),
+            "--abc--"
+        );
+        // zfill 符号保留
+        assert_eq!(as_str(&native_string_zfill(&mut v, &[s("-42"), Object::Int(5)]).unwrap()), "-0042");
+        assert_eq!(as_str(&native_string_zfill(&mut v, &[s("42"), Object::Int(5)]).unwrap()), "00042");
+        assert_eq!(as_str(&native_string_zfill(&mut v, &[s("+42"), Object::Int(5)]).unwrap()), "+0042");
+        assert_eq!(as_str(&native_string_zfill(&mut v, &[s("12345"), Object::Int(3)]).unwrap()), "12345");
+        // arity 自校验（MAX）
+        let err = native_string_pad_start(&mut v, &[s("42")]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("2-3"), "got: {}", err);
+        let err = native_string_center(&mut v, &[s("a"), Object::Int(1), s("x"), Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_string_split_lines_and_trim() {
+        let mut v = vm();
+        // 三种行尾
+        let r = native_string_split_lines(&mut v, &[s("a\nb\r\nc\rd")]).unwrap();
+        let items = list_items(&r);
+        assert_eq!(items.len(), 4);
+        assert_eq!(as_str(&items[1]), "b");
+        assert_eq!(as_str(&items[3]), "d");
+        // 尾部行尾不产生空行
+        let r = native_string_split_lines(&mut v, &[s("a\n")]).unwrap();
+        assert_eq!(list_items(&r).len(), 1);
+        // 空行保留（行间）
+        let r = native_string_split_lines(&mut v, &[s("a\n\nb")]).unwrap();
+        assert_eq!(list_items(&r).len(), 3);
+        // 空串 → 空 list
+        let r = native_string_split_lines(&mut v, &[s("")]).unwrap();
+        assert_eq!(list_items(&r).len(), 0);
+        // trim
+        assert_eq!(as_str(&native_string_trim_start(&mut v, &[s("  x  ")]).unwrap()), "x  ");
+        assert_eq!(as_str(&native_string_trim_end(&mut v, &[s("  x  ")]).unwrap()), "  x");
+    }
+
+    #[test]
+    fn test_string_predicates() {
+        let mut v = vm();
+        assert_eq!(native_string_is_alnum(&mut v, &[s("abc123")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_alnum(&mut v, &[s("")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_alnum(&mut v, &[s("a b")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_space(&mut v, &[s(" \t\n")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_space(&mut v, &[s("")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_space(&mut v, &[s(" x")]).unwrap(), Object::Bool(false));
+        // is_upper/is_lower：至少一个有大小写字母（Python 语义）
+        assert_eq!(native_string_is_upper(&mut v, &[s("ABC1")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_upper(&mut v, &[s("abc")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_upper(&mut v, &[s("123")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_upper(&mut v, &[s("")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_lower(&mut v, &[s("abc1")]).unwrap(), Object::Bool(true));
+        assert_eq!(native_string_is_lower(&mut v, &[s("Abc")]).unwrap(), Object::Bool(false));
+        assert_eq!(native_string_is_lower(&mut v, &[s("123")]).unwrap(), Object::Bool(false));
+    }
+
+    #[test]
+    fn test_string_cut_fields_join() {
+        let mut v = vm();
+        // cut：首个 sep 切两段
+        let t = native_string_cut(&mut v, &[s("a,b,c"), s(",")]).unwrap();
+        let items = tuple_items(&t);
+        assert_eq!(items.len(), 2);
+        assert_eq!(as_str(&items[0]), "a");
+        assert_eq!(as_str(&items[1]), "b,c");
+        // 无 sep → (s, "")
+        let t = native_string_cut(&mut v, &[s("abc"), s(",")]).unwrap();
+        let items = tuple_items(&t);
+        assert_eq!(as_str(&items[0]), "abc");
+        assert_eq!(as_str(&items[1]), "");
+        // 空 sep → ValueError
+        let err = native_string_cut(&mut v, &[s("abc"), s("")]).unwrap_err();
+        assert!(err.contains("ValueError"), "got: {}", err);
+        // fields：连续空白分割
+        let r = native_string_fields(&mut v, &[s("  a \t b  ")]).unwrap();
+        let items = list_items(&r);
+        assert_eq!(items.len(), 2);
+        assert_eq!(as_str(&items[0]), "a");
+        assert_eq!(as_str(&items[1]), "b");
+        // join：模块级与 sep.join(list) 等价
+        let lst = alloc_list(vec![s("a"), s("b"), s("c")]);
+        assert_eq!(as_str(&native_string_join(&mut v, &[s("-"), lst]).unwrap()), "a-b-c");
+        // join arity 自校验（MAX，与 path.join 共享名）
+        let err = native_string_join(&mut v, &[s("-")]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("exactly 2"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_integration_string_ext() {
+        // 端到端：task 80 扩充（等价 test_string_ext.ms 的值域部分）。
+        let src = r#"
+import string
+assert(string.count("aaa", "a") == 3)
+assert(string.find("hello", "xx") == -1)
+assert(string.title("hello world") == "Hello World")
+assert(string.capitalize("hello WORLD") == "Hello world")
+assert(string.pad_start("42", 5) == "   42")
+assert(string.zfill("-42", 5) == "-0042")
+before, after = string.cut("a,b,c", ",")
+assert(before == "a" and after == "b,c")
+f = string.fields("  a \t b  ")
+assert(len(f) == 2 and f[0] == "a" and f[1] == "b")
+assert(string.join("-", ["a", "b"]) == "a-b")
+lines = string.split_lines("a\nb\r\nc\rd")
+assert(len(lines) == 4)
+assert(string.format("{:.2f}", 3.14159) == "3.14")
+assert(string.format("{:.2f}", 3) == "3.00")
+assert(string.format("{{}}") == "{}")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "string ext integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_string_format_error_paths() {
+        // 端到端错误路径（原生 Err 不经 try/except，整体 Err）。
+        for (src, expect) in [
+            ("string.format(\"{:.2f}\", \"x\")", "TypeError"),
+            ("string.format(\"a}b\")", "ValueError"),
+            ("string.format(\"{:x}\", 1)", "ValueError"),
+            ("string.format(\"{:.10f}\", 1.0)", "ValueError"),
+        ] {
+            let full = format!("import string\n{}", src);
+            let r = run_source(&full);
+            assert!(r.is_err(), "{} should fail", src);
+            let e = r.unwrap_err();
+            assert!(e.contains(expect), "{}: expected {} in {}", src, expect, e);
+        }
     }
 }

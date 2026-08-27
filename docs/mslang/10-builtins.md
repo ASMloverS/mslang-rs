@@ -97,7 +97,8 @@ round(3.14159, 2)  # 3.14
 | `range` | `range(end) -> iterator` | 0 到 end-1 |
 | `range` | `range(start, end) -> iterator` | start 到 end-1 |
 | `range` | `range(start, end, step) -> iterator` | 带步长 |
-| `sorted` | `sorted(iterable) -> list` | 排序 |
+| `sorted` | `sorted(iterable, key?, reverse?) -> list` | 稳定排序（新 list）；key 为 1 参函数；reverse=true 反转比较器（等值元素保持原序） |
+| `sorted_by` | `sorted_by(iterable, key, reverse?) -> list` | sorted 的 key 显式版 |
 | `reversed` | `reversed(iterable) -> iterator` | 反转 |
 | `enumerate` | `enumerate(iterable) -> iterator` | (index, value) 对 |
 | `zip` | `zip(*iterables) -> iterator` | 并行迭代 |
@@ -115,6 +116,11 @@ range(0, 10, 2)       # 0,2,4,6,8
 
 sorted([3,1,2])       # [1,2,3]
 reversed([1,2,3])     # [3,2,1]
+
+# key / reverse（task 80）：稳定排序，等 key 元素保持原序
+sorted(["bb","a","ccc"], fn(w) { return len(w) })   # ["a","bb","ccc"]
+sorted([3,1,2], nil, true)                           # [3,2,1]
+sorted_by(["bb","a","ccc"], fn(w) { return len(w) }) # 同 sorted(iter, key)
 
 for i, v in enumerate(["a","b"]) {
     print(i, v)       # 0 a, 1 b
@@ -188,7 +194,8 @@ ch = channel(10)     # 缓冲区大小为 10
 | `remove(val)` | 删除第一个匹配 |
 | `index(val)` | 查找元素位置 |
 | `contains(val)` | 是否包含 |
-| `sort()` | 原地排序 |
+| `sort(key?, reverse?)` | 原地稳定排序（key 为 1 参函数；reverse=true 反转比较器，等值保序） |
+| `sort_by(key)` | 原地按键排序（sort 的 key 显式版） |
 | `reverse()` | 原地反转 |
 | `slice(start, end?)` | 切片 |
 | `map(fn)` | 映射 |
@@ -202,6 +209,13 @@ lst.push(9)                   # [1, 1, 3, 4, 5, 9]
 lst.pop()                     # 9
 lst.insert(0, 0)              # [0, 1, 1, 3, 4, 5]
 lst.remove(1)                 # [0, 1, 3, 4, 5]
+
+# key / reverse（task 80）
+words = ["bb", "a", "ccc"]
+words.sort(fn(w) { return len(w) })   # ["a", "bb", "ccc"]
+words.sort_by(fn(w) { return -len(w) })
+nums = [3, 1, 2]
+nums.sort(nil, true)                  # [3, 2, 1]
 
 [1,2,3].map(fn(x) { return x*2 })      # [2,4,6]
 [1,2,3,4].filter(fn(x) { return x>2 }) # [3,4]
@@ -291,6 +305,74 @@ math.log10(100)     # 2.0
 math.exp(1)         # 2.718...
 ```
 
+task 80 扩充（3 常量 + 28 函数）：
+
+```ms
+import math
+
+# 常量
+math.tau               # 2π
+math.inf               # 正无穷
+math.nan               # NaN
+
+# 反三角 / 双曲（域外返回 NaN，不抛错）
+math.asin(1)           # π/2
+math.atan2(1, 1)       # π/4
+math.sinh(0)           # 0.0
+math.acosh(1)          # 0.0
+
+# 数值
+math.cbrt(27)          # 3.0（立方根，负数域可用）
+math.hypot(3, 4)       # 5.0（无中间溢出）
+math.trunc(-3.7)       # -3（向零截断）
+math.sign(-2.5)        # -1（-1/0/1；NaN → 0）
+math.fmod(-7, 3)       # -1.0（C 截断取余，与 % 的地板取整区分）
+math.modf(1.25)        # (0.25, 1.0)
+math.copysign(3, -1)   # -3.0
+math.degrees(math.pi)  # 180.0
+math.radians(180)      # π
+
+# 整数族（参数非法 → ValueError；checked 溢出 → OverflowError）
+math.gcd(12, 18)       # 6（负数取绝对值；gcd(0,n)=n）
+math.lcm(4, 6)         # 12（lcm(0,n)=0）
+math.factorial(5)      # 120（范围 0-20，21 溢出）
+math.comb(5, 2)        # 10（k>n → 0）
+math.perm(5, 2)        # 20
+math.isqrt(17)         # 4（⌊√n⌋）
+
+# 谓词
+math.is_nan(math.nan)  # true
+math.is_inf(math.inf)  # true
+
+# log 升级：log(x, base?)
+math.log(8, 2)         # 3.0（base 2/10 走精确路径）
+math.log(100, 10)      # 2.0 == math.log10(100)
+# base=1 或 base<=0 → ValueError
+```
+
+#### API
+
+| 函数/常量 | 签名 | 说明 |
+|---|---|---|
+| `tau` / `inf` / `nan` | `-> float` | 常量（inline Float） |
+| `asin` / `acos` / `atan` | `(x) -> float` | 反三角；域外返回 NaN |
+| `atan2` | `(y, x) -> float` | |
+| `sinh` / `cosh` / `tanh` / `asinh` / `acosh` / `atanh` | `(x) -> float` | 双曲；域外返回 NaN |
+| `cbrt` | `(x) -> float` | 立方根 |
+| `hypot` | `(x, y) -> float` | √(x²+y²)，无中间溢出 |
+| `trunc` | `(x) -> int` | 向零截断 |
+| `sign` | `(x) -> int` | -1/0/1；NaN → 0 |
+| `fmod` | `(x, y) -> float` | C 截断取余 |
+| `modf` | `(x) -> tuple(float, float)` | (小数部分, 整数部分) |
+| `copysign` | `(x, y) -> float` | x 幅值 + y 符号 |
+| `degrees` / `radians` | `(x) -> float` | 角度/弧度互转 |
+| `gcd` / `lcm` | `(a, b) -> int` | 非负；负数取绝对值；溢出 → OverflowError |
+| `factorial` | `(n) -> int` | 0..=20；超范围 → OverflowError、负数 → ValueError |
+| `comb` / `perm` | `(n, k) -> int` | k>n → 0；负数 → ValueError；溢出 → OverflowError |
+| `isqrt` | `(n) -> int` | ⌊√n⌋；负数 → ValueError |
+| `is_nan` / `is_inf` | `(x) -> bool` | 谓词 |
+| `log` | `(x, base?) -> float` | base 缺省 e；base=1 / base<=0 → ValueError |
+
 ### os
 
 ```ms
@@ -316,6 +398,69 @@ string.reverse("hello")                   # "olleh"
 string.is_alpha("abc")                    # true
 string.is_digit("123")                    # true
 ```
+
+task 80 扩充（18 函数 + format 增强）：
+
+```ms
+import string
+
+# 查找
+string.count("aaa", "a")          # 3（非重叠；空 sub → 0）
+string.find("hello", "ll")        # 2（字符位置；未找到 -1）
+
+# 大小写
+string.title("hello world")       # "Hello World"
+string.capitalize("hello WORLD")  # "Hello world"
+
+# 填充（n 为结果总长，Python rjust/ljust 语义；pad 取首字符循环）
+string.pad_start("42", 5)         # "   42"
+string.pad_start("42", 5, "0")    # "00042"
+string.pad_end("42", 5, "*")      # "42***"
+string.center("abc", 7, "-")      # "--abc--"（左短右长）
+string.zfill("-42", 5)            # "-0042"（符号保留）
+
+# 行分割 / 修剪（\n / \r\n / \r 均识别；尾行尾不产生空行）
+string.split_lines("a\nb\r\nc")   # ["a", "b", "c"]
+string.trim_start("  x  ")        # "x  "
+string.trim_end("  x  ")          # "  x"
+
+# 谓词（空串均 false；is_upper/is_lower 需至少一个有大小写字母）
+string.is_alnum("abc123")         # true
+string.is_space(" \t\n")          # true
+string.is_upper("ABC1")           # true
+string.is_lower("abc1")           # true
+
+# 切分 / 连接
+before, after = string.cut("a,b,c", ",")   # ("a", "b,c")；无 sep → (s, "")
+string.fields("  a \t b  ")       # ["a", "b"]（连续空白分割）
+string.join("-", ["a", "b"])      # "a-b"（与 "-".join(list) 等价）
+
+# format 增强：{{ / }} 字面转义 + {:.Nf} 定点（N ∈ 0..=9）
+string.format("{{}}")             # "{}"
+string.format("{:.2f}", 3.14159)  # "3.14"
+string.format("{:.2f}", 3)        # "3.00"（Int 按 Float 格式化）
+# 非数值 / 非法规格（{:x}、{:.10f}、单独 }、未闭合）→ ValueError/TypeError
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `count` | `(s, sub) -> int` | 非重叠出现次数；空 sub → 0 |
+| `find` | `(s, sub) -> int` | 首个字符索引；未找到 -1（与 `s.index()` 抛错区分） |
+| `title` | `(s) -> string` | 每词首字母大写其余小写 |
+| `capitalize` | `(s) -> string` | 首字符大写其余小写 |
+| `pad_start` / `pad_end` | `(s, n, pad=" ") -> string` | 左/右填充至总长 n |
+| `center` | `(s, n, pad=" ") -> string` | 居中（左短右长） |
+| `zfill` | `(s, n) -> string` | 左补零，符号保留 |
+| `split_lines` | `(s) -> list` | 按行分割（\n / \r\n / \r） |
+| `trim_start` / `trim_end` | `(s) -> string` | 去除首/尾空白 |
+| `is_alnum` / `is_space` | `(s) -> bool` | 谓词（空串 false） |
+| `is_upper` / `is_lower` | `(s) -> bool` | 谓词（需至少一个有大小写字母） |
+| `cut` | `(s, sep) -> tuple(s0, s1)` | 首个 sep 切两段；无 sep → (s, "") |
+| `fields` | `(s) -> list` | 连续空白分割 |
+| `join` | `(sep, list) -> string` | 模块级，与 `sep.join(list)` 等价 |
+| `format` | `(template, *args) -> string` | `{}` 顺序替换 + `{{`/`}}` 转义 + `{:.Nf}` 定点（N ∈ 0..=9） |
 
 ### time
 

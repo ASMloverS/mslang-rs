@@ -272,6 +272,14 @@ pub struct VM {
     /// task 39：GET_ATTR 对 GENERATOR 解析 __next__/close/__iter__ 时写入待调用方法 id，
     /// CALL（call_value）对 GENERATOR 被调用者读取并清空。1=__next__，2=close，3=__iter__。
     gen_call_method: Option<u8>,
+    /// task 80：native 回调异常穿透 —— call_function 嵌套 run_loop 期间的 unwind
+    /// 边界（调用方帧索引）。drive_unwind 传播至该边界时不得重定向/弹调用方帧
+    /// （native 仍在执行，续行会损坏其栈布局），异常暂存 `escaped_exc`，由
+    /// call_value 在 native 返回后经 throw() 重抛（可被调用方 try/except 捕获）。
+    unwind_boundary: Option<usize>,
+    /// task 80：跨过 unwind_boundary 的待重抛异常（见上）。由最近的 native
+    /// 返回边界（call_value FUNCTION/BOUND_METHOD 分支）消费。
+    pub(crate) escaped_exc: Option<Object>,
     /// GC 堆（task 52）。MVP 经 `gc::maybe_gc` 在主循环触发；当前 VM 日常分配
     /// （`object.rs`/`builtins.rs` 的 `alloc_*`）尚未接入 GC 堆，故 GC 保持 dormant。
     /// task 74：pub(crate) 供 capi::gc 的 GC 控制/统计/finalizer API 直接访问。
@@ -370,6 +378,8 @@ impl VM {
             pending_unwind: None,
             gen_outcome: None,
             gen_call_method: None,
+            unwind_boundary: None,
+            escaped_exc: None,
             heap: gc::MsHeap::new(),
             gc_runtime: std::sync::Arc::new(gc::GcRuntime::new()),
             gc_coordinator: None,
@@ -435,10 +445,39 @@ impl VM {
         vm.native_arities.insert("sin".to_string(), 1);
         vm.native_arities.insert("cos".to_string(), 1);
         vm.native_arities.insert("tan".to_string(), 1);
-        vm.native_arities.insert("log".to_string(), 1);
+        // task 80：log 升级 (x, base?)，可变参（自校验 1-2 参）。
+        vm.native_arities.insert("log".to_string(), usize::MAX);
         vm.native_arities.insert("log2".to_string(), 1);
         vm.native_arities.insert("log10".to_string(), 1);
         vm.native_arities.insert("exp".to_string(), 1);
+        // task 80：math 扩充（16-stdlib-expansion.md §4.1）。
+        vm.native_arities.insert("asin".to_string(), 1);
+        vm.native_arities.insert("acos".to_string(), 1);
+        vm.native_arities.insert("atan".to_string(), 1);
+        vm.native_arities.insert("atan2".to_string(), 2);
+        vm.native_arities.insert("sinh".to_string(), 1);
+        vm.native_arities.insert("cosh".to_string(), 1);
+        vm.native_arities.insert("tanh".to_string(), 1);
+        vm.native_arities.insert("asinh".to_string(), 1);
+        vm.native_arities.insert("acosh".to_string(), 1);
+        vm.native_arities.insert("atanh".to_string(), 1);
+        vm.native_arities.insert("cbrt".to_string(), 1);
+        vm.native_arities.insert("hypot".to_string(), 2);
+        vm.native_arities.insert("trunc".to_string(), 1);
+        vm.native_arities.insert("sign".to_string(), 1);
+        vm.native_arities.insert("fmod".to_string(), 2);
+        vm.native_arities.insert("modf".to_string(), 1);
+        vm.native_arities.insert("copysign".to_string(), 2);
+        vm.native_arities.insert("degrees".to_string(), 1);
+        vm.native_arities.insert("radians".to_string(), 1);
+        vm.native_arities.insert("gcd".to_string(), 2);
+        vm.native_arities.insert("lcm".to_string(), 2);
+        vm.native_arities.insert("factorial".to_string(), 1);
+        vm.native_arities.insert("comb".to_string(), 2);
+        vm.native_arities.insert("perm".to_string(), 2);
+        vm.native_arities.insert("isqrt".to_string(), 1);
+        vm.native_arities.insert("is_nan".to_string(), 1);
+        vm.native_arities.insert("is_inf".to_string(), 1);
 
         // task 48：注册原生 os/string/time/path 模块 + 模块函数 arity。
         for (name, ptr) in [
@@ -463,6 +502,27 @@ impl VM {
         vm.native_arities.insert("reverse".to_string(), 1);
         vm.native_arities.insert("is_alpha".to_string(), 1);
         vm.native_arities.insert("is_digit".to_string(), 1);
+        // task 80：string 扩充（16-stdlib-expansion.md §4.2）。
+        // count 与 gc.count 同名 → MAX，各自自校验（gc.count=0 / string.count=2）；
+        // join 与 path.join 同名同 MAX（string.join 自校验恰 2 参）；
+        // pad_start/pad_end/center 为 (s, n, pad=" ") 可变参。
+        vm.native_arities.insert("count".to_string(), usize::MAX);
+        vm.native_arities.insert("find".to_string(), 2);
+        vm.native_arities.insert("title".to_string(), 1);
+        vm.native_arities.insert("capitalize".to_string(), 1);
+        vm.native_arities.insert("pad_start".to_string(), usize::MAX);
+        vm.native_arities.insert("pad_end".to_string(), usize::MAX);
+        vm.native_arities.insert("center".to_string(), usize::MAX);
+        vm.native_arities.insert("zfill".to_string(), 2);
+        vm.native_arities.insert("split_lines".to_string(), 1);
+        vm.native_arities.insert("trim_start".to_string(), 1);
+        vm.native_arities.insert("trim_end".to_string(), 1);
+        vm.native_arities.insert("is_alnum".to_string(), 1);
+        vm.native_arities.insert("is_space".to_string(), 1);
+        vm.native_arities.insert("is_upper".to_string(), 1);
+        vm.native_arities.insert("is_lower".to_string(), 1);
+        vm.native_arities.insert("cut".to_string(), 2);
+        vm.native_arities.insert("fields".to_string(), 1);
         vm.native_arities.insert("now".to_string(), 0);
         vm.native_arities.insert("sleep".to_string(), 1);
         vm.native_arities.insert("format".to_string(), usize::MAX);
@@ -494,7 +554,9 @@ impl VM {
         vm.native_arities.insert("set_concurrent".to_string(), 1);
         vm.native_arities.insert("set_adaptive".to_string(), 1);
         vm.native_arities.insert("stats".to_string(), 0);
-        vm.native_arities.insert("count".to_string(), 0);
+        // task 80：count 与 string.count 同名 → 升级 MAX（gc_count 自校验恰 0 参，
+        // string.count 自校验恰 2 参，§2.2 同名冲突治理）。
+        vm.native_arities.insert("count".to_string(), usize::MAX);
         vm.native_arities.insert("mem_alloc".to_string(), 0);
         vm.native_arities.insert("mem_live".to_string(), 0);
 
@@ -1975,7 +2037,14 @@ impl VM {
                 }
                 let args = self.stack[self.stack.len() - argc..].to_vec();
                 self.stack.truncate(self.stack.len() - argc - 1);
-                let result = func(self, &args)?;
+                let result = func(self, &args);
+                // task 80：native 回调异常穿透 —— call_function 在 unwind 边界截获的
+                // 异常在此重抛（经 throw/drive_unwind 走正常 except 匹配）。优先于
+                // native 自身的 Err（那是中止信号而非最终错误）。
+                if let Some(exc) = self.escaped_exc.take() {
+                    return self.throw(exc);
+                }
+                let result = result?;
                 self.push(result)?;
             }
             // 用户函数（task 27/31）：CLOSURE 分支。支持默认参数与可变参数。
@@ -2096,7 +2165,12 @@ impl VM {
                     let mut args = self.stack[self.stack.len() - argc..].to_vec();
                     args.insert(0, receiver);
                     self.stack.truncate(self.stack.len() - argc - 1);
-                    let result = func(self, &args)?;
+                    let result = func(self, &args);
+                    // task 80：native 回调异常穿透重抛（同 FUNCTION 分支）。
+                    if let Some(exc) = self.escaped_exc.take() {
+                        return self.throw(exc);
+                    }
+                    let result = result?;
                     self.push(result)?;
                 } else if method_tag == TypeTag::NATIVE_C_FUNCTION as u8 {
                     #[cfg(feature = "capi")]
@@ -2362,7 +2436,11 @@ impl VM {
     /// task 51：调用任意 callable Object（CLOSURE/FUNCTION/BOUND_METHOD）并返回结果。
     /// 供 List.map/filter/reduce 等原生方法调用用户回调。
     /// 压栈 callee + args，call_value 后 run_loop 至返回，弹出结果。
+    /// task 80：回调内异常穿透 —— 嵌套 run_loop 期间设置 unwind 边界，回调抛出的
+    /// 异常不重定向 native 调用方帧（见 VM.unwind_boundary 注释），而是暂存
+    /// escaped_exc 由最近的 native 返回边界重抛。
     pub fn call_function(&mut self, callee: &Object, args: &[Object]) -> Result<Object, String> {
+        let stack_entry = self.stack.len();
         self.push(callee.clone())?;
         for arg in args {
             self.push(arg.clone())?;
@@ -2370,7 +2448,17 @@ impl VM {
         let caller_depth = self.call_stack.len();
         self.call_value(args.len())?;
         if self.call_stack.len() > caller_depth {
-            self.run_loop(Some(caller_depth))?;
+            let prev_boundary = self.unwind_boundary.replace(caller_depth);
+            let result = self.run_loop(Some(caller_depth));
+            self.unwind_boundary = prev_boundary;
+            result?;
+        }
+        if self.escaped_exc.is_some() {
+            // task 80：回调异常穿透 —— 回调帧已被 drive_unwind 弹出并截断至 callee
+            // 槽，栈顶残留并非返回值。清理本次压栈后返回占位 Nil；异常由 call_value
+            // 在 native 返回后重抛（可被调用方 try/except 捕获）。
+            self.stack.truncate(stack_entry);
+            return Ok(Object::Nil);
         }
         self.pop()
     }
@@ -2965,6 +3053,15 @@ impl VM {
             .take()
             .expect("drive_unwind called with no pending exception");
         loop {
+            // task 80：native 回调边界 —— 异常不得越过 unwind_boundary 指示的帧
+            //（native 仍在执行，重定向其调用方帧会损坏栈布局）。暂存 escaped_exc，
+            // 交 call_value 在 native 返回后重抛（走正常 except 匹配）。
+            if let Some(boundary) = self.unwind_boundary {
+                if self.call_stack.len() <= boundary {
+                    self.escaped_exc = Some(err);
+                    return Ok(());
+                }
+            }
             let frame_stack_base = match self.call_stack.last() {
                 Some(f) => f.stack_base,
                 None => {

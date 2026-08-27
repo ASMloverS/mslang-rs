@@ -3,8 +3,10 @@
 //! 参照 [51-builtin-methods-list-dict-set](../../../docs/mslang/tasks/51-builtin-methods-list-dict-set.md)。
 
 use super::{expect_int, expect_list_ref};
-use crate::vm::builtins::NativeFn;
-use crate::vm::object::{alloc_list, read_list, CmpOp, Object, TypeTag};
+use crate::vm::builtins::{
+    expect_callable, expect_reverse, optional_key, rooted_list_ptr, sort_items_dsu, NativeFn,
+};
+use crate::vm::object::{alloc_list, read_list, Object};
 use crate::vm::VM;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +24,7 @@ pub fn lookup_list_method(name: &str) -> Option<NativeFn> {
         "index" => native_list_index,
         "contains" => native_list_contains,
         "sort" => native_list_sort,
+        "sort_by" => native_list_sort_by,
         "reverse" => native_list_reverse,
         "slice" => native_list_slice,
         "map" => native_list_map,
@@ -129,35 +132,77 @@ fn native_list_contains(_vm: &mut VM, args: &[Object]) -> Result<Object, String>
     Ok(Object::Bool(found))
 }
 
-fn native_list_sort(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let ptr = expect_list_ref(args.get(0), "sort()")?;
-    let mut items = unsafe { read_list(ptr) }.clone();
-    let mut err: Option<String> = None;
-    items.sort_by(|a, b| {
-        if err.is_some() {
-            return std::cmp::Ordering::Equal;
-        }
-        match a.compare(b, CmpOp::Less) {
-            Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
-            Ok(_) => match a.compare(b, CmpOp::Greater) {
-                Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
-                Ok(_) => std::cmp::Ordering::Equal,
-                Err(e) => {
-                    err = Some(e);
-                    std::cmp::Ordering::Equal
-                }
-            },
-            Err(e) => {
-                err = Some(e);
-                std::cmp::Ordering::Equal
-            }
-        }
-    });
-    if let Some(e) = err {
-        return Err(e);
+/// list.sort(key?, reverse?) — 原地稳定排序（task 80 扩展：key/reverse 可选）。
+/// 方法调用经 BoundMethod→FUNCTION 路径（mod.rs call_value）**不查 native_arities**，
+/// 用户参数个数（不含 receiver）须在 native 内自校验（0-2），违规 → TypeError。
+fn native_list_sort(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    expect_list_ref(args.get(0), "sort(key?, reverse?)")?;
+    if args.len() > 3 {
+        return Err(format!(
+            "TypeError: sort() takes 0-2 arguments, got {}",
+            args.len() - 1
+        ));
     }
-    unsafe { read_list(ptr) }.clear();
-    unsafe { read_list(ptr) }.extend(items);
+    let key = optional_key(args.get(1), "sort(key)")?;
+    let reverse = if args.len() > 2 {
+        expect_reverse(args.get(2), "sort(reverse)")?
+    } else {
+        false
+    };
+    sort_list_in_place(vm, args[0].clone(), key.as_ref(), reverse)
+}
+
+/// list.sort_by(key) — sort 的 key 显式版（task 80）。
+/// 同 sort：BoundMethod→FUNCTION 路径不查 native_arities，自校验恰 1 个用户参数。
+fn native_list_sort_by(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    expect_list_ref(args.get(0), "sort_by(key)")?;
+    if args.len() != 2 {
+        return Err(format!(
+            "TypeError: sort_by(key) takes exactly 1 argument, got {}",
+            args.len() - 1
+        ));
+    }
+    let key = expect_callable(args.get(1), "sort_by(key)")?;
+    sort_list_in_place(vm, args[0].clone(), Some(&key), false)
+}
+
+/// 原地 DSU 排序（task 80）：receiver 压栈根化 —— 方法调用实参已被弹出 vm.stack
+///（call_value BOUND_METHOD 分支），且 receiver 可能是唯一引用（如 [3,1,2].sort()），
+/// key 调用重入 VM 触发 GC 时未根化的源会被回收/移动。排序核心复用 builtins::
+/// sort_items_dsu（GC 根化要求见其文档注释）。
+fn sort_list_in_place(
+    vm: &mut VM,
+    receiver: Object,
+    key: Option<&Object>,
+    reverse: bool,
+) -> Result<Object, String> {
+    let root_base = vm.stack().len();
+    vm.push(receiver)?;
+    let ret = sort_in_place_rooted(vm, root_base, key, reverse);
+    vm.stack_mut().truncate(root_base);
+    ret
+}
+
+fn sort_in_place_rooted(
+    vm: &mut VM,
+    recv_slot: usize,
+    key: Option<&Object>,
+    reverse: bool,
+) -> Result<Object, String> {
+    let items: Vec<Object> = {
+        // SAFETY: recv_slot 持 sort_list_in_place 压入的 list Ref（经 expect_list_ref 校验）。
+        unsafe { read_list(rooted_list_ptr(vm, recv_slot)) }.clone()
+    };
+    let sorted = sort_items_dsu(vm, items, key, reverse)?;
+    if vm.escaped_exc.is_some() {
+        // key 异常已截获暂存：中止（call_value 将重抛）；不写回部分结果。
+        return Ok(Object::Nil);
+    }
+    // 写回：指针从根槽重取（sort_items_dsu 内 key 调用可能触发 GC 移动）。
+    // SAFETY: 同上。
+    let list = unsafe { read_list(rooted_list_ptr(vm, recv_slot)) };
+    list.clear();
+    list.extend(sorted);
     Ok(Object::Nil)
 }
 
@@ -242,32 +287,6 @@ fn native_list_reduce(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     Ok(acc)
 }
 
-/// 校验参数为 callable（FUNCTION/CLOSURE/BOUND_METHOD）。
-fn expect_callable(arg: Option<&Object>, who: &str) -> Result<Object, String> {
-    match arg {
-        Some(o @ Object::Ref(ptr)) => {
-            let tag = unsafe { (**ptr).type_tag };
-            if tag == TypeTag::FUNCTION as u8
-                || tag == TypeTag::CLOSURE as u8
-                || tag == TypeTag::BOUND_METHOD as u8
-            {
-                Ok(o.clone())
-            } else {
-                Err(format!(
-                    "TypeError: {} expects callable, got {}",
-                    who,
-                    o.type_name()
-                ))
-            }
-        }
-        other => Err(format!(
-            "TypeError: {} expects callable, got {}",
-            who,
-            other.map(|o| o.type_name()).unwrap_or("missing")
-        )),
-    }
-}
-
 /// 列表索引归一化（负索引相对末尾，越界返回 None）。
 fn normalize_index(i: i64, len: usize) -> Option<usize> {
     let len = len as i64;
@@ -291,13 +310,154 @@ mod tests {
     #[test]
     fn test_lookup_list_method() {
         let names = [
-            "length", "push", "pop", "insert", "remove", "index", "contains", "sort",
+            "length", "push", "pop", "insert", "remove", "index", "contains", "sort", "sort_by",
             "reverse", "slice", "map", "filter", "reduce",
         ];
         for name in &names {
             assert!(lookup_list_method(name).is_some(), "missing list method: {}", name);
         }
         assert!(lookup_list_method("nosuch").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // task 80: sort(key?, reverse?) / sort_by(key)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_list_sort_arity_self_validation() {
+        let mut v = vm();
+        // 用户参数（不含 receiver）自校验：sort 0-2、sort_by 恰 1。
+        let lst = ilist(&[1, 2]);
+        let err =
+            native_list_sort(&mut v, &[lst.clone(), Object::Nil, Object::Bool(false), Object::Bool(false)])
+                .unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("0-2"), "got: {}", err);
+        let err = native_list_sort_by(&mut v, &[lst.clone()]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("exactly 1"), "got: {}", err);
+        let err = native_list_sort_by(&mut v, &[lst.clone(), Object::Nil, Object::Nil]).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        // sort key 非 callable → TypeError
+        let err = native_list_sort(&mut v, &[lst.clone(), Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("callable"), "got: {}", err);
+        // sort reverse 非 bool → TypeError
+        let err = native_list_sort(&mut v, &[lst, Object::Nil, Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("reverse"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_integration_sort_key_stability() {
+        // DSU 稳定排序：等 key 元素保持原序；reverse 等值保序。
+        let src = r#"
+words = ["bb", "a", "ccc", "dd", "e", "aa"]
+by_len = sorted(words, fn(w) { return len(w) })
+assert(by_len == ["a", "e", "bb", "dd", "aa", "ccc"], "len 稳定排序")
+rev = sorted(words, fn(w) { return len(w) }, true)
+assert(rev == ["ccc", "bb", "dd", "aa", "a", "e"], "reverse 等值保序")
+assert(sorted_by(words, fn(w) { return len(w) }) == by_len, "sorted_by 等价")
+assert(sorted_by(words, fn(w) { return len(w) }, true) == rev, "sorted_by reverse")
+assert(sorted([3, 1, 2]) == [1, 2, 3], "无 key 兼容旧用例")
+assert(sorted([3, 1, 2], nil, true) == [3, 2, 1], "nil key + reverse")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "sort key stability failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_list_sort_key() {
+        // list.sort / sort_by 原地生效。
+        let src = r#"
+lst = [3, 1, 2]
+r = lst.sort()
+assert(r == nil, "sort 返回 nil")
+assert(lst == [1, 2, 3], "原地")
+
+lst2 = ["bb", "a", "ccc"]
+lst2.sort(fn(w) { return len(w) })
+assert(lst2 == ["a", "bb", "ccc"], "list.sort(key)")
+
+lst3 = [3, 1, 2]
+lst3.sort(nil, true)
+assert(lst3 == [3, 2, 1], "list.sort(nil, true)")
+
+lst4 = ["bb", "a", "ccc"]
+lst4.sort_by(fn(w) { return len(w) })
+assert(lst4 == ["a", "bb", "ccc"], "sort_by")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "list sort key failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_sort_key_exception_propagation() {
+        // key 抛错上抛调用方：try/except 捕获 key 内抛出的 ValueError。
+        let src = r#"
+fn bad_key(x) {
+    if x > 2 {
+        throw ValueError("too big: " + str(x))
+    }
+    return x
+}
+caught = false
+msg = ""
+try {
+    sorted([1, 3, 2], bad_key)
+} except ValueError as e {
+    caught = true
+    msg = e.message
+}
+assert(caught, "sorted key 异常被调用方捕获")
+assert(msg == "too big: 3", "异常消息")
+
+caught2 = false
+try {
+    [1, 3, 2].sort_by(bad_key)
+} except ValueError as e {
+    caught2 = true
+}
+assert(caught2, "list.sort_by key 异常上抛")
+
+# sort 中止后不写回部分结果
+lst = [3, 1]
+try {
+    lst.sort(bad_key)
+} except Error as e {
+}
+assert(lst == [3, 1], "key 异常后原 list 不变")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "sort key exception propagation failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_integration_sort_gc_stress() {
+        // GC 压力：大 list + key 内逐元素分配新对象 + gc.collect 后逐项校验。
+        let src = r#"
+import gc
+big = []
+i = 0
+while i < 200 {
+    big.push(200 - i)
+    i = i + 1
+}
+keyed = sorted(big, fn(x) {
+    junk = ["k", x, x * 2]
+    return x % 7
+})
+gc.collect()
+assert(len(keyed) == 200, "长度保持")
+k = 0
+while k < len(keyed) - 1 {
+    assert(keyed[k] % 7 <= keyed[k + 1] % 7, "按键非降")
+    k = k + 1
+}
+total = 0
+for v in keyed {
+    total = total + v
+}
+assert(total == 20100, "元素总值不变（无丢失/错值）")
+"#;
+        let r = run_source(src);
+        assert!(r.is_ok(), "sort gc stress failed: {:?}", r.err());
     }
 
     #[test]

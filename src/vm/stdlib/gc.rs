@@ -290,7 +290,15 @@ fn gc_stats(vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
     Ok(alloc_dict(map))
 }
 
-fn gc_count(vm: &mut VM, _args: &[Object]) -> Result<Object, String> {
+fn gc_count(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    // task 80：count 与 string.count 同名，native_arities 升级 MAX（§2.2 同名
+    // 冲突治理），此处自校验恰 0 参。
+    if !args.is_empty() {
+        return Err(format!(
+            "TypeError: gc.count() takes exactly 0 arguments, got {}",
+            args.len()
+        ));
+    }
     let total = vm.heap.minor_count + vm.heap.major_count;
     Ok(Object::Int(total as i64))
 }
@@ -450,6 +458,9 @@ mod tests {
             gc_count(&mut v, &[]).unwrap(),
             Object::Int(total as i64)
         );
+        // task 80：count 与 string.count 同名升级 MAX，此处自校验恰 0 参。
+        let err = gc_count(&mut v, &[Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("0"), "got: {}", err);
     }
 
     #[test]

@@ -183,7 +183,10 @@ impl VM {
             // 迭代器与容器函数（task 26）：range 覆盖 task 25 的 List 版本为迭代器；
             // sorted/reversed/enumerate/zip/map/filter/any/all 为新增。
             ("range", usize::MAX, builtin_range),
-            ("sorted", 1, builtin_sorted),
+            // task 80：sorted 扩展 (iterable, key?, reverse?)；sorted_by 为 key 显式版。
+            // 两者均 MAX（native 内自校验 1-3 / 2-3 参）。
+            ("sorted", usize::MAX, builtin_sorted),
+            ("sorted_by", usize::MAX, builtin_sorted_by),
             ("reversed", 1, builtin_reversed),
             ("enumerate", 1, builtin_enumerate),
             ("zip", usize::MAX, builtin_zip),
@@ -928,41 +931,236 @@ fn builtin_range(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 // 迭代器函数（task 26）
 // ---------------------------------------------------------------------------
 
-/// sorted(iterable) -> 新列表（升序）。比较失败须上抛 TypeError（不静默错序）。
-fn builtin_sorted(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let arg = args.get(0).ok_or("sorted() requires 1 argument")?;
-    // 统一走 to_iterator，接受任意可迭代对象（list/tuple/string/set/dict/range/iterator）。
-    let mut items: Vec<Object> = Vec::new();
-    let mut iter = to_iterator(arg)?;
-    while let Some(v) = iter.next() {
-        items.push(v);
-    }
-    // CmpOp 与 OpCode 解耦（task 21，object.rs）。比较失败须上抛 TypeError。
-    let mut err: Option<String> = None;
-    items.sort_by(|a, b| {
-        if err.is_some() {
-            return std::cmp::Ordering::Equal;
-        }
-        match a.compare(b, CmpOp::Less) {
-            Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
-            Ok(_) => match a.compare(b, CmpOp::Greater) {
-                Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
-                Ok(_) => std::cmp::Ordering::Equal,
-                Err(e) => {
-                    err = Some(e);
-                    std::cmp::Ordering::Equal
-                }
-            },
-            Err(e) => {
-                err = Some(e);
-                std::cmp::Ordering::Equal
+/// 校验参数为 callable（FUNCTION/CLOSURE/BOUND_METHOD）。task 51 引入（list.rs），
+/// task 80 提升至此供 sorted/sorted_by/sort/sort_by 的 key 校验共用。
+pub(crate) fn expect_callable(arg: Option<&Object>, who: &str) -> Result<Object, String> {
+    match arg {
+        Some(o @ Object::Ref(ptr)) => {
+            let tag = unsafe { (**ptr).type_tag };
+            if tag == TypeTag::FUNCTION as u8
+                || tag == TypeTag::CLOSURE as u8
+                || tag == TypeTag::BOUND_METHOD as u8
+            {
+                Ok(o.clone())
+            } else {
+                Err(format!(
+                    "TypeError: {} expects callable, got {}",
+                    who,
+                    o.type_name()
+                ))
             }
         }
-    });
+        other => Err(format!(
+            "TypeError: {} expects callable, got {}",
+            who,
+            other.map(|o| o.type_name()).unwrap_or("missing")
+        )),
+    }
+}
+
+/// reverse 参数校验（task 80）：仅接受 Bool。
+pub(crate) fn expect_reverse(arg: Option<&Object>, who: &str) -> Result<bool, String> {
+    match arg {
+        Some(Object::Bool(b)) => Ok(*b),
+        other => Err(format!(
+            "TypeError: {} expects bool for reverse, got {}",
+            who,
+            other.map(|o| o.type_name()).unwrap_or("missing")
+        )),
+    }
+}
+
+/// key 可选参数解析（task 80）：缺省 / Nil → None（Python key=None 语义），
+/// 其余须为 callable。
+pub(crate) fn optional_key(arg: Option<&Object>, who: &str) -> Result<Option<Object>, String> {
+    match arg {
+        None | Some(Object::Nil) => Ok(None),
+        Some(_) => Ok(Some(expect_callable(arg, who)?)),
+    }
+}
+
+/// 比较辅助（升序）：错误置入 err 槽延迟上抛（sort_by 闭包无法返回 Result）。
+fn cmp_objects(a: &Object, b: &Object, err: &mut Option<String>) -> std::cmp::Ordering {
+    if err.is_some() {
+        return std::cmp::Ordering::Equal;
+    }
+    match a.compare(b, CmpOp::Less) {
+        Ok(Object::Bool(true)) => std::cmp::Ordering::Less,
+        Ok(_) => match a.compare(b, CmpOp::Greater) {
+            Ok(Object::Bool(true)) => std::cmp::Ordering::Greater,
+            Ok(_) => std::cmp::Ordering::Equal,
+            Err(e) => {
+                *err = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        },
+        Err(e) => {
+            *err = Some(e);
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
+/// 从根化栈槽重取 heap list 裸指针（task 80 GC 安全）。
+/// call_function 重入解释器期间可能触发 GC，堆指针须从 vm.stack 根槽重取，
+/// 防对象移动/回收后悬垂（16-stdlib-expansion.md §GC 安全）。
+pub(crate) fn rooted_list_ptr(vm: &VM, slot: usize) -> *mut MsObjHeader {
+    match &vm.stack()[slot] {
+        Object::Ref(p) => *p,
+        _ => unreachable!("rooted slot must hold list Ref"),
+    }
+}
+
+/// DSU 中间对（tuple）元素读取：slot 0 = key，slot 1 = 原元素。
+fn tuple_elem(obj: &Object, idx: usize) -> Object {
+    match obj {
+        Object::Ref(p) => {
+            // SAFETY: DSU 对由 alloc_tuple 分配。
+            let t = unsafe { read_tuple(*p) };
+            t[idx].clone()
+        }
+        _ => unreachable!("DSU pair must be tuple Ref"),
+    }
+}
+
+/// task 80：DSU 排序核心（sorted/sorted_by/list.sort/list.sort_by 共用）。
+///
+/// - 稳定排序（Rust `sort_by`）；reverse 反转比较器（等值元素保持原序，Python 语义）；
+/// - decorate-sort-undecorate：单次 sort 每元素仅调用 key 一次；
+/// - key 抛错上抛调用方（call_function 截获的异常暂存 `escaped_exc`，由 call_value
+///   在 native 返回后重抛，可被调用方 try/except 捕获）；
+/// - GC 安全：key 调用经 call_function 重入解释器（每条字节码前 maybe_gc），native
+///   栈不在 GC 根集 —— key、源元素 heap list、DSU 中间对 heap list 均压入 vm.stack
+///   根化（list 被 trace，元素随之存活）；call_function 之后一切堆指针从根槽重取。
+///   （builtin_map/filter 与 list.map/filter 的未根化结果 Vec 写法存在同构隐患，
+///   本 task 不修复，但新代码禁止复刻。）
+pub(crate) fn sort_items_dsu(
+    vm: &mut VM,
+    items: Vec<Object>,
+    key: Option<&Object>,
+    reverse: bool,
+) -> Result<Vec<Object>, String> {
+    // 无 key：比较器不重入 VM，无 GC 窗口（与旧 builtin_sorted 一致，无需根化）。
+    let Some(key_obj) = key else {
+        let mut sorted = items;
+        let mut err = None;
+        sorted.sort_by(|a, b| {
+            let (x, y) = if reverse { (b, a) } else { (a, b) };
+            cmp_objects(x, y, &mut err)
+        });
+        return match err {
+            Some(e) => Err(e),
+            None => Ok(sorted),
+        };
+    };
+    let root_base = vm.stack().len();
+    vm.push(key_obj.clone())?; // slot root_base+0：key 根
+    vm.push(alloc_list(items))?; // slot root_base+1：源元素 heap list 根
+    let ret = dsu_sort_rooted(vm, root_base, reverse);
+    vm.stack_mut().truncate(root_base);
+    ret
+}
+
+/// DSU 路径（key 为 Some）：decorate → sort → undecorate。
+/// 根布局：root_base+0 = key、root_base+1 = 源元素 list、root_base+2 = DSU 对 list。
+fn dsu_sort_rooted(vm: &mut VM, root_base: usize, reverse: bool) -> Result<Vec<Object>, String> {
+    // DSU 中间对放入 heap list 并压栈根化（list 被 trace，tuple 元素随之存活）。
+    vm.push(alloc_list(Vec::new()))?;
+    let pairs_slot = root_base + 2;
+    let n = {
+        // SAFETY: slot root_base+1 由 sort_items_dsu 压入 alloc_list 的 Ref。
+        let items = unsafe { read_list(rooted_list_ptr(vm, root_base + 1)) };
+        items.len()
+    };
+    for i in 0..n {
+        // 元素从根化的源 list 重取（防上次迭代 key 调用触发 GC 后指针悬垂）。
+        let elem = {
+            let items_ptr = rooted_list_ptr(vm, root_base + 1);
+            // SAFETY: 同上。
+            let items = unsafe { read_list(items_ptr) };
+            items[i].clone()
+        };
+        let key_now = vm.stack()[root_base].clone();
+        let k = vm.call_function(&key_now, &[elem])?;
+        if vm.escaped_exc.is_some() {
+            // key 抛出的异常已被截获暂存：中止排序（结果将被丢弃），
+            // call_value 会在本 native 返回后重抛给调用方。
+            return Ok(Vec::new());
+        }
+        // call_function 之后重读源元素（GC 移动后旧 Ref 可能悬垂）。
+        let elem_fresh = {
+            let items_ptr = rooted_list_ptr(vm, root_base + 1);
+            // SAFETY: 同上。
+            let items = unsafe { read_list(items_ptr) };
+            items[i].clone()
+        };
+        let pair = alloc_tuple(vec![k, elem_fresh]);
+        // SAFETY: pairs_slot 由本函数压入 alloc_list 的 Ref。
+        let pairs = unsafe { read_list(rooted_list_ptr(vm, pairs_slot)) };
+        pairs.push(pair);
+    }
+    // 排序：纯 Rust 比较器（不重入 VM，无 GC 窗口）。
+    let mut err = None;
+    {
+        let pairs_ptr = rooted_list_ptr(vm, pairs_slot);
+        // SAFETY: 同上。
+        let pairs = unsafe { read_list(pairs_ptr) };
+        pairs.sort_by(|a, b| {
+            let (ka, kb) = (tuple_elem(a, 0), tuple_elem(b, 0));
+            let (x, y) = if reverse { (kb, ka) } else { (ka, kb) };
+            cmp_objects(&x, &y, &mut err)
+        });
+    }
     if let Some(e) = err {
         return Err(e);
     }
-    Ok(alloc_list(items))
+    // undecorate：物化结果（此后不再重入 VM）。
+    let pairs_ptr = rooted_list_ptr(vm, pairs_slot);
+    // SAFETY: 同上。
+    let pairs = unsafe { read_list(pairs_ptr) };
+    Ok(pairs.iter().map(|p| tuple_elem(p, 1)).collect())
+}
+
+/// sorted(iterable, key?, reverse?) -> 新列表（task 80：key/reverse 可选 + DSU 稳定排序）。
+/// arity MAX（native_arities）：native 内自校验 1-3 参。
+/// 比较失败须上抛 TypeError（不静默错序）。
+fn builtin_sorted(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.is_empty() || args.len() > 3 {
+        return Err(format!(
+            "TypeError: sorted() takes 1-3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let key = optional_key(args.get(1), "sorted(key)")?;
+    let reverse = if args.len() > 2 {
+        expect_reverse(args.get(2), "sorted(reverse)")?
+    } else {
+        false
+    };
+    // 统一走 to_iterator，接受任意可迭代对象（list/tuple/string/set/dict/range/iterator）。
+    let items = collect_iter(&args[0])?;
+    let sorted = sort_items_dsu(vm, items, key.as_ref(), reverse)?;
+    Ok(alloc_list(sorted))
+}
+
+/// sorted_by(iterable, key, reverse?) -> 新列表（sorted 的 key 显式版，task 80）。
+/// arity MAX：native 内自校验 2-3 参。
+fn builtin_sorted_by(vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(format!(
+            "TypeError: sorted_by() takes 2-3 arguments, got {}",
+            args.len()
+        ));
+    }
+    let key = expect_callable(args.get(1), "sorted_by(key)")?;
+    let reverse = if args.len() > 2 {
+        expect_reverse(args.get(2), "sorted_by(reverse)")?
+    } else {
+        false
+    };
+    let items = collect_iter(&args[0])?;
+    let sorted = sort_items_dsu(vm, items, Some(&key), reverse)?;
+    Ok(alloc_list(sorted))
 }
 
 /// reversed(iterable) -> 反转迭代器。仅支持有确定序的 list/tuple/string。
@@ -1690,5 +1888,87 @@ mod tests {
         // 依赖用户函数调用（task 27/28），本 task 以存根返回 Err。
         assert!(builtin_map(&mut v, &[Object::Int(1), Object::Int(2)]).is_err());
         assert!(builtin_filter(&mut v, &[Object::Int(1), Object::Int(2)]).is_err());
+    }
+
+    // ---- task 80：sorted/sorted_by 参数自校验（DSU 稳定性/reverse/异常穿透
+    //     的端到端用例见 list.rs tests，需经 test_util::run_source 驱动）----
+
+    #[test]
+    fn test_sorted_arity_self_validation() {
+        let mut v = vm();
+        // 0 参 / 4 参 → TypeError（arity MAX，native 内自校验 1-3）
+        let err = builtin_sorted(&mut v, &[]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("1-3"), "got: {}", err);
+        let err = builtin_sorted(
+            &mut v,
+            &[
+                alloc_list(vec![]),
+                Object::Nil,
+                Object::Bool(false),
+                Object::Bool(false),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        // key 非 callable → TypeError
+        let err = builtin_sorted(&mut v, &[alloc_list(vec![]), Object::Int(1)]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("callable"), "got: {}", err);
+        // reverse 非 bool → TypeError
+        let err = builtin_sorted(
+            &mut v,
+            &[alloc_list(vec![]), Object::Nil, Object::Int(1)],
+        )
+        .unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("reverse"), "got: {}", err);
+        // nil key 视为缺省（合法）
+        assert!(builtin_sorted(&mut v, &[alloc_list(vec![Object::Int(2), Object::Int(1)]), Object::Nil]).is_ok());
+    }
+
+    #[test]
+    fn test_sorted_by_arity_self_validation() {
+        let mut v = vm();
+        // 1 参 / 4 参 → TypeError（自校验 2-3）
+        let err = builtin_sorted_by(&mut v, &[alloc_list(vec![])]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("2-3"), "got: {}", err);
+        let err = builtin_sorted_by(
+            &mut v,
+            &[
+                alloc_list(vec![]),
+                Object::Nil,
+                Object::Bool(true),
+                Object::Bool(true),
+            ],
+        )
+        .unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
+        // key 必填：nil → TypeError（callable 校验）
+        let err = builtin_sorted_by(&mut v, &[alloc_list(vec![]), Object::Nil]).unwrap_err();
+        assert!(err.contains("TypeError") && err.contains("callable"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_sorted_no_key_and_reverse() {
+        let mut v = vm();
+        // 无 key 兼容旧用例
+        assert_eq!(
+            builtin_sorted(&mut v, &[alloc_list(vec![Object::Int(3), Object::Int(1), Object::Int(2)])]).unwrap(),
+            alloc_list(vec![Object::Int(1), Object::Int(2), Object::Int(3)])
+        );
+        // 无 key + reverse（nil 占位 key）
+        assert_eq!(
+            builtin_sorted(
+                &mut v,
+                &[
+                    alloc_list(vec![Object::Int(3), Object::Int(1), Object::Int(2)]),
+                    Object::Nil,
+                    Object::Bool(true)
+                ]
+            )
+            .unwrap(),
+            alloc_list(vec![Object::Int(3), Object::Int(2), Object::Int(1)])
+        );
+        // 不可比较元素 → TypeError 上抛
+        let err = builtin_sorted(&mut v, &[alloc_list(vec![s("a"), Object::Int(1)])]).unwrap_err();
+        assert!(err.contains("TypeError"), "got: {}", err);
     }
 }
