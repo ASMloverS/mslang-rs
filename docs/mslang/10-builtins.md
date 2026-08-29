@@ -525,6 +525,80 @@ try {
 - 注册到内置异常表（`src/vm/mod.rs` `BUILTIN_EXCEPTION_NAMES` / `EXCEPTION_PARENTS`）
 - `except TimeoutError` 直接匹配；与 `except Error` 也匹配（父类链）
 
+### random
+
+```ms
+import random
+
+random.random()            # [0, 1) 均匀 Float
+random.randint(1, 6)       # 闭区间 [1, 6] Int
+random.uniform(5, 10)      # Float（端点不保证，Python 语义）
+random.gauss(0, 1)         # 正态分布（Box–Muller）
+random.choice("abc")       # 随机单字符 string（list/tuple/string 均可）
+lst = [1, 2, 3]
+random.shuffle(lst)        # 原地 Fisher–Yates 洗牌，返回 nil
+random.sample([1, 2, 3], 2)    # 不放回采样，返回新 list
+random.seed(42)            # 重置生成器（缺省系统熵）；此后序列确定
+```
+
+生成器为 thread_local `StdRng`：`seed(n)` 后序列确定（可测试），与 select 语句
+随机分派的内部 `thread_rng` 互不影响。负 seed 按补码位模式转 u64。
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `random` | `() -> float` | [0,1) 均匀 |
+| `randint` | `(a, b) -> int` | 闭区间 [a,b]（含 i64 全区间）；a>b → ValueError；非 int → TypeError |
+| `uniform` | `(a, b) -> float` | a + (b-a)*random()；端点不保证（Python 语义） |
+| `gauss` | `(mu, sigma) -> float` | Box–Muller 正态；sigma<0 → ValueError |
+| `choice` | `(seq) -> value` | list/tuple/string（string 返回单字符 string）；空 → ValueError |
+| `shuffle` | `(lst) -> nil` | 原地 Fisher–Yates；非 list → TypeError |
+| `sample` | `(pop, n) -> list` | 不放回；string 总体返回单字符 string 的 list；n<0 或 n>len → ValueError |
+| `seed` | `(n?) -> nil` | 重置生成器；缺省（或 nil）系统熵播种 |
+
+### encoding
+
+```ms
+import encoding
+
+encoding.base64_encode("foobar")   # "Zm9vYmFy"（RFC 4648 + '=' padding）
+encoding.base64_decode("Zm9vYg==") # "foob"（ASCII 空白剔除后解码）
+encoding.hex_encode("mslang")      # "6d736c616e67"（小写）
+encoding.hex_decode("4D53")        # "MS"（大写输入等价）
+encoding.url_encode("a b/c")       # "a%20b/c"（safe="/" 缺省，%HH 大写）
+encoding.url_encode("a b/c", "")   # "a%20b%2Fc"（自定义 safe）
+encoding.url_decode("a+b")         # "a+b"（`+` 保持字面，非 form 语义）
+```
+
+语言无 bytes 类型：解码结果须为合法 UTF-8，否则 ValueError（如
+`url_decode("%FF")`）。非法字符/长度错误均附位置。
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `base64_encode` | `(s) -> string` | RFC 4648 标准字母表 + `=` padding |
+| `base64_decode` | `(s) -> string` | 剔除 ASCII 空白；长度非 4 倍数 / 非法字符 / padding >2 → ValueError |
+| `hex_encode` | `(s) -> string` | 字节十六进制小写 |
+| `hex_decode` | `(s) -> string` | 大小写输入均接受；奇数长度 / 非 hex → ValueError |
+| `url_encode` | `(s, safe="/") -> string` | 保留 `A-Za-z0-9-_.~` 与 safe；其余逐 UTF-8 字节 `%HH` 大写 |
+| `url_decode` | `(s) -> string` | %XX 解码（大小写 hex 均接受）；`+` 字面；非法序列/UTF-8 → ValueError |
+
+### uuid
+
+```ms
+import uuid
+
+u = uuid.uuid4()   # "xxxxxxxx-xxxx-4xxx-[89ab]xxx-xxxxxxxxxxxx"（36 字符小写）
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `uuid4` | `() -> string` | RFC 4122 版本 4；122 位熵（复用 random 模块生成器，seed 后可复现）；version/variant 位正确置位 |
+
 ### gc
 
 ```ms

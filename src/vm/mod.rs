@@ -570,6 +570,38 @@ impl VM {
         vm.native_arities.insert("sleep".to_string(), 1);
         vm.native_arities.insert("timeout".to_string(), 2);
 
+        // task 81：注册原生 random/encoding/uuid 模块 + 模块函数 arity
+        //（16-stdlib-expansion.md §4.4-4.6）。
+        let random_ptr = stdlib::register_random_module();
+        vm.module_resolver
+            .native_modules
+            .insert("random".to_string(), random_ptr);
+        // seed(n?) 可变参（自校验 0-1 参，§2.2）；其余固定 arity。
+        vm.native_arities.insert("random".to_string(), 0);
+        vm.native_arities.insert("randint".to_string(), 2);
+        vm.native_arities.insert("uniform".to_string(), 2);
+        vm.native_arities.insert("gauss".to_string(), 2);
+        vm.native_arities.insert("choice".to_string(), 1);
+        vm.native_arities.insert("shuffle".to_string(), 1);
+        vm.native_arities.insert("sample".to_string(), 2);
+        vm.native_arities.insert("seed".to_string(), usize::MAX);
+
+        vm.module_resolver
+            .native_modules
+            .insert("encoding".to_string(), stdlib::register_encoding_module());
+        // url_encode(s, safe?) 可变参（自校验 1-2 参，§2.2）。
+        vm.native_arities.insert("base64_encode".to_string(), 1);
+        vm.native_arities.insert("base64_decode".to_string(), 1);
+        vm.native_arities.insert("hex_encode".to_string(), 1);
+        vm.native_arities.insert("hex_decode".to_string(), 1);
+        vm.native_arities.insert("url_encode".to_string(), usize::MAX);
+        vm.native_arities.insert("url_decode".to_string(), 1);
+
+        vm.module_resolver
+            .native_modules
+            .insert("uuid".to_string(), stdlib::register_uuid_module());
+        vm.native_arities.insert("uuid4".to_string(), 0);
+
         // task 79：填充嵌入式 .ms 模块注册表（collections/itertools/functools/test
         // 占位，内容由 task 84 填充）。磁盘解析未命中后兜底。
         vm.module_resolver.embedded_modules = stdlib::embedded_sources();
