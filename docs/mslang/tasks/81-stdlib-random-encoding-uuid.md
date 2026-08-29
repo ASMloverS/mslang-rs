@@ -28,7 +28,7 @@ Phase 9 - 标准库扩展（M3）
 | gauss | (mu, sigma) -> Float | Box–Muller；sigma<0 → ValueError |
 | choice | (seq) -> value | list/tuple/string（string 返回单字符 string）；空 → ValueError |
 | shuffle | (lst) -> nil | 原地 Fisher–Yates；非 list → TypeError |
-| sample | (pop, n) -> list | 不放回；n<0 或 n>len → ValueError |
+| sample | (pop, n) -> list | 不放回；pop 为 list/tuple/string（string 采样返回单字符 list）；n<0 或 n>len → ValueError；非序列 → TypeError |
 | seed | (n?) -> nil | 重置生成器；缺省系统熵播种；arity MAX |
 
 ### encoding
@@ -71,13 +71,20 @@ thread_local! {
 ```
 
 - `seed(n)` 重置为 `SeedableRng::seed_from_u64(n)`（缺省 `from_entropy`）。
-- 与 `vm/mod.rs:5148` 的 `rand::thread_rng()`（select 随机分派）**互不影响**：
+  n 须为 Int（非 Int → TypeError）；负数按补码位模式转 u64。
+- 与 `vm/mod.rs:5250` 的 `rand::thread_rng()`（select 随机分派）**互不影响**：
   该处沿用 thread_rng，不与本模块状态共享。
+
+### 参数校验（§2.3）
+
+- 错误消息沿用 `前缀: 签名提示` 风格，如 `TypeError: randint(a, b) requires int`。
+- `uniform(a, b)` 参数须为数值（Int/Float），否则 TypeError。
+- `choice`/`sample` 的序列参数非 list/tuple/string → TypeError。
 
 ### gauss（Box–Muller）
 
 ```
-u1, u2 ∈ (0,1]（拒绝 0，防 log(0)）
+u1 = 1.0 - random()、u2 = 1.0 - random()（恒 ∈ (0,1]，杜绝 log(0)）
 z = sqrt(-2 ln u1) * cos(2π u2)
 返回 mu + sigma * z
 ```
@@ -102,10 +109,12 @@ z = sqrt(-2 ln u1) * cos(2π u2)
 ## GC 安全
 
 - 三个模块全部无状态或 thread_local 纯 Rust 状态，无堆对象引用，无新根集。
-- shuffle 原地交换 list 元素（`read_list_mut`），写屏障由既有 SET_INDEX 路径语义
-  覆盖——native 内直接 Vec 交换不经过屏障，但元素均为已有堆内对象且 list 本身
-  存活，无跨代引用变化（元素集合不变，仅重排）。保守起见实现后与 GC 负责人确认
-  （ms_corpus gc 用例回归覆盖）。
+- shuffle **不得裸 Vec 交换**：并发标记（`init_concurrent_mark` 后 Coordinator
+  与 mutator 真并发）活跃期，交换中间窗口被逐出对象仅存于 Rust 局部、不在根集，
+  绕过混合写屏障（Yuasa 快照语义）可能被误清扫 → UAF。实现须**每个槽位写入前
+  调用 `gc::write_barrier`**，或采用「克隆 → 洗牌 → 逐槽经屏障写回」。
+- 附注：既有 `list.reverse`（stdlib/list.rs:211）与 sort 写回（list.rs:203-205）
+  为同类裸写，实现期一并向 GC 负责人报告（不在本 task 范围）。
 
 ## 验证标准
 
@@ -119,7 +128,16 @@ z = sqrt(-2 ln u1) * cos(2π u2)
 8. url_decode("%ZZ") → ValueError
 9. uuid4 格式与版本位：匹配 36 字符模式、第 13 位 = '4'、第 17 位 ∈ 89ab；
    连续生成 100 个互不相同
-10. `cargo test` 全绿
+10. 细化行为：base64_decode 含 ASCII 空白输入剔除后成功；url_decode("%FF") →
+    ValueError（非法 UTF-8）；sample([1], -1) → ValueError；无参 seed() 不报错
+11. Rust 单元测试（§2.4.1）：base64/hex/url 非法输入矩阵（padding 0/1/2、
+    大写 hex 输入、%XX 缺位）、randint(i64::MIN, i64::MAX) 全区间采样
+12. `cargo test` 全绿
+
+## 文档同步（§2.4.3）
+
+- `docs/mslang/10-builtins.md`：新增 random/encoding/uuid 章节（API 表）。
+- `docs/mslang/tasks/README.md`：task 81 状态标记 ✅。
 
 ## 测试用例
 
