@@ -12,7 +12,7 @@ Phase 9 - 标准库扩展（M4）
 
 ## 目标
 
-1. 新增 `fs` 模块（15 个函数：目录/文件结构操作与元数据）。
+1. 新增 `fs` 模块（17 个函数：目录/文件结构操作与元数据）。
 2. `os` 扩充 5 个函数（getpid/hostname/environ/unsetenv/run）。
 3. 新增 `sys` 模块（4 个函数）。
 
@@ -30,6 +30,9 @@ abs/size/mtime/temp_dir/home_dir。
 - `list_dir` 返回**排序后**子项文件名列表（跨平台确定性，不含 `.`/`..`）
 - `walk` 递归先序返回全路径扁平 list（目录+文件），不跟随符号链接
 - `temp_dir()` / `home_dir()` 无参；home 缺失（env USERPROFILE/HOME 均无）→ IOError
+- `abs` 用 `std::path::absolute`：不解析符号链接；Unix 保留 `..`，但 Windows 经
+  GetFullPathNameW 会**词法归一 `..`**（平台差异，测试仅断言 `is_absolute` 不变量，
+  10-builtins.md 注明）
 
 ### os 扩充
 
@@ -38,8 +41,8 @@ abs/size/mtime/temp_dir/home_dir。
 | 函数 | 签名 | 说明 |
 |---|---|---|
 | getpid | () -> Int | |
-| hostname | () -> string | env COMPUTERNAME/HOSTNAME；缺失 → IOError |
-| environ | () -> dict | 全量环境变量快照 |
+| hostname | () -> string | env COMPUTERNAME/HOSTNAME；缺失 → IOError（Linux 非交互 shell/CI 下 HOSTNAME 常未导出，已知限制，10-builtins.md 注明） |
+| environ | () -> dict | 全量环境变量快照；经 `vars_os` + `to_string_lossy` 构建（无效 Unicode 项不 panic） |
 | unsetenv | (key) -> nil | |
 | run | (argv) -> dict | `{"status","stdout","stderr"}`；argv 为 string list **不经 shell** |
 
@@ -47,6 +50,8 @@ abs/size/mtime/temp_dir/home_dir。
   返回 status 为 Int（Unix 信号情形 platform 特定，统一映射为负值或 128+n，实现时以
   `ExitStatus` 序列化为准并在 10-builtins.md 注明）。
 - os.exec（shell 字符串）保留不动；文档引导结构化场景用 os.run。
+- os.run 同步阻塞（与 os.exec 一致，单线程协作事件循环；长命令饿死其他协程，
+  10-builtins.md 注明）。
 
 ### sys
 
@@ -56,43 +61,49 @@ abs/size/mtime/temp_dir/home_dir。
 |---|---|
 | platform() | "windows" / "linux" / "macos"（cfg! 映射） |
 | version() | "mslang 0.1.0"（env!("CARGO_PKG_VERSION")，与 Cargo.toml 自动同步） |
-| executable() | current_exe 绝对路径 |
+| executable() | current_exe 绝对路径；失败（二进制已删等）→ IOError |
 | stdin_read_all() | 读 stdin 至 EOF（管道/重定向场景） |
 
 ## 实现细节
 
 ### 文件位置
 
-- `src/vm/stdlib/fs.rs` — `register_fs_module` + 15 个 native 函数
+- `src/vm/stdlib/fs.rs` — `register_fs_module` + 17 个 native 函数
 - `src/vm/stdlib/os.rs` — 追加 5 个函数到既有 `register_os_module` exports
 - `src/vm/stdlib/sys.rs` — `register_sys_module` + 4 个 native 函数
 - `src/vm/stdlib/mod.rs` — `pub use` 转发
-- `src/vm/mod.rs` — 注册 + `native_arities` 登记（fs/sys 新函数逐个；
-  os 侧 getenv 等既有不变；`run → 1`；注意 `abs → 1` 与 math 无同名冲突、
-  `size → 1` 唯一、`platform → 0` 唯一）
+- `src/vm/mod.rs` — 注册 + `native_arities` 登记（os 侧 getenv 等既有不变；
+  `run → 1`；`abs → 1` 与全局内置 abs（builtins 已注册 1）同名同 arity，无冲突；
+  `size → 1`、`platform → 0` 唯一；**`copy` 与全局内置 `copy(val)`（已注册 1）同名
+  不同 arity**，按总纲 §2.2 必须 `copy → usize::MAX`，fs.copy 自校验恰 2 参、
+  全局 builtin copy 自校验 1 参，并补同名交叉调用回归用例）
+- `docs/mslang/10-builtins.md` — 新增 fs/sys 章节、os 章节扩表（5 函数）与
+  exec 注入警示引导至 os.run
+- `docs/mslang/tasks/README.md` — task 82 状态 ⬜ → ✅
 
 ### walk 实现
 
-显式栈迭代（避免递归深目录栈溢出）：
+显式栈迭代（避免递归深目录栈溢出），**pop 时输出**的 DFS 先序，输出**含 root 自身**
+（首元素）：
 
 ```
+out = []
 stack = [root]
-while let Some(dir) = stack.pop():
-    entries = read_dir(dir) 排序
-    for e in entries:
-        path = dir + e
-        out.push(path)
-        if e.is_dir() && !e.is_symlink(): stack.push(path)
+while let Some(p) = stack.pop():
+    out.push(p)
+    if p.is_dir() && !p.is_symlink():
+        for e in read_dir(p).sorted().rev():
+            stack.push(join(p, e))
 ```
 
-- 排序保证输出顺序确定（与 list_dir 同一排序函数）。
-- 先序语义：父目录条目先于其子目录内容（栈实现时注意压入顺序反转，
-  保证字典序小的子目录先展开；以实现期单测锁定确切顺序）。
+- 排序 + 逆序压栈保证字典序最小子项先展开：输出为严格递归先序（父目录条目先于
+  其子目录内容，且后继兄弟排在先前兄弟的子树之后，与 Go filepath.Walk 同序）。
+- 与 list_dir 同一排序函数；以实现期单测锁定确切顺序。
 
 ### copy 实现
 
-- `std::fs::copy`（12.8 万字节缓冲由 std 内部处理）；dst 为目录时 → IOError
-  （不自动拼接文件名，显式优于隐式）。
+- `std::fs::copy`（Windows CopyFileExW / Unix copy_file_range 由 std 内部处理）；
+  dst 为目录时 → IOError（不自动拼接文件名，显式优于隐式）。
 
 ### os.run 实现
 
@@ -120,7 +131,8 @@ while let Some(dir) = stack.pop():
    status==0 且 stdout 含 hi；os.run([]) → TypeError；os.run(["no_such_exe_xyz"]) → IOError
 7. sys.platform() ∈ {windows, linux, macos}；sys.version() 以 "mslang" 开头；
    sys.executable() 非空
-8. `echo hello | ms run t.ms` 中 stdin_read_all() == "hello"
+8. `echo hello | ms run t.ms` 中 stdin_read_all() 去除行尾后 == "hello"
+   （echo 必附 `\r\n`/`\n`，断言用 trim/包含，不得裸相等）
 9. 全部文件系统用例使用 `std::env::temp_dir()` 下唯一子目录，测试后清理（Rust 侧
    与 .ms 侧均遵守；ms 语料清理失败不判失败——CI 临时目录容错）
 10. `cargo test` 全绿
@@ -141,4 +153,13 @@ while let Some(dir) = stack.pop():
 
 ### Rust 集成测试（tests/ 内新增 `sys_stdin.rs` 或并入 ms_corpus 辅助）
 
-- `echo` 管道驱动 `ms run`，验证 stdin_read_all 输出（验证标准 8）。
+- `echo` 管道驱动 `ms run`，验证 stdin_read_all 输出（验证标准 8；断言去除行尾后
+  相等——echo 必附 `\r\n`/`\n`）。
+- 同名交叉调用回归：全局 `copy([1,2])` 与 `fs.copy(src, dst)` 并存均可用
+  （§2.2 治理，MAX 下各自自校验）。
+
+### 文件内 Rust 单元测试（fs.rs / os.rs / sys.rs 各含 `#[cfg(test)]`）
+
+- 按总纲 §2.4 第 1 条：各模块文件内单测（fs round-trip、copy 同名治理、
+  os.run 参数校验、sys.platform/version 等）；文件系统用例各用
+  `std::env::temp_dir()` 下唯一子目录，测试后清理。

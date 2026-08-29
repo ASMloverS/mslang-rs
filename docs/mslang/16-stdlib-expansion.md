@@ -71,6 +71,7 @@
 | parse | json.parse = 1 | time.parse | 升级 MAX；两者各自自校验 |
 | repeat | string.repeat = 2 | itertools.repeat | 升级 MAX；两者各自自校验 |
 | sorted | builtin sorted = 1 | sorted(iter, key?, reverse?) | 升级 MAX + 自校验 1-3 参 |
+| copy | builtin copy = 1 | fs.copy | 升级 MAX；两侧各自自校验（task 82 审核发现，回写） |
 
 规则：凡注册为 MAX 的原生函数**必须**自校验参数个数并返回 TypeError；实现期加入
 「同名函数 arity 交叉调用」回归用例（如 `gc.count()` 与 `string.count("aa","a")` 并存）。
