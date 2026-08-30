@@ -387,6 +387,42 @@ os.exit(0)                 # 退出程序
 os.args                    # 命令行参数列表
 ```
 
+**安全警示**：`os.exec` 的命令字符串经 shell（Windows `cmd /C`、Unix `sh -c`）
+执行，拼接不可信输入存在命令注入风险。结构化场景（命令与参数固定、含用户
+数据）请改用 `os.run`（argv 列表不经 shell，无注入面）。
+
+task 82 扩充（5 函数）：
+
+```ms
+import os
+
+os.getpid()                              # 当前进程 ID（int）
+os.hostname()                            # 主机名（env COMPUTERNAME/HOSTNAME）
+e = os.environ()                         # 全量环境变量快照（dict）
+os.unsetenv("KEY")                       # 删除环境变量
+r = os.run(["cmd", "/C", "echo", "hi"])  # 不经 shell 执行
+# r == {"status": 0, "stdout": "hi\r\n", "stderr": ""}
+```
+
+#### API（task 82 扩充）
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `getpid` | `() -> int` | 当前进程 ID（正整数） |
+| `hostname` | `() -> string` | env COMPUTERNAME/HOSTNAME；均缺失 → IOError（Linux 非交互 shell/CI 下 HOSTNAME 常未导出，已知限制） |
+| `environ` | `() -> dict` | 全量环境变量快照（string→string）；经 `vars_os` + `to_string_lossy` 构建，无效 Unicode 项不 panic；Windows 键统一大写（与 Python os.environ 对齐，保证 `e["PATH"]` 命中），Unix 保留原样 |
+| `unsetenv` | `(key) -> nil` | 删除环境变量（键不存在亦成功） |
+| `run` | `(argv) -> dict` | `{"status","stdout","stderr"}`；argv 为非空 string list，不经 shell（无注入面） |
+
+os.run 注意事项：
+
+- 参数校验：argv 非 list / 空列表 / 含非 string 元素 → TypeError；启动失败
+  （可执行不存在）→ IOError。
+- status 序列化：正常退出为退出码（int）；Unix 下被信号杀死
+  （`ExitStatus::code()` 为 None）统一 -1（platform 特定，不区分信号编号）。
+- stdout/stderr 经 `from_utf8_lossy`（与 os.exec 一致）。
+- 同步阻塞（与 os.exec 一致）：单线程协作事件循环下长命令会饿死其他协程。
+
 ### string
 
 ```ms
@@ -641,6 +677,80 @@ gc.mem_live()                   # 当前存活字节数
 
 GC 系统设计详见 [14-gc](14-gc.md)。
 
+### fs
+
+```ms
+import fs
+
+fs.mkdir("a")                    # 单级创建；已存在 → IOError
+fs.mkdirs("a/b/c")               # 递归创建；幂等（已存在目录成功）
+fs.rmdir("a")                    # 删除空目录（非空/不存在 → IOError）
+fs.remove("f.txt")               # 删除文件（目录 → IOError）
+fs.remove_all("dir")             # 递归删除；不存在返回 nil（幂等，Go RemoveAll）
+fs.rename("old", "new")          # 重命名/移动
+fs.copy("src.txt", "dst.txt")    # 文件复制；dst 存在则覆盖，dst 为目录 → IOError
+fs.list_dir("dir")               # 子项文件名 list（排序返回，不含 `.`/`..`）
+fs.walk("dir")                   # 递归先序全路径扁平 list（含 dir 自身；不跟随符号链接）
+fs.is_dir("p")                   # 谓词（is_file / is_abs 同型）
+fs.abs("p")                      # 词法绝对化（不解析符号链接）
+fs.size("f.txt")                 # 字节数（int）
+fs.mtime("f.txt")                # 修改时间（Unix 秒，float）
+fs.temp_dir()                    # 系统临时目录
+fs.home_dir()                    # env USERPROFILE/HOME；均缺失 → IOError
+```
+
+与 io 模块分工：read_file/write_file/exists/open（内容读写）保留在 io，
+不在 fs 重复。错误一律 IOError 前缀。
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `mkdir` | `(path) -> nil` | 单级创建；已存在（文件/目录）→ IOError |
+| `mkdirs` | `(path) -> nil` | 递归创建；幂等 |
+| `rmdir` | `(path) -> nil` | 仅空目录；非空 → IOError |
+| `remove` | `(path) -> nil` | 删除文件；目录 → IOError（目录用 remove_all） |
+| `remove_all` | `(path) -> nil` | 递归删除；路径不存在返回 nil（幂等） |
+| `rename` | `(old, new) -> nil` | 重命名/移动 |
+| `copy` | `(src, dst) -> nil` | 文件→文件；dst 存在则覆盖；dst 为目录 → IOError（不自动拼接文件名，显式优于隐式） |
+| `list_dir` | `(path) -> list` | 子项文件名排序返回（跨平台确定；不含 `.`/`..`） |
+| `walk` | `(path) -> list` | DFS 严格先序全路径扁平 list（含 path 首元素）；与 list_dir 同排序；不跟随符号链接 |
+| `is_dir` / `is_file` / `is_abs` | `(path) -> bool` | 谓词 |
+| `abs` | `(path) -> string` | `std::path::absolute` 词法绝对化；不解析符号链接 |
+| `size` | `(path) -> int` | 字节数 |
+| `mtime` | `(path) -> float` | 修改时间（Unix 秒） |
+| `temp_dir` | `() -> string` | 系统临时目录 |
+| `home_dir` | `() -> string` | env USERPROFILE/HOME；均缺失 → IOError |
+
+注意事项：
+
+- `copy` 与全局内置 `copy(val)` 同名不同 arity：native_arities 升级 MAX 后
+  两者各自自校验（fs.copy 恰 2 参、全局 copy 恰 1 参），并存无冲突（§2.2）。
+- `abs` 平台差异：Unix 保留 `..`（仅前置 cwd 词法拼接）；Windows 经
+  GetFullPathNameW 会词法归一 `..`。可移植代码只依赖「结果为绝对路径」不变量。
+- `walk` 顺序与 Go filepath.Walk 一致：父目录条目先于其子目录内容，兄弟按
+  字典序，后继兄弟排在先前兄弟的整个子树之后。
+
+### sys
+
+```ms
+import sys
+
+sys.platform()         # "windows" / "linux" / "macos"（cfg! 编译期映射）
+sys.version()          # "mslang 0.1.0"（与 Cargo.toml 自动同步）
+sys.executable()       # 当前解释器绝对路径；失败（二进制已删等）→ IOError
+sys.stdin_read_all()   # 读 stdin 至 EOF（管道/重定向场景）
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `platform` | `() -> string` | "windows" / "linux" / "macos"（`cfg!` 编译期映射） |
+| `version` | `() -> string` | "mslang {CARGO_PKG_VERSION}"（env! 编译期读取，与 Cargo.toml 自动同步） |
+| `executable` | `() -> string` | current_exe 绝对路径；失败（二进制已删等）→ IOError |
+| `stdin_read_all` | `() -> string` | 读 stdin 至 EOF；非 UTF-8 → IOError（lossy 不可逆，宁可报错）；交互 REPL 下阻塞至 EOF，仅面向 `ms run script.ms < input` 管道/重定向用法 |
+
 ### 未文档化的标准库模块
 
 以下模块已列入标准库结构但尚未定义完整 API，将在后续版本中补充：
@@ -651,5 +761,4 @@ GC 系统设计详见 [14-gc](14-gc.md)。
 | `http` | HTTP 客户端/服务端 |
 | `net` | 网络操作（TCP/UDP） |
 | `collections` | 高级数据结构（deque, heap 等） |
-| `fs` | 文件系统操作（目录遍历、文件元数据等） |
 | `test` | 测试框架（assert 辅助、mock 等） |

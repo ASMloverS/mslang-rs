@@ -602,6 +602,48 @@ impl VM {
             .insert("uuid".to_string(), stdlib::register_uuid_module());
         vm.native_arities.insert("uuid4".to_string(), 0);
 
+        // task 82：注册原生 fs/sys 模块 + os 扩充函数 arity
+        // （16-stdlib-expansion.md §4.7-4.9）。
+        let fs_ptr = stdlib::register_fs_module();
+        vm.module_resolver
+            .native_modules
+            .insert("fs".to_string(), fs_ptr);
+        vm.native_arities.insert("mkdir".to_string(), 1);
+        vm.native_arities.insert("mkdirs".to_string(), 1);
+        vm.native_arities.insert("rmdir".to_string(), 1);
+        vm.native_arities.insert("remove".to_string(), 1);
+        vm.native_arities.insert("remove_all".to_string(), 1);
+        vm.native_arities.insert("rename".to_string(), 2);
+        // copy 与全局内置 copy(val)（register_builtins 已注册 1）同名不同 arity
+        //（fs.copy 为 2 参）→ §2.2 升级 MAX：fs.copy 自校验恰 2 参、builtin_copy
+        // 自校验恰 1 参（同名交叉调用回归见 fs.rs 单测与 tests/sys_stdin.rs）。
+        vm.native_arities.insert("copy".to_string(), usize::MAX);
+        vm.native_arities.insert("list_dir".to_string(), 1);
+        vm.native_arities.insert("walk".to_string(), 1);
+        vm.native_arities.insert("is_dir".to_string(), 1);
+        vm.native_arities.insert("is_file".to_string(), 1);
+        vm.native_arities.insert("is_abs".to_string(), 1);
+        // abs 与全局内置 abs 同名同 arity（register_builtins 已注册 1），不重注册。
+        vm.native_arities.insert("size".to_string(), 1);
+        vm.native_arities.insert("mtime".to_string(), 1);
+        vm.native_arities.insert("temp_dir".to_string(), 0);
+        vm.native_arities.insert("home_dir".to_string(), 0);
+
+        // os 扩充（§4.8）：getpid/hostname/environ/unsetenv/run。
+        vm.native_arities.insert("getpid".to_string(), 0);
+        vm.native_arities.insert("hostname".to_string(), 0);
+        vm.native_arities.insert("environ".to_string(), 0);
+        vm.native_arities.insert("unsetenv".to_string(), 1);
+        vm.native_arities.insert("run".to_string(), 1);
+
+        vm.module_resolver
+            .native_modules
+            .insert("sys".to_string(), stdlib::register_sys_module());
+        vm.native_arities.insert("platform".to_string(), 0);
+        vm.native_arities.insert("version".to_string(), 0);
+        vm.native_arities.insert("executable".to_string(), 0);
+        vm.native_arities.insert("stdin_read_all".to_string(), 0);
+
         // task 79：填充嵌入式 .ms 模块注册表（collections/itertools/functools/test
         // 占位，内容由 task 84 填充）。磁盘解析未命中后兜底。
         vm.module_resolver.embedded_modules = stdlib::embedded_sources();

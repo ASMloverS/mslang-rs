@@ -15,6 +15,7 @@
 mod r#async;
 mod dict;
 mod encoding;
+mod fs;
 mod gc;
 mod io;
 mod json;
@@ -25,11 +26,13 @@ mod path;
 mod random;
 mod set;
 mod string;
+mod sys;
 mod time;
 mod uuid;
 
 pub use dict::lookup_dict_method;
 pub use encoding::register_encoding_module;
+pub use fs::register_fs_module;
 pub use gc::register_gc_module;
 pub use io::{lookup_file_method, native_io_open, register_io_module};
 pub use json::register_json_module;
@@ -41,6 +44,7 @@ pub use r#async::register_async_module;
 pub use random::register_random_module;
 pub use set::lookup_set_method;
 pub use string::{lookup_string_method, register_string_module};
+pub use sys::register_sys_module;
 pub use time::register_time_module;
 pub use uuid::register_uuid_module;
 

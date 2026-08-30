@@ -879,9 +879,16 @@ fn builtin_hash(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
 }
 
 /// copy(val) -> 浅拷贝。
+/// task 82（§2.2 同名冲突治理）：fs.copy 加入后 native_arities 的 copy 升级
+/// usize::MAX，此处自校验恰 1 参（fs.copy 自校验恰 2 参，两侧并存）。
 fn builtin_copy(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
-    let val = args.get(0).ok_or("copy() requires 1 argument")?;
-    match val {
+    if args.len() != 1 {
+        return Err(format!(
+            "TypeError: copy() takes exactly 1 argument but {} were given",
+            args.len()
+        ));
+    }
+    match &args[0] {
         Object::Ref(ptr) => {
             debug_assert!(!ptr.is_null(), "null Object::Ref");
             let tag = unsafe { (**ptr).type_tag };
@@ -892,10 +899,10 @@ fn builtin_copy(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
                 let pairs = unsafe { read_dict(*ptr) }.clone();
                 Ok(alloc_dict(pairs))
             } else {
-                Ok(val.clone()) // 不可变类型直接返回
+                Ok(args[0].clone()) // 不可变类型直接返回
             }
         }
-        _ => Ok(val.clone()),
+        _ => Ok(args[0].clone()),
     }
 }
 
