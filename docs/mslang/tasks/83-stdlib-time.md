@@ -53,20 +53,30 @@ static MONO_BASE: OnceLock<Instant> = OnceLock::new();
 monotonic() = Instant::now().duration_since(*MONO_BASE.get_or_init(Instant::now)).as_secs_f64()
 ```
 
+### ts 参数校验（iso / date_parts / format_ts）
+
+- ts 接受 Int 与 Float（与既有 time.format 一致）。
+- Float ts 禁止 `as u64` 静默饱和（§2.3）：NaN/±Inf → ValueError、
+  超出可表示范围 → OverflowError（经 `float_to_int` 语义校验），再截断取整秒。
+- ts < 0 → ValueError（沿用 time.format 既有校验）。
+
 ### format_ts / parse 共享指令扫描
 
 - 格式串逐字符：`%` + 指令字符为一段；其余为字面字符。
+- 指令集外指令字符（如 `%q`）与孤立 `%` → ValueError（format_ts 与 parse 同）。
 - `format_ts`：字面段原样输出；指令段替换为对应零填充数字（`%Y` 4 位、
   `%m/%d/%H/%M/%S` 2 位、`%%` 输出 `%`）。
 - `parse`：格式串与输入串双指针推进；字面段须精确匹配；指令段按位数贪婪扫描数字
   （`%Y` 1-4 位、其余 1-2 位），扫完构造 (year,month,day,hour,min,sec)；
-  月份 1-12 / 日 1-31 / 时 0-23 / 分秒 0-59 越界 → ValueError；多余输入 → ValueError。
+  月份 1-12 / 时 0-23 / 分秒 0-59 越界 → ValueError；日 1-31 且不超当月天数
+  （含闰年规则，对齐 Python strptime，2 月 30 → ValueError）；多余输入 → ValueError；
+  结果 ts < 0（1970 前日期）→ ValueError（与 ts ≥ 0 约束对称，保证往返一致）。
 - ts→ymdhms 与反向均复用/补写 civil 历法（既有 `unix_to_ymdhms` 为正向；
   反向 `ymdhms_to_unix` 补写 days_from_civil，同 Howard Hinnant 算法）。
 
 ### date_parts weekday
 
-`(days_since_epoch + 4) % 7`（1970-01-01 为周四=4），结果 0=周一…6=周日；
+`(days_since_epoch + 3) % 7`（1970-01-01 为周四=3），结果 0=周一…6=周日；
 负数情形不存在（ts ≥ 0 校验，与现 time.format 一致：ts<0 → ValueError）。
 
 ### iso / date_parts 缺省 ts
@@ -90,16 +100,27 @@ monotonic() = Instant::now().duration_since(*MONO_BASE.get_or_init(Instant::now)
 8. parse/format_ts 往返一致（多组样本）
 9. parse 非法：字面不匹配 / 月 13 / 多余尾部 → ValueError
 10. sleep_ms(-1) → ValueError；sleep_ms("x") → TypeError
-11. 同名冲突回归：json.parse('1') 与 time.parse(...) 同脚本并存正确
-12. `cargo test` 全绿
+11. iso(NaN) → ValueError（Float ts 非有限值显式报错，禁止静默饱和）
+12. 未知指令：format_ts(0, "%q") / parse("x", "%q") → ValueError
+13. parse("2023-02-30", "%Y-%m-%d") → ValueError（日越界当月天数）
+14. parse("1969-12-31 23:59:59", "%Y-%m-%d %H:%M:%S") → ValueError（结果 ts < 0）
+15. 同名冲突回归：json.parse('1') 与 time.parse(...) 同脚本并存正确
+16. `cargo test` 全绿
 
 ## 测试用例
 
 ### tests/ms/stdlib/test_time_ext.ms
 
-验证标准 3-11（assert + ALL PASSED；1-2 因时序抖动仅作宽松断言）。
+验证标准 3-15（assert + ALL PASSED；1-2 因时序抖动仅作宽松断言；11 的 NaN 经
+math.nan 常量构造）。
 
 ### Rust 单测（time.rs 内）
 
 - `unix_to_ymdhms` / `ymdhms_to_unix` 往返（含闰日 2000-02-29 / 2024-02-29 / 2100-02-28）
-- format_ts / parse 指令扫描边界（%% 结尾、孤立 % 结尾 → ValueError）
+- format_ts / parse 指令扫描边界（%% 结尾、孤立 % 结尾、未知指令 %q → ValueError）
+
+## 文档更新
+
+- `docs/mslang/10-builtins.md` — time 章节扩表（7 新函数 + ts 校验说明；
+  sleep_ms 注明协程场景用 async.sleep）
+- `docs/mslang/tasks/README.md` — task 83 状态 ⬜ → ✅
