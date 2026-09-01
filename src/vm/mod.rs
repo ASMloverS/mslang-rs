@@ -526,6 +526,14 @@ impl VM {
         vm.native_arities.insert("now".to_string(), 0);
         vm.native_arities.insert("sleep".to_string(), 1);
         vm.native_arities.insert("format".to_string(), usize::MAX);
+        // task 83：time 扩充（16-stdlib-expansion.md §4.10）。
+        // iso/date_parts 为 (ts?) 可变参（各自自校验 0-1 参）。
+        vm.native_arities.insert("now_ms".to_string(), 0);
+        vm.native_arities.insert("monotonic".to_string(), 0);
+        vm.native_arities.insert("iso".to_string(), usize::MAX);
+        vm.native_arities.insert("date_parts".to_string(), usize::MAX);
+        vm.native_arities.insert("sleep_ms".to_string(), 1);
+        vm.native_arities.insert("format_ts".to_string(), 2);
         vm.native_arities.insert("ext".to_string(), 1);
         vm.native_arities.insert("base".to_string(), 1);
         vm.native_arities.insert("dir".to_string(), 1);
@@ -535,7 +543,10 @@ impl VM {
         vm.module_resolver
             .native_modules
             .insert("json".to_string(), stdlib::register_json_module());
-        vm.native_arities.insert("parse".to_string(), 1);
+        // task 83：parse 与 time.parse 同名不同 arity（1 vs 2）→ §2.2 升级 MAX，
+        // json.parse 自校验恰 1 参、time.parse 自校验恰 2 参（交叉回归见
+        // json.rs / time.rs 单测与 tests/ms/stdlib/test_time_ext.ms）。
+        vm.native_arities.insert("parse".to_string(), usize::MAX);
         vm.native_arities.insert("stringify".to_string(), 1);
 
         // task 60：注册原生 gc 模块 + 模块函数 arity。

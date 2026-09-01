@@ -53,7 +53,15 @@ pub fn register_json_module() -> *mut MsObjHeader {
 /// json.parse(string) → 解析 JSON 文本为 mslang 值（task 49 §方案 B，手动解析，零依赖）。
 /// 类型映射：null→nil、bool→bool、整数→int、浮点→float、字符串→string、
 /// 数组→list、对象→dict。超出 i64 的整数退化为 float（与 Python JSON 一致）。
+/// task 83（§2.2 同名冲突）：time.parse 加入后 native_arities["parse"] 升级
+/// MAX，此处自校验恰 1 参（time.parse 自校验恰 2 参）。
 fn native_json_parse(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "TypeError: parse(string) takes exactly 1 argument, got {}",
+            args.len()
+        ));
+    }
     let json_str = expect_string(args.get(0), "parse(string)")?;
     let bytes = json_str.as_bytes();
     let mut p = JsonParser { src: bytes, pos: 0 };
@@ -711,6 +719,21 @@ mod tests {
         // 入参非 string → TypeError
         let e = native_json_parse(&mut v, &[Object::Int(1)]).unwrap_err();
         assert!(e.contains("TypeError"), "got: {}", e);
+    }
+
+    #[test]
+    fn test_json_parse_arity_self_check() {
+        let mut v = vm();
+        // task 83：parse 升级 MAX（time.parse 同名）后 json.parse 自校验恰 1 参。
+        let e = native_json_parse(&mut v, &[]).unwrap_err();
+        assert!(e.contains("TypeError") && e.contains("exactly 1"), "got: {}", e);
+        let e = native_json_parse(&mut v, &[s("1"), s("2")]).unwrap_err();
+        assert!(e.contains("TypeError") && e.contains("exactly 1"), "got: {}", e);
+        // 恰 1 参不受影响
+        assert_eq!(
+            native_json_parse(&mut v, &[s("42")]).unwrap(),
+            Object::Int(42)
+        );
     }
 
     #[test]

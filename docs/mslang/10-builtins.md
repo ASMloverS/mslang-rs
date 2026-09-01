@@ -503,10 +503,35 @@ string.format("{:.2f}", 3)        # "3.00"（Int 按 Float 格式化）
 ```ms
 import time
 
-time.now()               # 当前时间戳（秒）
-time.sleep(1)            # 休眠 1 秒
-time.format(timestamp)   # 格式化时间
+time.now()               # 当前时间戳（秒，Float）
+time.now_ms()            # 当前时间戳（毫秒，Int）
+time.monotonic()         # 单调秒（Float，进程启动为 0 点；用于计时非报时）
+time.sleep(1)            # 休眠 1 秒（阻塞）
+time.sleep_ms(100)       # 休眠 100 毫秒（Int，阻塞；协程场景用 async.sleep）
+time.format(timestamp)   # 格式化时间戳（固定 "YYYY-MM-DD HH:MM:SS"）
+time.iso(1700000000)     # "2023-11-14T22:13:20Z"（缺省当前时间）
+time.date_parts(0)       # {year:1970, month:1, ..., weekday:3}（缺省当前时间）
+time.format_ts(0, "%Y-%m-%d %H:%M:%S")   # "1970-01-01 00:00:00"
+time.parse("2023-11-14 22:13:20", "%Y-%m-%d %H:%M:%S")  # → 1700000000.0
 ```
+
+#### API（task 83 扩充）
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `now_ms` | `() -> int` | Unix 毫秒 |
+| `monotonic` | `() -> float` | 单调秒，进程启动为 0 点；用于计时非报时（不受系统时钟回拨影响） |
+| `iso` | `(ts?) -> string` | `"YYYY-MM-DDTHH:MM:SSZ"`（UTC）；缺省当前时间 |
+| `date_parts` | `(ts?) -> dict` | `{year, month, day, hour, minute, second, weekday}`；weekday 0=周一…6=周日（Python 约定；1970-01-01 为周四=3）；缺省当前时间 |
+| `sleep_ms` | `(ms) -> nil` | 阻塞指定毫秒（Int）；负数 → ValueError。协程场景用 `async.sleep`（非阻塞），阻塞 sleep 会饿死其他协程 |
+| `format_ts` | `(ts, fmt) -> string` | 指令集 `%Y %m %d %H %M %S %%`（UTC；%Y 4 位、其余 2 位零填充，字面段原样输出） |
+| `parse` | `(s, fmt) -> float` | 同指令集解析为 Unix 秒；字面不匹配 / 域越界 / 多余输入 / 1970 前日期 → ValueError（与 json.parse 同名，各自自校验参数个数） |
+
+- 时间一律 UTC、秒为 Float、毫秒为 Int；闰秒忽略；`time.format(ts)`（无 fmt）保留不动。
+- ts 校验（iso / date_parts / format_ts）：接受 Int 与 Float；负数 → ValueError；
+  Float 非有限值（NaN/±Inf）→ ValueError、超 i64 范围 → OverflowError（禁止静默饱和）。
+- parse 域校验对齐 Python strptime：月 1-12、时 0-23、分/秒 0-59、日 1-31 且不超
+  当月天数（含闰年规则，2 月 30 → ValueError）；`%Y` 贪婪 1-4 位、其余 1-2 位。
 
 ### json
 
