@@ -31,9 +31,12 @@ Phase 9 - 标准库扩展（M6）
 | heap_push | (lst, v) -> nil | 尾插 + sift-up |
 | heap_pop | (lst) -> value | 首位弹出（尾元素补首 + sift-down）；空 → IndexError |
 | push_pop | (lst, v) -> value | push 后立即 pop 最小（合并语义，一次 sift） |
-| n_largest/n_smallest | (lst, n) -> list | 前 n 大（降序）/小（升序）；不改原 list；n≤0 → [] |
+| n_largest/n_smallest | (lst, n) -> list | 前 n 大（降序）/小（升序）；不改原 list；n≤0 → []；n≥len → 全量排序返回（Python 语义） |
 
 比较沿用对象 `compare`（同 sorted 语义，CmpOp::Less）；跨类型比较错误上抛。
+`Object::compare` 仅支持 Int/Float/String 排序，Instance 等其余类型 → TypeError
+（`<` 运算符经 `__lt__` 分派是 opcode 路径，06-oop.md；两者的语义差异在
+10-builtins.md heapq 章节注明）。
 
 ### collections（.ms 嵌入）
 
@@ -45,7 +48,7 @@ Phase 9 - 标准库扩展（M6）
   `push_back/push_front/pop_back/pop_front/front/back/extend(iter)/to_list/is_empty/
   __len__/__iter__`；空弹出 → IndexError。
 - **Counter**：`(iterable?)` 构造；`__getitem__` 缺失返回 0（**不写入**，Python 语义）；
-  `update(other)`；`most_common(n?)`（sorted_by 按频次降序）；`elements()` 生成器；
+  `update(other)`（other 为 iterable，元素逐个计数）；`most_common(n?)`（sorted_by 按频次降序）；`elements()` 生成器；
   `items()/get(k, d=0)`。
 - **defaultdict**：`(default_factory)` 构造；`__getitem__` 缺失 → 调 factory() 存入并返回；
   factory 为 nil → KeyError；`get` 不触发 factory（Python 一致）。
@@ -60,7 +63,9 @@ zip_longest(*iters)（fill=nil 固定） / product(*iters) / combinations(it, r)
 permutations(it, r?) / islice(it, start, stop, step=1) / batched(it, n)。
 
 - 无限序列（count/cycle/repeat 无 n）必须以生成器实现，配合 take_while/islice 消费。
-- repeat arity MAX（与 string.repeat=2 共享名，.ms 默认参数天然支持 1-2 参自校验）。
+- repeat 与 string.repeat=2 共享名：string.repeat 原生侧升级 MAX 自校验属 task 80
+  范畴；itertools.repeat 为 .ms 闭包，不经 native_arities（仅 NATIVE 分支查表，
+  src/vm/mod.rs call_value），1-2 参由默认参数机制自校验。
 - combinations/permutations 输入先物化为 list（索引算法）。
 
 ### functools（.ms 嵌入）
@@ -82,8 +87,12 @@ assert_len(v,n,msg?) / assert_contains(coll,item,msg?) / fail(msg)。
 
 失败统一抛 AssertionError，消息含 `str(a)`/`str(b)` 与可选 msg。
 **assert_raises 类匹配机制**（开放问题 2 在本 task 闭环）：
-实现期验证异常实例的类名获取路径——`type(e)` 若不返回异常类名，则以
-异常消息前缀（"ClassName: ..."）解析类名比对；结论回写 16-stdlib-expansion.md §7.2。
+类名获取用已实现路径 **`e.type`**（task 37 GET_ATTR EXC 分支返回类名字符串，
+MsException.class_name；勿走消息前缀解析——`str(e)` 格式未约定含类名前缀）。
+`exc_class` 形态定为**类名字符串**（如 `"ValueError"`；GET_ATTR 取
+EXCEPTION_CLASS 的 name 未定义，不传类对象）。匹配为精确类名比对，不含父类链
+（.ms 侧无 MRO 查询通道；与 except 的 CATCH 父类链语义差异在 10-builtins.md
+注明）。结论回写 16-stdlib-expansion.md §7.2。
 
 ## 实现细节
 
@@ -96,10 +105,22 @@ assert_len(v,n,msg?) / assert_contains(coll,item,msg?) / fail(msg)。
   — 替换 task 79 的占位内容（模块名/导出名固定）
 - `src/vm/stdlib/mod.rs` — include_str! 已由 task 79 建好，无改动
 
+### 文档更新
+
+- `docs/mslang/10-builtins.md` — 新增 heapq / collections / itertools / functools /
+  test 五章 API 表；注明 heapq 仅支持 Int/Float/String 排序（Instance 不经
+  `__lt__`，与 `<` 运算符的差异）、assert_raises 精确匹配不含父类链、
+  islice stop=nil 无限语义、batched n<1 → ValueError
+- `docs/mslang/tasks/README.md` — Phase 9 索引追加本 task 行
+- `docs/mslang/16-stdlib-expansion.md` — §4.13 回写 islice stop=nil；§7.2 回写
+  assert_raises 机制结论（e.type + 类名字符串 + 精确匹配）
+
 ### heapq sift 细节
 
 - 直接操作 `read_list_mut` 的 Vec<Object>；比较用 `Object::compare(CmpOp::Less)`，
   Err 上抛（排序中断时 list 处于部分堆序——可接受，与 Python 异常语义一致）。
+  sift 全程处于 read_list_mut 长借用下，compare 须保持纯函数（无 GC 对象分配、
+  无用户代码分派）——本实现的不变量，参照 task 51 借用约束。
 - push_pop 语义顺序（Python）：若 lst 空 v 直返；若 v ≤ 堆顶直返 v；
   否则弹出堆顶、v 入首并 sift-down。
 
@@ -107,15 +128,15 @@ assert_len(v,n,msg?) / assert_contains(coll,item,msg?) / fail(msg)。
 
 ```ms
 class Deque {
-    fn __init__() {
-        self.buf = []
-        self.head = 0      # 逻辑首在 buf 的偏移
+    fn __init__(self) {
+        self.buf = []      # 逻辑序 = 物理序；len == buf.length()
     }
-    # buf 物理序 = 逻辑序循环移位 head；len == buf.length()
-    fn push_back(x)  { self.buf.push(x) }
-    fn push_front(x) { self.buf.insert(0, x); self.head = (self.head + 1) % self.buf.length() }
-    # 实现期可改为「物理 head 移动」方案，以单测锁定语义为准
+    fn push_back(self, x)  { self.buf.push(x) }
+    fn push_front(self, x) { self.buf.insert(0, x) }   # O(n)，见下方性能注记
 }
+# pop_front 用 buf.remove(0)（按索引删）；空弹出先判 length 抛 IndexError。
+# 实现期可改为「物理 head 移动」真循环缓冲（物理尾 append、head 前移
+# (head-1+len) % len，不用 insert），以单测锁定语义为准
 ```
 
 > 性能注记：insert(0,·) 为 O(n)。M6 验收以正确性优先；若压测前端操作
@@ -128,18 +149,21 @@ class Deque {
 - `pairwise`：prev 状态变量逐项推进。
 - `accumulate(it, fn?)`：fn 缺省用 `+`（判 nil）。
 - `islice(start, stop, step=1)`：索引计数跳过，stop=nil 表示无限
-  （位置参数表达：islice(it, start, stop) stop 传 nil）。
-- `batched(it, n)`：内部 list 攒批 yield。
+  （位置参数表达：islice(it, start, stop) stop 传 nil）；stop=nil 无限语义为
+  对 16 §4.13 的扩展，随本 task 回写该节。
+- `batched(it, n)`：内部 list 攒批 yield；n < 1 → ValueError（Python 3.12 语义）。
+- 边界语义：chain()/zip_longest() 零参 → 空迭代；product() 零参 → 产出一个空
+  tuple 后结束（Python 语义）；permutations r 缺省 = 物化后 len(it)。
 
 ### functools.memoize
 
 ```ms
-fn memoize(fn) {
+fn memoize(f) {
     cache = {}
     return fn(*args) {
         key = tuple(args)
         if cache.contains(key) { return cache[key] }
-        val = fn(*args)
+        val = f(*args)
         cache[key] = val
         return val
     }
@@ -154,16 +178,20 @@ fn memoize(fn) {
 fn assert_raises(f, exc_class, msg?) {
     try {
         f()
-    } except e {
-        # 类名比对：e 的类名获取路径实现期验证（见设计规格）
+    } except as e {
+        if e.type != exc_class {
+            fail(msg or ("expected " + exc_class + ", got " + e.type))
+        }
         return nil
     }
     fail(msg or "expected exception not raised")
 }
 ```
 
-except 绑定变量语法 / 异常类匹配语法以 37-try-except-finally 已实现形态为准
-（`except ValueError` 直接匹配类 vs `except e` 绑定实例，实现期对齐）。
+except 子句语法以 37-try-except-finally 已实现形态为准：`except ValueError`
+类型匹配（含父类链）、`except as e` 纯绑定实例——mslang 无 `except e` 裸绑定
+形式（03-syntax.md except 子句文法）。msg? 缺省为 nil，`msg or "..."` 以 nil
+假值回退默认消息。
 
 ## GC 安全
 
@@ -187,7 +215,9 @@ except 绑定变量语法 / 异常类匹配语法以 37-try-except-finally 已�
    捕获与不匹配两种路径；assert_len/assert_contains
 10. 全部 .ms 模块经**嵌入**路径 import（无磁盘依赖）；repeat(3)（string）与
     itertools.repeat(3, 2) 同脚本并存（同名冲突回归）
-11. `cargo test` 全绿
+11. 文档同步完成：10-builtins.md 五章 API 表、tasks/README.md 索引行、
+    16-stdlib-expansion.md §4.13/§7.2 回写（见「文档更新」）
+12. `cargo test` 全绿
 
 ## 测试用例
 
