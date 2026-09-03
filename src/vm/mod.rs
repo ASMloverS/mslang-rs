@@ -57,17 +57,22 @@ enum GenOutcome {
     Exhausted,
 }
 
-/// 异常处理器条目（task 37）。与 defer_stack 一样按帧分区，但用 frame_stack_base
-/// （值栈基址）判定所属帧。throw() 自顶向下扫描，匹配当前帧者跳到 catch_address。
+/// 异常处理器条目（task 37）。与 defer_stack 一样按帧分区，用 frame_depth
+/// （注册时 call_stack 索引）判定所属帧。
+/// task 84 修复：原以值栈基址（frame_stack_base）判帧——callee 恰落栈底时
+/// 内层帧与外层帧基址相同（<main> base=0 与被调函数 base=0），跨帧 unwind
+/// 会把外层 handler 误配给内层帧（模块函数内 throw、导入方 try 捕获即触发，
+/// ip 被重定向到他帧 catch 地址致 "ip past end of bytecode"）。帧索引天然
+/// 严格区分内外层，无歧义。
 pub struct ExceptionHandler {
     /// except 分派器入口（throw 跳转点）。
     catch_address: usize,
-    /// finally 块入口地址（None 表示无 finally 块）。当前由编译端 dispatcher 经 JUMP
-    /// 路由到 finally，VM 不直接读取；保留以契合 spec（TRY_ENTER 双操作数）。
+    /// finally 块入口地址（None 表示无 finally 块）。当前由编译器 dispatcher 经 JUMP
+    /// 路由至 finally，VM 不直接读取；保留以契合 spec（TRY_ENTER 双操作数）。
     #[allow(dead_code)]
     finally_address: Option<usize>,
-    /// 所属帧的值栈基址（跨帧判定）。
-    frame_stack_base: usize,
+    /// 所属帧的 call_stack 索引（跨帧判定）。
+    frame_depth: usize,
     /// 进入 try 时值栈长度（unwind 时恢复栈平衡）。
     scope_stack_base: usize,
 }
@@ -219,6 +224,8 @@ const EXCEPTION_PARENTS: &[(&str, &str)] = &[
     ("OverflowError", "Error"),
     ("StopIteration", "Error"),
     ("GeneratorExit", "Error"),
+    // task 84：AssertionError（父类 Error），test 模块断言族失败统一抛出。
+    ("AssertionError", "Error"),
     // task 45：ImportError（父类 Error），由 load()/IMPORT handler 抛出。
     ("ImportError", "Error"),
     // task 61：TimeoutError（父类 Error），由 async.timeout 超时时 reject。
@@ -240,6 +247,8 @@ const BUILTIN_EXCEPTION_NAMES: &[&str] = &[
     "OverflowError",
     "StopIteration",
     "GeneratorExit",
+    // task 84：使脚本可 `except AssertionError`（test 模块断言族）。
+    "AssertionError",
     // task 45：使脚本可 `except ImportError`。
     "ImportError",
     // task 61：使脚本可 `except TimeoutError`。
@@ -655,8 +664,21 @@ impl VM {
         vm.native_arities.insert("executable".to_string(), 0);
         vm.native_arities.insert("stdin_read_all".to_string(), 0);
 
+        // task 84：注册原生 heapq 模块 + 模块函数 arity
+        // （16-stdlib-expansion.md §4.11；最小堆，比较同 sorted 语义）。
+        let heapq_ptr = stdlib::register_heapq_module();
+        vm.module_resolver
+            .native_modules
+            .insert("heapq".to_string(), heapq_ptr);
+        vm.native_arities.insert("heapify".to_string(), 1);
+        vm.native_arities.insert("heap_push".to_string(), 2);
+        vm.native_arities.insert("heap_pop".to_string(), 1);
+        vm.native_arities.insert("push_pop".to_string(), 2);
+        vm.native_arities.insert("n_largest".to_string(), 2);
+        vm.native_arities.insert("n_smallest".to_string(), 2);
+
         // task 79：填充嵌入式 .ms 模块注册表（collections/itertools/functools/test
-        // 占位，内容由 task 84 填充）。磁盘解析未命中后兜底。
+        // 由 task 84 填充实现）。磁盘解析未命中后兜底。
         vm.module_resolver.embedded_modules = stdlib::embedded_sources();
 
         vm
@@ -1605,7 +1627,7 @@ impl VM {
 /// `Object::hash`（`object.rs`）对 list/dict/set/NaN 发
 /// `panic!("TypeError: unhashable type: '...'")`，该消息已符合规范，直接转
 /// `Err` 返回，使 try/except（task 37）可捕获而非终止 VM 进程（spec §3）。
-fn unhashable_message(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn unhashable_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -2276,6 +2298,62 @@ impl VM {
                     // frame_base = callee(BoundMethod) 所在 slot；覆写为 receiver（self）。
                     let frame_base = self.stack.len() - argc - 1;
                     self.stack[frame_base] = receiver;
+                    // task 84 修复：方法调用补齐实参区间校验、默认参数、可变参数
+                    // 与生成器预检（与上方 CLOSURE 直调分支同款语义；此前方法
+                    // 路径缺失——含默认参数/可变参数/yield 的方法得到错误行为，
+                    // collections deque.__iter__ / Counter.most_common 等依赖本修复）。
+                    // 方法 arity 含 self（receiver 已占 slot 0），实参数 = argc + 1。
+                    let func_ptr = {
+                        // SAFETY: method_tag 已守卫为 CLOSURE，指针由 alloc_closure 分配。
+                        unsafe { read_closure(method_ptr) }.function
+                    };
+                    let (arity, required_arity, has_variadic, is_generator) = {
+                        // SAFETY: func_ptr 由 alloc_function 分配。
+                        let func = unsafe { read_function(func_ptr) };
+                        let f = &func.function;
+                        (f.arity, f.required_arity, f.has_variadic, f.is_generator)
+                    };
+                    let call_argc = argc + 1;
+                    // 仅校验下界：多余实参容忍不上抛（with 语句的 ctx 显式 self
+                    // 实参在 BoundMethod 路径为多余项，dict/FileHandle/Instance
+                    // 三种管理器共用同一发射序列）。缺参此前读取悬垂栈槽，
+                    // 现改为显式 TypeError。
+                    if call_argc < required_arity {
+                        return Err(format!(
+                            "TypeError: expected at least {} arguments, got {}",
+                            required_arity - 1, argc
+                        ));
+                    }
+                    // 步骤 1：填充默认值（receiver 计入 call_argc，同直调路径偏移）。
+                    if call_argc < arity {
+                        let defaults_to_fill = arity - call_argc;
+                        let offset = call_argc - required_arity;
+                        // SAFETY: func_ptr 为有效 Function，default_values 与 arity 对应。
+                        let to_fill: Vec<Object> = unsafe {
+                            let f = &read_function(func_ptr).function;
+                            f.default_values[offset..offset + defaults_to_fill].to_vec()
+                        };
+                        for v in to_fill {
+                            self.push(v)?;
+                        }
+                    }
+                    // 步骤 2：可变参数收集（*rest）。receiver 即首参 self，固定参
+                    // 占 frame_base..frame_base+arity-1，多余实参自其后收集。
+                    if has_variadic {
+                        let fixed_end = frame_base + arity;
+                        if self.stack.len() > fixed_end {
+                            let varargs: Vec<Object> = self.stack.drain(fixed_end..).collect();
+                            self.push(alloc_list(varargs))?;
+                        } else {
+                            self.push(alloc_list(Vec::new()))?;
+                        }
+                    }
+                    // 生成器预检：含 yield 的方法创建 generator 而非压帧执行
+                    //（deque.__iter__ 等生成器方法）。
+                    if is_generator {
+                        let final_argc = self.stack.len() - frame_base - 1;
+                        return self.call_generator(method_ptr, final_argc);
+                    }
                     self.call_stack.push(CallFrame::new(
                         method_ptr,
                         frame_base,
@@ -2791,6 +2869,12 @@ impl VM {
     fn pop_generator_frame(&mut self, gen_ptr: *mut MsObjHeader) {
         let frame = self.call_stack.pop().expect("no generator frame to pop");
         let stack_base = frame.stack_base;
+        // task 84 修复：挂起前关闭指向本帧栈槽的开放上值（与 RETURN 路径一致）。
+        // 生成器帧挂起后栈被截断、恢复时落位可能改变，未关闭的上值将悬垂指向
+        // 被复用的栈槽（生成器体内创建的闭包捕获其局部值跨挂起读取错值）。
+        // 关闭即装箱当前值：恢复后的重绑定不再同步到已关闭上值（捕获值冻结
+        // 于最近一次挂起，读取型捕获不受影响；完全活单元语义留待后续）。
+        self.close_upvalues_from(stack_base);
         let snapshot: Vec<Object> = self.stack[stack_base..].to_vec();
         self.stack.truncate(stack_base);
         let gen = unsafe { read_generator_mut(gen_ptr) };
@@ -3200,17 +3284,19 @@ impl VM {
             self.call_stack.last_mut().unwrap().defer_flushing = false;
 
             // (b) 扫描 exception_handlers，找到属于当前帧的 handler。
-            //   frame_stack_base 是值栈基址：内层帧更高、外层帧更低。
+            //   frame_depth 是 call_stack 索引（task 84 修复：原值栈基址在
+            //   callee 落栈底时内外帧同址，跨帧误配）：
             //   handler > 当前帧 → 残留的内层 handler（其帧已 pop）→ 丢弃；
             //   handler == 当前帧 → 命中本帧；
             //   handler < 当前帧 → 属于外层帧 → 保留，pop 本帧后续传。
+            let frame_depth = self.call_stack.len().saturating_sub(1);
             let handler = loop {
                 match self.exception_handlers.last() {
                     None => break None,
-                    Some(h) if h.frame_stack_base > frame_stack_base => {
+                    Some(h) if h.frame_depth > frame_depth => {
                         self.exception_handlers.pop();
                     }
-                    Some(h) if h.frame_stack_base == frame_stack_base => {
+                    Some(h) if h.frame_depth == frame_depth => {
                         break self.exception_handlers.pop();
                     }
                     Some(_) => break None,
@@ -3721,11 +3807,26 @@ impl VM {
                     // task 54：channel 是自身的迭代器。
                     let is_channel = matches!(&iterable,
                         Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::CHANNEL as u8);
-                    if is_gen || is_channel {
-                        self.push(iterable)?;
+                    // task 84：Instance 含 __iter__ 时经魔术方法分派（06-oop.md
+                    // 容器协议，task 43 遗留缺口；collections deque for-in 依赖）。
+                    // 生成器风格：__iter__ 返回 generator（FOR_ITER 按 GENERATOR
+                    // slot 驱动）；返回其余可迭代对象则转 ITERATOR。无 __iter__
+                    // 落回 to_iterator 的既有报错路径（错误信息不变）。
+                    // 注：迭代器协议风格（__iter__ 返回 self + __next__）不支持。
+                    let target = if Self::is_instance(&iterable) {
+                        self.try_instance_magic(&iterable, "__iter__", &[])?
+                            .unwrap_or_else(|| iterable.clone())
+                    } else {
+                        iterable.clone()
+                    };
+                    let target_is_iter = matches!(&target,
+                        Object::Ref(ptr) if unsafe { (**ptr).type_tag } == TypeTag::GENERATOR as u8
+                            || unsafe { (**ptr).type_tag } == TypeTag::CHANNEL as u8);
+                    if is_gen || is_channel || target_is_iter {
+                        self.push(target)?;
                     } else {
                         let iter_state =
-                            to_iterator(&iterable).map_err(|e| format!("RuntimeError: {}", e))?;
+                            to_iterator(&target).map_err(|e| format!("RuntimeError: {}", e))?;
                         self.push(alloc_iterator(iter_state))?;
                     }
                 }
@@ -4336,17 +4437,24 @@ impl VM {
                 OpCode::TryEnter => {
                     let handler_offset = self.read_u16()? as usize;
                     let finally_raw = self.read_u16()?;
-                    let frame = self.call_stack.last().ok_or("no call frame".to_string())?;
+                    let frame = self.call_stack.last().ok_or("no call frame")?;
                     let catch_address = frame.ip + handler_offset;
                     let finally_address = if finally_raw == 0xFFFF {
                         None
                     } else {
                         Some(frame.ip + finally_raw as usize)
                     };
+                    if std::env::var("MS_DBG_UNWIND").is_ok() {
+                        eprintln!(
+                            "[dbg-try] ENTER depth={} catch={}",
+                            self.call_stack.len() - 1,
+                            catch_address
+                        );
+                    }
                     self.exception_handlers.push(ExceptionHandler {
                         catch_address,
                         finally_address,
-                        frame_stack_base: frame.stack_base,
+                        frame_depth: self.call_stack.len() - 1,
                         scope_stack_base: self.stack.len(),
                     });
                 }
@@ -11948,15 +12056,22 @@ assert(make() == 111)
 
     #[test]
     fn test_embedded_real_placeholders_registered() {
-        // 标准 1 补充：VM::new 内建注册的 4 个占位模块（collections/itertools/
-        // functools/test）随 include_str! 嵌入，源码含 VERSION 占位常量。
+        // 标准 1 补充：VM::new 内建注册的 4 个嵌入模块（collections/itertools/
+        // functools/test）随 include_str! 嵌入，task 84 起为真实实现（签名导出
+        // 存在性以源码子串断言，导出行为由 tests/ms/stdlib 用例覆盖）。
         let vm = VM::new();
-        for name in ["collections", "itertools", "functools", "test"] {
+        for (name, marker) in [
+            ("collections", "class deque"),
+            ("itertools", "fn combinations"),
+            ("functools", "fn memoize"),
+            ("test", "fn assert_eq"),
+        ] {
             let src = vm.module_resolver.resolve_embedded(name).unwrap();
             assert!(
-                src.contains("VERSION"),
-                "{} placeholder missing VERSION",
-                name
+                src.contains(marker),
+                "{} embedded source missing marker {:?}",
+                name,
+                marker
             );
         }
     }

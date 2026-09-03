@@ -219,7 +219,8 @@ fn native_fh_enter(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     Ok(args[0].clone())
 }
 /// f.__exit__(self, err_type, err_msg, traceback) → 关闭句柄，异常继续传播（不抑制）。
-/// 固定 4 参数（task 38 with 编译器 CALL 4 约定）。
+/// with 编译器 CALL 4（ctx 显式 self 实参 + 三异常参数），BoundMethod 注入 receiver
+/// 至 args[0]，多余实参忽略（native 仅读 args[0]）。
 fn native_fh_exit(_vm: &mut VM, args: &[Object]) -> Result<Object, String> {
     let ptr = expect_file_handle(args.get(0), "__exit__()")?;
     // SAFETY: ptr 由 expect_file_handle 校验。

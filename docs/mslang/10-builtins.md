@@ -776,14 +776,204 @@ sys.stdin_read_all()   # 读 stdin 至 EOF（管道/重定向场景）
 | `executable` | `() -> string` | current_exe 绝对路径；失败（二进制已删等）→ IOError |
 | `stdin_read_all` | `() -> string` | 读 stdin 至 EOF；非 UTF-8 → IOError（lossy 不可逆，宁可报错）；交互 REPL 下阻塞至 EOF，仅面向 `ms run script.ms < input` 管道/重定向用法 |
 
+### heapq
+
+```ms
+import heapq
+
+lst = [7, 2, 9, 4, 3]
+heapq.heapify(lst)             # 原地建堆（最小堆）→ nil
+heapq.heap_push(lst, 1)        # 尾插 + 上浮 → nil
+smallest = heapq.heap_pop(lst) # 弹出最小（1）；空堆 → IndexError
+v = heapq.push_pop(lst, 0)     # 合并语义：0 ≤ 堆顶直返 0（一次 sift）
+top2 = heapq.n_largest(lst, 2) # 前 2 大（降序），不改原 list
+low2 = heapq.n_smallest(lst, 2)# 前 2 小（升序）；n≤0 → []
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `heapify` | `(lst) -> nil` | 原地建堆（sift-down 自底向上，O(n)） |
+| `heap_push` | `(lst, v) -> nil` | 尾插 + sift-up |
+| `heap_pop` | `(lst) -> value` | 首位弹出（尾元素补首 + sift-down）；空 → IndexError |
+| `push_pop` | `(lst, v) -> value` | push 后立即 pop 最小（合并语义，一次 sift）：lst 空直返 v；v ≤ 堆顶直返 v；否则弹原堆顶、v 入堆 |
+| `n_largest` | `(lst, n) -> list` | 前 n 大（降序）；n≤0 → []；n≥len 全量排序返回；不改原 list |
+| `n_smallest` | `(lst, n) -> list` | 前 n 小（升序）；边界同上 |
+
+注意事项：
+
+- **排序类型限制**：比较走对象 `compare`（同 `sorted`），仅 Int/Float/String
+  可排序；Instance 等其余类型 → TypeError（原生错误不可捕获）。`<` 运算符
+  经 `__lt__` 分派可支持自定义类，但 heapq 不走该路径——两者语义有差异。
+- 混合 Int/Float 数值可比较；int 与 string 混合 → TypeError。
+
+### collections
+
+```ms
+import collections
+
+# deque：两端均摊 O(1)（list 容量倍增 + head 偏移循环缓冲）
+d = collections.deque()
+d.push_back(2)
+d.push_front(1)
+d.extend([3, 4])
+d.to_list()          # [1, 2, 3, 4]
+len(d)               # 4（__len__）
+for x in d { ... }   # for-in（__iter__ 生成器）
+d.front(); d.back()  # 两端窥视；空 → IndexError
+d.pop_front()        # 空弹出 → IndexError
+d.pop_back()
+d.is_empty()
+
+# Counter：缺失键读 0 不写入（Python 语义）
+c = collections.Counter(["a", "b", "a"])
+c["a"]               # 2
+c["z"]               # 0（不写入）
+c.update("xya")      # iterable 逐个计数
+c.most_common()      # 按频次降序 [(a,3),(b,1)...]（等频保插入序）
+c.most_common(2)     # 前 n 项
+c.elements()         # 生成器：按计数重复展开
+c.items(); c.get("z")   # get 缺省 0
+
+# defaultdict：__getitem__ 缺失触发 factory
+dd = collections.defaultdict(fn() { return [] })
+dd["k"].push(1)      # factory() 存入并返回
+dd.get("nope")       # nil（get 不触发 factory，Python 一致）
+dn = collections.defaultdict(nil)
+dn["x"]              # factory 为 nil → KeyError
+```
+
+注意事项：
+
+- 三个 class 均为 class 实例（dict 为内建类型不可继承），经 `__len__`/
+  `__getitem__`/`__iter__` 魔术方法接通 `len()`/`[]`/for-in。
+- Counter 的 `c[k]` 读缺失不写入；`most_common` 依赖 `sorted_by`（等频稳定）。
+
+### itertools
+
+```ms
+import itertools
+
+# 无限序列配合 islice/take_while 消费
+for x in itertools.islice(itertools.count(10, 5), 0, 3) { }   # 10, 15, 20
+for x in itertools.islice(itertools.count(1), 3, nil) { }     # stop=nil 无限（跳过前 3 项）
+for x in itertools.islice(itertools.cycle([1, 2]), 0, 5) { }  # 1, 2, 1, 2, 1
+for x in itertools.repeat(7, 3) { }                           # 7, 7, 7
+
+itertools.chain([1, 2], "ab")            # 串接（零参 → 空迭代）
+itertools.take_while(fn(x) { return x < 3 }, [1, 2, 3, 1])   # 1, 2
+itertools.drop_while(fn(x) { return x < 3 }, [1, 2, 3, 1])   # 3, 1
+itertools.pairwise([1, 2, 3])            # (1,2), (2,3)
+itertools.accumulate([1, 2, 3], fn(a, b) { return a * b })   # 缺省 +；1, 2, 6
+itertools.zip_longest([1, 2], [3])       # (1,3), (2,nil)（fill=nil 固定）
+itertools.product([1, 2], "xy")          # 笛卡尔积（右端变化最快）
+itertools.combinations([1, 2, 3], 2)     # C(3,2) 字典序
+itertools.permutations([1, 2, 3], 2)     # P(3,2)；r 缺省 = len
+itertools.islice(it, 1, 6, 2)            # 索引切片
+itertools.batched([1, 2, 3, 4, 5], 2)    # (1,2), (3,4), (5)（尾批可不满）
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `count` | `(start=0, step=1)` | 无限计数（生成器） |
+| `cycle` | `(iter)` | 无限循环（先物化为 list；空输入立即结束） |
+| `repeat` | `(x, n?)` | 重复 n 次；缺省无限。与 string.repeat 同名共存（.ms 闭包不经 native_arities） |
+| `chain` | `(*iters)` | 串接；零参 → 空迭代 |
+| `take_while` | `(pred, it)` | 谓词假即止 |
+| `drop_while` | `(pred, it)` | 一次失假全放行 |
+| `pairwise` | `(it)` | 相邻对 (prev, cur) |
+| `accumulate` | `(it, fn?)` | 前缀累积；缺省 `+`（判 nil） |
+| `zip_longest` | `(*iters)` | 补 nil 对齐；fill=nil 固定（无命名参数） |
+| `product` | `(*iters)` | 笛卡尔积；零参产出一个空 tuple；含空输入不产出 |
+| `combinations` | `(it, r)` | 组合（输入先物化，字典序）；r<0 → ValueError（急切） |
+| `permutations` | `(it, r?)` | 排列；r 缺省 = len；r<0 → ValueError（急切） |
+| `islice` | `(it, start, stop, step=1)` | 索引切片；**stop=nil 无限**；start/stop 负或 step<1 → ValueError（急切） |
+| `batched` | `(it, n)` | 按 n 分批 yield tuple；尾批可不满；n<1 → ValueError（Python 3.12，急切） |
+
+注意事项：
+
+- 全部惰性生成器；参数校验为**急切**（调用即抛，Python 语义，可 try/except
+  捕获）——生成器体内 throw 在 resume 时不可捕获。
+- `repeat` 与 string 方法 `repeat` 同名共存无冲突（前者 .ms 闭包、后者原生）。
+
+### functools
+
+```ms
+import functools
+
+add3 = fn(a, b, c) { return a + b + c }
+p = functools.partial(add3, 1, 2)
+p(3)                 # 6（args 在前，*more 在后）
+
+slow = fn(x) { ... }
+fast = functools.memoize(slow)     # dict 缓存，键 tuple(args)
+fast(21); fast(21)                 # 命中：副作用仅执行一次
+
+functools.reduce(fn(a, b) { return a + b }, [1, 2, 3], 100)  # 106
+functools.reduce(fn(a, b) { return a + b }, [1, 2, 3])       # 6（首元素作种子）
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `partial` | `(fn, *args)` | 可调用实例（类即工厂），调用时 args 在前、*more 在后 |
+| `memoize` | `(fn)` | dict 缓存，键 `tuple(args)`；unhashable → TypeError（dict 行为上抛，原生不可捕获）；无 LRU 上限 |
+| `reduce` | `(fn, iter, init?)` | iterable 级归约（list.reduce 方法保留不动）；init=nil 视为未提供；空迭代无 init → TypeError |
+
+注意事项：
+
+- mslang 无调用点展开（`f(*args)`），partial/memoize 以 **0-4 参阶梯**分派
+  动态实参；目标函数 arity > 4 → TypeError。
+
+### test
+
+```ms
+import test as testmod
+
+testmod.assert_eq(1, 1, "可选 msg")
+testmod.assert_ne(1, 2)
+testmod.assert_true(cond)
+testmod.assert_false(cond)
+testmod.assert_almost_eq(0.1 + 0.2, 0.3)          # 默认 eps=1e-9
+testmod.assert_almost_eq(a, b, 0.01, "msg")       # 自定义 eps（nil 回退默认）
+testmod.assert_raises(fn() { throw ValueError("x") }, "ValueError")
+testmod.assert_len([1, 2], 2)
+testmod.assert_contains("hello", "ell")
+testmod.fail("直接失败")
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `assert_eq` | `(a, b, msg?)` | 失败抛 AssertionError，消息含 `str(a)`/`str(b)` 与可选 msg |
+| `assert_ne` | `(a, b, msg?)` | 同上（`!=`） |
+| `assert_true` | `(cond, msg?)` / `assert_false` | 谓词断言 |
+| `assert_almost_eq` | `(a, b, eps=1e-9, msg?)` | 数值；`abs(a-b) <= eps`；eps 显式 nil 回退默认 |
+| `assert_raises` | `(fn, exc_class, msg?)` | 调 fn()：未抛 → AssertionError；类不匹配 → AssertionError |
+| `assert_len` | `(v, n, msg?)` | `len(v) == n` |
+| `assert_contains` | `(coll, item, msg?)` | `item in coll` |
+| `fail` | `(msg?)` | 直接抛 AssertionError |
+
+注意事项：
+
+- **assert_raises 类匹配为精确类名比对，不含父类链**：匹配机制用 `e.type`
+  （异常实例的类名字符串），`exc_class` 传类名字符串（如 `"ValueError"`）。
+  `throw ValueError(...)` 不能被断言为 `"Error"` 命中——与 `except` 的
+  CATCH 父类链语义有差异。
+- 仅捕获 .ms 侧 `throw` 的异常；原生错误（heapq/IO 等）不可捕获。
+- `assert_almost_eq` 的 eps 为位置参数，不支持关键字跳过；显式传 nil 回退默认。
+
 ### 未文档化的标准库模块
 
-以下模块已列入标准库结构但尚未定义完整 API，将在后续版本中补充：
+以下模块已列入标准库结构但尚未定义完整 API，将在后续版本补充：
 
 | 模块 | 说明 |
 |---|---|
 | `regex` | 正则表达式匹配 |
 | `http` | HTTP 客户端/服务端 |
 | `net` | 网络操作（TCP/UDP） |
-| `collections` | 高级数据结构（deque, heap 等） |
-| `test` | 测试框架（assert 辅助、mock 等） |

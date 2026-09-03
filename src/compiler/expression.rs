@@ -701,15 +701,25 @@ impl Compiler {
         // 换出父单元，编译函数体。parent 指向 saved_unit（裸指针，规避 self-referential
         // 借用冲突 — task 28 方案），使 resolve_upvalue_recursive 可攀爬外层。
         // nonlocal/global 声明集合按函数体隔离保存/恢复（同具名函数路径）。
+        // task 84 修复：try_depth / finally_stack / current_loop 一并隔离
+        //（try 块内定义的匿名闭包其 return 不得携带外层 TRY_EXIT/finally 内联，
+        // 运行时弹无关 handler；同 statement.rs compile_function_closure 注记）。
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
         let saved_nonlocal = std::mem::take(&mut self.nonlocal_names);
         let saved_global = std::mem::take(&mut self.global_names);
+        let saved_try_depth = self.try_depth;
+        self.try_depth = 0;
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
+        let saved_current_loop = std::mem::take(&mut self.current_loop);
         self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line); // 隐式 return nil
         self.emit_return(line);
         self.nonlocal_names = saved_nonlocal;
         self.global_names = saved_global;
+        self.try_depth = saved_try_depth;
+        self.finally_stack = saved_finally_stack;
+        self.current_loop = saved_current_loop;
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
         // 上值捕获回填（task 28）：is_local=true 的上值对应父单元局部变量，

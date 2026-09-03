@@ -323,7 +323,7 @@ os.exec（shell 字符串）保留不动，文档继续警示注入风险；结�
 | accumulate(it, fn?) | 前缀累积（缺省 `+`） |
 | zip_longest(*iters) | fill=nil 固定（无命名参数） |
 | product(*iters) / combinations(it, r) / permutations(it, r?) | 笛卡尔积/组合/排列（输入物化） |
-| islice(it, start, stop, step=1) | 切片迭代 |
+| islice(it, start, stop, step=1) | 切片迭代；**stop=nil 表示无限**（task 84 回写：位置传参 `islice(it, start, nil)`；参数校验急切，start/stop 负或 step<1 → ValueError） |
 | batched(it, n) | 按 n 分批 |
 
 ### 4.14 functools（M6，.ms 嵌入）
@@ -446,8 +446,12 @@ http.get(url)
 
 1. **native_arities 同名冲突**：count/parse/repeat/log/sorted 升级 MAX 后靠自校验兜底；
    实现期补「同名交叉调用」回归用例（gc.count × string.count、json.parse × time.parse 等）。
-2. **assert_raises 类匹配**：`type(e)` 对异常实例的返回值待实现期验证；必要时暴露
-   `__class__` 或增强 type()，在 M6 内闭环并回写本文档。
+2. **assert_raises 类匹配**（task 84 闭环回写）：匹配机制用 **`e.type`**——task 37
+   GET_ATTR 的 EXC 分支返回类名字符串（MsException.class_name），不走消息前缀
+   解析（`str(e)` 格式未约定含类名前缀）。`exc_class` 形态定为**类名字符串**
+   （如 `"ValueError"`；不传类对象）。匹配为**精确类名比对，不含父类链**
+   （.ms 侧无 MRO 查询通道；与 except 的 CATCH 父类链语义差异在 10-builtins.md
+   test 章注明）。实现于嵌入式 test 模块（src/vm/stdlib/ms/test.ms）。
 3. **http detached 线程生命周期**：解释器销毁后入队结果被丢弃；若 capi 场景出现
    future 指针悬垂风险，以「销毁前 join in-flight 线程」兜底，M8 内验证。
 4. **TLS**：https 不支持；未来引入 rustls（新依赖决策，另行确认）。

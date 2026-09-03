@@ -987,7 +987,9 @@ pub(crate) fn optional_key(arg: Option<&Object>, who: &str) -> Result<Option<Obj
 }
 
 /// 比较辅助（升序）：错误置入 err 槽延迟上抛（sort_by 闭包无法返回 Result）。
-fn cmp_objects(a: &Object, b: &Object, err: &mut Option<String>) -> std::cmp::Ordering {
+/// 比较器（Less/Greater 组合，错误暂存后统一上抛）。task 84 起 heapq
+/// n_largest/n_smallest 复用（同 sorted 比较语义）。
+pub(crate) fn cmp_objects(a: &Object, b: &Object, err: &mut Option<String>) -> std::cmp::Ordering {
     if err.is_some() {
         return std::cmp::Ordering::Equal;
     }

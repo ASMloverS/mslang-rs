@@ -428,15 +428,27 @@ impl Compiler {
         // 规避 self-referential 借用冲突，见 CompilationUnit.parent 字段注释）。
         // nonlocal/global 声明集合按函数体隔离保存/恢复：声明仅在所属函数内生效，
         // 不泄漏到随后编译的兄弟函数。
+        // task 84 修复：try_depth / finally_stack / current_loop 同样按函数体隔离
+        // ——此前嵌套函数（如 try 块内定义的匿名闭包）编译时继承外层 try_depth，
+        // 其 return 被插入外层 try 的 TRY_EXIT/finally 内联，运行时弹出无关
+        // handler（调用方 try 捕获失效）；循环上下文泄漏亦致 break/continue
+        // 跳转错位。嵌套函数体是独立作用域，三者须归零后恢复。
         let saved_unit = std::mem::replace(&mut self.unit, func_unit);
         let saved_nonlocal = std::mem::take(&mut self.nonlocal_names);
         let saved_global = std::mem::take(&mut self.global_names);
+        let saved_try_depth = self.try_depth;
+        self.try_depth = 0;
+        let saved_finally_stack = std::mem::take(&mut self.finally_stack);
+        let saved_current_loop = std::mem::take(&mut self.current_loop);
         self.unit.parent = std::ptr::addr_of!(saved_unit);
         self.compile_block(body, line)?;
         self.emit_byte(OpCode::Nil as u8, line);
         self.emit_return(line);
         self.nonlocal_names = saved_nonlocal;
         self.global_names = saved_global;
+        self.try_depth = saved_try_depth;
+        self.finally_stack = saved_finally_stack;
+        self.current_loop = saved_current_loop;
         let func_unit = std::mem::replace(&mut self.unit, saved_unit);
 
         // 上值捕获回填：函数体中 is_local=true 的上值对应父单元的局部变量，
@@ -899,7 +911,10 @@ impl Compiler {
     ///
     /// 字节码布局（见 docs/mslang/tasks/38-with-statement.md §2）。关键约定：
     /// - CALL 为 callee-below-args（`expression.rs:379-389`）：__enter__ 用 CALL 1，
-    ///   __exit__ 用 CALL 4（self + err_type/err_msg/tb）。
+    ///   __exit__ 用 CALL 4（self + err_type/err_msg/tb）。dict 管理器（task 38
+    ///   临时风味）GET_ATTR 返回裸闭包，ctx 作显式 self 实参；Instance/FileHandle
+    ///   管理器 GET_ATTR 返回 BoundMethod（receiver 注入 slot 0），多余 ctx 实参
+    ///   由 CALL 的 BOUND_METHOD 分支容忍（不上抛、不消费）。
     /// - handler 内不 emit TRY_EXIT：drive_unwind 命中 catch_address 时已 pop handler
     ///   （`src/vm/mod.rs` drive_unwind），再 emit 会空栈 pop。
     /// - try_depth++ 包裹 body，使内部 return/break/continue 插 TRY_EXIT 避免泄漏。

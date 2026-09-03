@@ -17,6 +17,7 @@ mod dict;
 mod encoding;
 mod fs;
 mod gc;
+mod heapq;
 mod io;
 mod json;
 mod list;
@@ -34,6 +35,7 @@ pub use dict::lookup_dict_method;
 pub use encoding::register_encoding_module;
 pub use fs::register_fs_module;
 pub use gc::register_gc_module;
+pub use heapq::register_heapq_module;
 pub use io::{lookup_file_method, native_io_open, register_io_module};
 pub use json::register_json_module;
 pub use list::lookup_list_method;
@@ -50,7 +52,7 @@ pub use uuid::register_uuid_module;
 
 use std::collections::HashMap;
 
-use super::object::{read_str, MsObjHeader, Object, TypeTag};
+use super::object::{read_str, read_tuple, MsObjHeader, Object, TypeTag};
 
 // ---------------------------------------------------------------------------
 // task 79：嵌入式 .ms 标准库
@@ -163,6 +165,15 @@ fn hash_key(obj: &Object) -> Result<u64, String> {
             if tag == TypeTag::STRING as u8 || tag == TypeTag::TUPLE as u8 {
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
+                // task 84 修复：tuple 递归哈希遇嵌套 List/Dict/Set 元素时 Hash impl
+                // panic（object.rs）。先递归校验元素可哈希性再哈希，杜绝 panic
+                //（memoize 键 tuple(args) 含 list 时须得 TypeError 而非 abort）。
+                if tag == TypeTag::TUPLE as u8 {
+                    // SAFETY: type_tag 已守卫为 TUPLE。
+                    for elem in unsafe { read_tuple(*ptr) }.clone() {
+                        hash_key(&elem)?;
+                    }
+                }
                 let mut hasher = DefaultHasher::new();
                 obj.hash(&mut hasher);
                 Ok(hasher.finish())
@@ -317,5 +328,39 @@ assert(a.length() == 3)
 "#;
         let r = run_source(src);
         assert!(r.is_ok(), "self-reference integration failed: {:?}", r.err());
+    }
+
+    #[test]
+    fn test_memoize_unhashable_graceful() {
+        // task 84：memoize 键 tuple(args) 含 list → TypeError（dict 行为上抛），
+        // 须优雅 Err 而非 Rust panic（hash_key 递归校验嵌套可哈希性）。
+        let src = r#"
+import functools
+m = functools.memoize(fn(x) { return x })
+m([1, 2])
+"#;
+        let r = run_source(src);
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("TypeError") && e.contains("unhashable"),
+            "got: {}",
+            e
+        );
+    }
+
+    #[test]
+    fn test_nested_tuple_unhashable_graceful() {
+        // 深层嵌套 unhashable（tuple 内 tuple 内 list）同样优雅报错。
+        let src = r#"
+d = {}
+d[tuple([tuple([[1]])])] = 1
+"#;
+        let r = run_source(src);
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("TypeError") && e.contains("unhashable"),
+            "got: {}",
+            e
+        );
     }
 }
