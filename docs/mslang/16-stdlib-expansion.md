@@ -72,6 +72,7 @@
 | repeat | string.repeat = 2 | itertools.repeat | 升级 MAX；两者各自自校验 |
 | sorted | builtin sorted = 1 | sorted(iter, key?, reverse?) | 升级 MAX + 自校验 1-3 参 |
 | copy | builtin copy = 1 | fs.copy | 升级 MAX；两侧各自自校验（task 82 审核发现，回写） |
+| split | string 方法 `s.split(sep?)` = 1-2 参 | regex.split = 2 参 | 注册 MAX；regex.split 自校验恰好 2 参（task 85 审核发现，回写） |
 
 规则：凡注册为 MAX 的原生函数**必须**自校验参数个数并返回 TypeError；实现期加入
 「同名函数 arity 交叉调用」回归用例（如 `gc.count()` 与 `string.count("aa","a")` 并存）。
@@ -354,7 +355,7 @@ os.exec（shell 字符串）保留不动，文档继续警示注入风险；结�
 | search | (pattern, s) -> Match/nil | 首个匹配 |
 | findall | (pattern, s) -> list | 0/1 组 → list[string]；多组 → list[tuple] |
 | sub | (pattern, repl, s, count=0) -> string | count=0 全替换；repl 为 string 或函数；arity MAX |
-| split | (pattern, s) -> list | |
+| split | (pattern, s) -> list | arity MAX（§2.2 与 `s.split` 同名，自校验恰好 2 参） |
 | compile | (pattern) -> Regex | 对象式；方法 `match(s)/search(s)/findall(s)/sub(repl,s,count?)/split(s)/pattern()` |
 
 - 替换串 `${1}` 分组引用（仅索引；无命名组 v1）；repl 为函数时接收 Match 返回 string。
@@ -362,8 +363,13 @@ os.exec（shell 字符串）保留不动，文档继续警示注入风险；结�
 - 新堆类型：`TypeTag::REGEX`（MsRegex{pattern, Box<regex::Regex>}）与
   `TypeTag::MATCH`（MsMatch{text, spans: Vec<Option<(start,end)>>}）；
   均为纯数据（无 Ref 字段），trace noop，正常参与分代 GC。
-- Match 方法：`group(i)`（越界 → IndexError）/ `groups()`（tuple，未参组为 nil）/
+- Match 方法：`group(i)`（越界 → IndexError；负索引 v1 按越界处理）/ `groups()`（tuple，未参组为 nil）/
   `start()/end()/span()`（偏移为字符偏移，与 `s.index` 语义一致）。
+
+> **保留字注（task 85 审核回写）**：`match` 为保留字（01-lexical.md §保留字），现行词法器
+> 对其无条件报错，`regex.match(...)` 无法通过词法。task 85 前置扩展：保留字改为产出
+> Reserved token、解析器在绑定位置拒绝、属性名位置（`.` 后）放行；API 名 `match` 维持
+> 不变（Python 对齐优先，不采用改名方案）。
 
 ### 4.17 hash（M7，依赖 md-5/sha1/sha2）
 
