@@ -54,6 +54,12 @@ pub enum TypeTag {
     /// 调用 C 函数，C 函数负责异步完成时调用 msFutureResolve/msFutureReject。
     /// trace noop：字段（name + func + arity）无 Ref 引用。
     NATIVE_ASYNC_FUNCTION = 22,
+    /// 编译后的正则对象（task 85）。MsRegex：pattern + Box<regex::Regex>。
+    /// 纯数据（无 Ref 字段），trace noop。
+    REGEX = 23,
+    /// 正则匹配结果（task 85）。MsMatch：text + 字节/字符双 spans。
+    /// 纯数据（无 Ref 字段），trace noop。
+    MATCH = 24,
     LARGE_OBJECT = 0xFF,
 }
 
@@ -1215,9 +1221,101 @@ pub unsafe fn read_file_handle<'a>(ptr: *mut MsObjHeader) -> &'a MsFileHandle {
 /// 读取 MsFileHandle（可变，用于 close/write）。
 ///
 /// # Safety
-/// `ptr` 必须指向由 `alloc_file_handle` 分配的、在 `'a` 期间有效的 `MsFileHandle`。
+/// `ptr` 必须指向由 `alloc_file_handle` 分配的、在 `'a` 期间有效的 MsFileHandle。
 pub unsafe fn read_file_handle_mut<'a>(ptr: *mut MsObjHeader) -> &'a mut MsFileHandle {
     &mut *(ptr as *mut MsFileHandle)
+}
+
+// ---------------------------------------------------------------------------
+// Regex / Match 堆对象（task 85，16-stdlib-expansion.md §4.16）
+// ---------------------------------------------------------------------------
+
+/// 编译后的正则堆对象（TypeTag::REGEX = 23）。
+///
+/// 纯数据（pattern String + Box<regex::Regex>，无 Ref 字段）→ trace noop，
+/// 与 MsStr 同类。`regex::Regex: Clone`（1.13+，内部 Arc 共享、廉价），
+/// copy/free 路径可直接克隆/释放。
+#[repr(C)]
+pub struct MsRegex {
+    pub header: MsObjHeader,
+    pub pattern: String,
+    pub compiled: Box<regex::Regex>,
+}
+
+/// 分配 MsRegex 堆对象，返回 Object::Ref。
+pub fn alloc_regex(pattern: &str, compiled: regex::Regex) -> Object {
+    let obj = Box::new(MsRegex {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::REGEX as u8,
+            size: std::mem::size_of::<MsRegex>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        pattern: pattern.to_string(),
+        compiled: Box::new(compiled),
+    });
+    debug_assert!(
+        std::mem::size_of::<MsRegex>() <= crate::vm::gc::LARGE_OBJ_THRESHOLD,
+        "MsRegex too large, use LOS"
+    );
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsRegex（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_regex` 分配的、在 `'a` 期间有效的 MsRegex。
+pub unsafe fn read_regex<'a>(ptr: *mut MsObjHeader) -> &'a MsRegex {
+    debug_assert_eq!((*ptr).type_tag, TypeTag::REGEX as u8, "read_regex on non-REGEX");
+    &*(ptr as *const MsRegex)
+}
+
+/// 正则匹配结果堆对象（TypeTag::MATCH = 24）。
+///
+/// `byte_spans` 与 `char_spans` 平行镜像（索引 i = 分组号，0 = 整体匹配；
+/// 未参与匹配的组为 None）：
+/// - regex crate 的 span 为**字节**偏移——`group(i)` / findall / sub 按字节
+///   偏移 O(1) 切片提取子串；
+/// - Match 方法语义为**字符**偏移（与 `s.index` 一致）——构造期经字节→字符
+///   映射预转换（见 stdlib/regex.rs byte_to_char_map），查询 O(1)。
+#[repr(C)]
+pub struct MsMatch {
+    pub header: MsObjHeader,
+    pub text: String,
+    pub byte_spans: Vec<Option<(usize, usize)>>,
+    pub char_spans: Vec<Option<(usize, usize)>>,
+}
+
+/// 分配 MsMatch 堆对象，返回 Object::Ref。调用方保证两 spans 平行且为边界偏移。
+pub fn alloc_match(
+    text: String,
+    byte_spans: Vec<Option<(usize, usize)>>,
+    char_spans: Vec<Option<(usize, usize)>>,
+) -> Object {
+    debug_assert_eq!(byte_spans.len(), char_spans.len(), "spans must be parallel");
+    let obj = Box::new(MsMatch {
+        header: MsObjHeader {
+            gc_meta: 0,
+            type_tag: TypeTag::MATCH as u8,
+            size: std::mem::size_of::<MsMatch>() as u16,
+            _padding: 0,
+            class_ptr: 0,
+        },
+        text,
+        byte_spans,
+        char_spans,
+    });
+    Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
+}
+
+/// 读取 MsMatch（不可变）。
+///
+/// # Safety
+/// `ptr` 必须指向由 `alloc_match` 分配的、在 `'a` 期间有效的 MsMatch。
+pub unsafe fn read_match<'a>(ptr: *mut MsObjHeader) -> &'a MsMatch {
+    debug_assert_eq!((*ptr).type_tag, TypeTag::MATCH as u8, "read_match on non-MATCH");
+    &*(ptr as *const MsMatch)
 }
 
 impl MsClass {
@@ -1343,6 +1441,10 @@ impl Object {
                     "channel"
                 } else if tag == TypeTag::JOIN_HANDLE as u8 {
                     "JoinHandle"
+                } else if tag == TypeTag::REGEX as u8 {
+                    "regex"
+                } else if tag == TypeTag::MATCH as u8 {
+                    "match"
                 } else {
                     "object"
                 }
@@ -2374,6 +2476,22 @@ impl fmt::Display for Object {
                 } else if tag == TypeTag::MODULE as u8 {
                     // SAFETY: type_tag 为 MODULE，指针由 alloc_module 分配。
                     write!(f, "<module \"{}\">", unsafe { read_module(*ptr) }.name)
+                } else if tag == TypeTag::REGEX as u8 {
+                    // SAFETY: type_tag 为 REGEX，指针由 alloc_regex 分配。
+                    write!(f, "/{}/", unsafe { read_regex(*ptr) }.pattern)
+                } else if tag == TypeTag::MATCH as u8 {
+                    // task 85：类 Python `<re.Match object; ...>` 的简化文本。
+                    // SAFETY: type_tag 为 MATCH，指针由 alloc_match 分配。
+                    let m = unsafe { read_match(*ptr) };
+                    match (m.byte_spans.first(), m.char_spans.first()) {
+                        (Some(Some((bs, be))), Some(Some((cs, ce)))) => match m.text.get(*bs..*be) {
+                            Some(whole) => {
+                                write!(f, "<match span=({}, {}), match='{}'>", cs, ce, whole)
+                            }
+                            None => write!(f, "<match span=({}, {})>", cs, ce),
+                        },
+                        _ => write!(f, "<match>"),
+                    }
                 } else {
                     write!(f, "<object:{}>", tag)
                 }

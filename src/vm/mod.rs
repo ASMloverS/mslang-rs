@@ -677,6 +677,31 @@ impl VM {
         vm.native_arities.insert("n_largest".to_string(), 2);
         vm.native_arities.insert("n_smallest".to_string(), 2);
 
+        // task 85：注册原生 regex/hash 模块 + 模块函数 arity
+        // （16-stdlib-expansion.md §4.16-4.17）。
+        let regex_ptr = stdlib::register_regex_module();
+        vm.module_resolver
+            .native_modules
+            .insert("regex".to_string(), regex_ptr);
+        // sub 可变参（3-4，自校验）；split 与 string 方法 `s.split(sep?)` 同名
+        //（§2.2 冲突治理，审核 A2）→ 必须 MAX：regex.split 自校验恰 2 参，
+        // `s.split()`/`s.split(",")` 不受影响（交叉回归见 test_regex.ms）。
+        vm.native_arities.insert("match".to_string(), 2);
+        vm.native_arities.insert("search".to_string(), 2);
+        vm.native_arities.insert("findall".to_string(), 2);
+        vm.native_arities.insert("sub".to_string(), usize::MAX);
+        vm.native_arities.insert("split".to_string(), usize::MAX);
+        vm.native_arities.insert("compile".to_string(), 1);
+
+        let hash_ptr = stdlib::register_hash_module();
+        vm.module_resolver
+            .native_modules
+            .insert("hash".to_string(), hash_ptr);
+        vm.native_arities.insert("md5".to_string(), 1);
+        vm.native_arities.insert("sha1".to_string(), 1);
+        vm.native_arities.insert("sha256".to_string(), 1);
+        vm.native_arities.insert("sha512".to_string(), 1);
+
         // task 79：填充嵌入式 .ms 模块注册表（collections/itertools/functools/test
         // 由 task 84 填充实现）。磁盘解析未命中后兜底。
         vm.module_resolver.embedded_modules = stdlib::embedded_sources();
@@ -4867,6 +4892,55 @@ impl VM {
                                     "AttributeError: 'JoinHandle' has no attribute '{}'",
                                     attr
                                 ));
+                            }
+                        }
+                        // task 85：Regex 对象方法分派（match/search/findall/sub/
+                        // split/pattern；`match` 为保留字，属性名位置放行）。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::REGEX as u8 =>
+                        {
+                            match stdlib::lookup_regex_method(&attr) {
+                                Some(func) => {
+                                    let method_obj = alloc_native_function(NativeFunction {
+                                        name: attr.clone(),
+                                        func,
+                                    });
+                                    let method_ptr = match method_obj {
+                                        Object::Ref(p) => p,
+                                        _ => unreachable!(),
+                                    };
+                                    self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "AttributeError: 'regex' has no attribute '{}'",
+                                        attr
+                                    ));
+                                }
+                            }
+                        }
+                        // task 85：Match 对象方法分派（group/groups/start/end/span）。
+                        Object::Ref(ptr)
+                            if unsafe { (**ptr).type_tag } == TypeTag::MATCH as u8 =>
+                        {
+                            match stdlib::lookup_match_method(&attr) {
+                                Some(func) => {
+                                    let method_obj = alloc_native_function(NativeFunction {
+                                        name: attr.clone(),
+                                        func,
+                                    });
+                                    let method_ptr = match method_obj {
+                                        Object::Ref(p) => p,
+                                        _ => unreachable!(),
+                                    };
+                                    self.push(alloc_bound_method(obj.clone(), method_ptr))?;
+                                }
+                                None => {
+                                    return Err(format!(
+                                        "AttributeError: 'match' has no attribute '{}'",
+                                        attr
+                                    ));
+                                }
                             }
                         }
                         _ => {

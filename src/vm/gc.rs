@@ -26,9 +26,9 @@
 
 use crate::vm::frame::CallFrame;
 use crate::vm::object::{
-    read_bound_method, read_class, read_file_handle, read_instance, read_module, read_module_mut,
-    DictMap, MsBoundMethod, MsClass, MsFileHandle, MsInstance, MsModule, MsObjHeader, Object,
-    TypeTag,
+    read_bound_method, read_class, read_file_handle, read_instance, read_match, read_module,
+    read_module_mut, read_regex, DictMap, MsBoundMethod, MsClass, MsFileHandle, MsInstance,
+    MsModule, MsObjHeader, Object, TypeTag,
 };
 use crate::vm::DeferEntry;
 use std::collections::{HashMap, HashSet};
@@ -953,6 +953,70 @@ static JOIN_HANDLE_DESC: TypeDescriptor = TypeDescriptor {
     size_base: std::mem::size_of::<crate::async_runtime::join_handle::MsJoinHandle>(),
 };
 
+// task 85：REGEX / MATCH。Box 分配（alloc_regex / alloc_match），未接入 GC 堆。
+// 纯数据（String / Vec / Box<Regex>，无 Ref 字段）→ trace noop。
+// free 回收 typed Box（Drop 释放 String/Vec/Regex 载荷；注册真实实现以防
+// 未来接入 GC 堆后泄漏，与 FILE_HANDLE 同策略）。regex::Regex: Clone（1.13+，
+// Arc 共享廉价），copy 路径可直接克隆载荷。
+fn copy_for_gc_regex(src: *mut MsObjHeader) -> *mut MsObjHeader {
+    // SAFETY: src 由 alloc_regex 分配，type_tag = REGEX。
+    let r = unsafe { read_regex(src) };
+    let new = Box::new(crate::vm::object::MsRegex {
+        header: header_for(TypeTag::REGEX, r.header.size),
+        pattern: r.pattern.clone(),
+        compiled: r.compiled.clone(),
+    });
+    Box::into_raw(new) as *mut MsObjHeader
+}
+
+fn free_regex(obj: *mut MsObjHeader) {
+    // SAFETY: obj 由 alloc_regex 经 Box::into_raw 分配；主体与载荷随 Drop 回收。
+    unsafe {
+        drop(Box::from_raw(obj as *mut crate::vm::object::MsRegex));
+    }
+}
+
+static REGEX_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::REGEX,
+    name: "regex",
+    trace: trace_noop,
+    copy_for_gc: copy_for_gc_regex,
+    forward_fields: forward_noop,
+    free: free_regex,
+    finalize: None,
+    size_base: std::mem::size_of::<crate::vm::object::MsRegex>(),
+};
+
+fn copy_for_gc_match(src: *mut MsObjHeader) -> *mut MsObjHeader {
+    // SAFETY: src 由 alloc_match 分配，type_tag = MATCH。
+    let m = unsafe { read_match(src) };
+    let new = Box::new(crate::vm::object::MsMatch {
+        header: header_for(TypeTag::MATCH, m.header.size),
+        text: m.text.clone(),
+        byte_spans: m.byte_spans.clone(),
+        char_spans: m.char_spans.clone(),
+    });
+    Box::into_raw(new) as *mut MsObjHeader
+}
+
+fn free_match(obj: *mut MsObjHeader) {
+    // SAFETY: obj 由 alloc_match 经 Box::into_raw 分配。
+    unsafe {
+        drop(Box::from_raw(obj as *mut crate::vm::object::MsMatch));
+    }
+}
+
+static MATCH_DESC: TypeDescriptor = TypeDescriptor {
+    type_tag: TypeTag::MATCH,
+    name: "match",
+    trace: trace_noop,
+    copy_for_gc: copy_for_gc_match,
+    forward_fields: forward_noop,
+    free: free_match,
+    finalize: None,
+    size_base: std::mem::size_of::<crate::vm::object::MsMatch>(),
+};
+
 /// 类型描述表查找：为每个 TypeTag 返回对应的 TypeDescriptor。
 /// 参照 14-gc.md — 所有 TypeTag 必须覆盖。当前仅 STRING/LIST/DICT/TUPLE/SET
 /// 由 GC 托管；FUNCTION..EXCEPTION_CLASS(6..=19) 与 LARGE_OBJECT(0xFF) 以占位 noop
@@ -981,6 +1045,9 @@ fn type_descriptor(tag: u8) -> &'static TypeDescriptor {
         t if t == TypeTag::CHANNEL as u8 => &CHANNEL_DESC,
         // task 55：JOIN_HANDLE（Box 分配，未接入 GC 堆）→ 真实 trace，其余占位。
         t if t == TypeTag::JOIN_HANDLE as u8 => &JOIN_HANDLE_DESC,
+        // task 85：REGEX / MATCH（Box 分配，未接入 GC 堆）→ 纯数据，trace noop。
+        t if t == TypeTag::REGEX as u8 => &REGEX_DESC,
+        t if t == TypeTag::MATCH as u8 => &MATCH_DESC,
         // 合法但当前未托管 TypeTag（6..=19 除 MODULE，与 0xFF）→ 占位 noop trace。
         // 这些类型不经 gc_alloc_* 分配（CLOSURE/UPVALUE/EXCEPTION 用 Box::into_raw），故
         // trace/copy/free 实际不被调用；防悬垂。

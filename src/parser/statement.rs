@@ -320,6 +320,18 @@ impl Parser {
                 self.advance();
                 Ok("self".to_string())
             }
+            // task 85：参数名位置拒绝保留字（expect_identifier 同款消息）。
+            TokenKind::Reserved(word) => {
+                let tok = self.peek();
+                Err(MspError::ParseError {
+                    line: tok.span.start.line,
+                    column: tok.span.start.column,
+                    message: format!(
+                        "'{}' is a reserved word and cannot be used as identifier",
+                        word
+                    ),
+                })
+            }
             _ => {
                 let tok = self.peek();
                 Err(MspError::ParseError {
@@ -412,6 +424,19 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
                 Ok(name)
+            }
+            // task 85：绑定位置（变量/函数/类/参数/import 绑定/for-in 变量等，
+            // 均经本入口）遇保留字拒绝，消息沿用词法期文本。
+            TokenKind::Reserved(word) => {
+                let tok = self.peek();
+                Err(MspError::ParseError {
+                    line: tok.span.start.line,
+                    column: tok.span.start.column,
+                    message: format!(
+                        "'{}' is a reserved word and cannot be used as identifier",
+                        word
+                    ),
+                })
             }
             _ => {
                 let tok = self.peek();

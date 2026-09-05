@@ -11,6 +11,11 @@ parking_lot = "0.12"
 libloading = { version = "0.8", optional = true }
 rand = "0.8"
 rustyline = "14"
+# task 85（16-stdlib-expansion.md §2.5）：regex/hash 模块（M7）。
+regex = "1"
+md-5 = "0.10"
+sha1 = "0.10"
+sha2 = "0.10"
 
 [[bin]]
 name = "ms"

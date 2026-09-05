@@ -335,6 +335,12 @@ enum TokenKind {
 | `export` | 模块显式导出（见 [09-modules](09-modules.md)） | 预留，无实现计划 |
 | `match` | 模式匹配 | 预留，无实现计划 |
 
-> **词法处理**：保留字由关键字查找表统一管理。匹配到保留字时词法分析器报错（"保留字不可用作标识符"）。保留字不需要在 Token 枚举中定义——仅在查找表中标记为"禁止"。
+> **词法处理**（task 85 起）：保留字由关键字查找表统一管理。匹配到保留字时词法分析器
+> 产出 `TokenKind::Reserved(String)`（**不再词法报错**），由解析器按位置裁决：
+> 绑定/初等表达式位置（变量声明、赋值目标、参数名、函数名、class 名、import 绑定、
+> for-in 变量等）拒绝——ParseError（"'match' is a reserved word and cannot be used
+> as identifier"，消息与行号语义与旧词法错误一致）；成员访问位置（`.` 后属性名，如
+> `regex.match(...)`、`re.match(s)`）放行。保留字不需要独立的关键词语义，
+> 仅在查找表中标记。
 
 > **`select`/`case`/`default` 升级历史**：三者在 Phase 1-6 期间作为保留字（词法器报错）；task 59（Phase 7.3）将三者升级为正式关键字（`TokenKind::Select` / `Case` / `Default`），从保留字表移除。详见 [08-concurrency](08-concurrency.md) § select。

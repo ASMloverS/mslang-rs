@@ -240,14 +240,9 @@ impl Lexer {
         let kind = if let Some(kw) = keyword_table().get(lexeme.as_str()) {
             kw.clone()
         } else if reserved_words().contains(&lexeme.as_str()) {
-            return Err(MspError::LexError {
-                line: start.line,
-                column: start.column,
-                message: format!(
-                    "'{}' is a reserved word and cannot be used as identifier",
-                    lexeme
-                ),
-            });
+            // task 85：保留字不再词法报错，产出 Reserved token；由解析器在绑定
+            // 位置拒绝（ParseError，消息不变）、成员访问位置放行（regex.match）。
+            TokenKind::Reserved(lexeme.clone())
         } else {
             TokenKind::Identifier(lexeme.clone())
         };
@@ -859,9 +854,17 @@ mod tests {
 
     #[test]
     fn test_all_reserved_words_error() {
+        // task 85 断言迁移：保留字不再 LexError，改为产出 Reserved token；
+        // 绑定拒绝由解析器完成（parser 侧 test_reserved_* 与 negative 语料覆盖）。
         for word in &["export", "match"] {
-            let result = Lexer::new(&format!("{} = 1\n", word)).tokenize_all();
-            assert!(result.is_err(), "reserved word '{}' should error", word);
+            let tokens = tokenize(&format!("{} = 1\n", word));
+            assert!(
+                tokens
+                    .iter()
+                    .any(|t| matches!(&t.kind, TokenKind::Reserved(s) if s == word)),
+                "reserved word '{}' should lex to Reserved token",
+                word
+            );
         }
     }
 

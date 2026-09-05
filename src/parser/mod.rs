@@ -387,4 +387,52 @@ mod tests {
         let expr = p.parse_expression().unwrap();
         assert!(matches!(&expr, Expr::Identifier(s) if s == "x"));
     }
+
+    // ---- task 85：保留字位置裁决（Reserved token 由解析器拒绝/放行）----
+
+    /// 断言 source 解析失败且消息为保留字专用文本。
+    fn assert_reserved_reject(source: &str) {
+        let err = match parse(source) {
+            Ok(_) => panic!("should reject reserved word binding: {:?}", source),
+            Err(e) => format!("{}", e),
+        };
+        assert!(
+            err.contains("reserved word"),
+            "reserved-word message expected, got: {} ({:?})",
+            err,
+            source
+        );
+    }
+
+    #[test]
+    fn test_reserved_word_binding_positions_rejected() {
+        // 变量声明 / 赋值目标（含 :=）。
+        assert_reserved_reject("var match = 1\n");
+        assert_reserved_reject("match = 1\n");
+        assert_reserved_reject("match := 1\n");
+        assert_reserved_reject("export = 1\n");
+        // 函数名 / 参数名 / for-in 变量 / class 名 / import 绑定。
+        assert_reserved_reject("fn match() {\n}\n");
+        assert_reserved_reject("fn f(match) {\n}\n");
+        assert_reserved_reject("for match in [1, 2] {\n}\n");
+        assert_reserved_reject("class match {\n}\n");
+        assert_reserved_reject("from regex import match\n");
+    }
+
+    #[test]
+    fn test_reserved_word_attribute_position_allowed() {
+        // `.` 后属性名位置放行（regex.match / re.match / super.match）。
+        let prog = parse("x.match(1)\nx.export\n").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+        match &prog.statements[0] {
+            Stmt::ExprStmt { expr, .. } => match expr {
+                Expr::Call { callee, .. } => match &**callee {
+                    Expr::Dot { name, .. } => assert_eq!(name, "match"),
+                    _ => panic!("expected dot callee"),
+                },
+                _ => panic!("expected call expr"),
+            },
+            _ => panic!("expected expr stmt"),
+        }
+    }
 }

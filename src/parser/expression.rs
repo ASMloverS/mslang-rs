@@ -392,8 +392,11 @@ impl Parser {
                 // 不可用 expect(TokenKind::Identifier(String::new()))：TokenKind 派生的
                 // PartialEq 按内层 String 比较，与 check 的 == 配合会使任意真实标识符都
                 // 不匹配 Identifier("")。改用模式匹配。
+                // task 85：属性名位置接受保留字（`regex.match(...)` /
+                // `re.match(s)`），见 01-lexical.md §保留字。
                 let name = match &self.peek().kind {
                     TokenKind::Identifier(n) => n.clone(),
+                    TokenKind::Reserved(n) => n.clone(),
                     _ => {
                         let tok = self.peek();
                         return Err(MspError::ParseError {
@@ -454,6 +457,19 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Identifier(name))
             }
+            // task 85：保留字在初等表达式位置（含赋值目标，如 `match = 1`）拒绝。
+            // 错误种类由词法（LexError）迁移为解析（ParseError），消息与行号语义保持。
+            TokenKind::Reserved(word) => {
+                let tok = self.peek();
+                Err(MspError::ParseError {
+                    line: tok.span.start.line,
+                    column: tok.span.start.column,
+                    message: format!(
+                        "'{}' is a reserved word and cannot be used as identifier",
+                        word
+                    ),
+                })
+            }
             TokenKind::Zelf => {
                 // `self` 关键字在方法体内作为初等表达式；按 task 13 约定映射为
                 // Expr::Identifier("self")，使 self.attr 解析路径与普通标识符一致。
@@ -470,8 +486,10 @@ impl Parser {
             TokenKind::Super => {
                 self.advance();
                 self.expect(TokenKind::Dot, "expected '.' after 'super'")?;
+                // task 85：方法名位置接受保留字（与 parse_postfix 的 `.` 属性名一致）。
                 let name = match &self.peek().kind {
                     TokenKind::Identifier(n) => n.clone(),
+                    TokenKind::Reserved(n) => n.clone(),
                     _ => {
                         let tok = self.peek();
                         return Err(MspError::ParseError {

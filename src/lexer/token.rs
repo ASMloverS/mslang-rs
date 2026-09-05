@@ -12,6 +12,11 @@ pub enum TokenKind {
     // 标识符
     Identifier(String),
 
+    // 保留字（task 85）：`export` / `match` 等无语义保留字。词法器产出本 token，
+    // 由解析器按位置裁决——绑定/初等表达式位置拒绝（ParseError），成员访问
+    // （`.` 后属性名）位置放行（如 `regex.match(...)`）。见 01-lexical.md §保留字。
+    Reserved(String),
+
     // 39 个关键字 + is（双重角色）+ select/case/default（task 59）
     Var,
     Const,
@@ -153,6 +158,7 @@ impl fmt::Display for TokenKind {
             TokenKind::Float(v) => write!(f, "Float({})", v),
             TokenKind::String(v) => write!(f, "String(\"{}\")", v),
             TokenKind::Identifier(v) => write!(f, "Identifier(\"{}\")", v),
+            TokenKind::Reserved(v) => write!(f, "Reserved(\"{}\")", v),
             // 关键字
             TokenKind::Var => write!(f, "var"),
             TokenKind::Const => write!(f, "const"),

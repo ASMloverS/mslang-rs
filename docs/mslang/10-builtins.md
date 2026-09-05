@@ -968,12 +968,92 @@ testmod.fail("直接失败")
 - 仅捕获 .ms 侧 `throw` 的异常；原生错误（heapq/IO 等）不可捕获。
 - `assert_almost_eq` 的 eps 为位置参数，不支持关键字跳过；显式传 nil 回退默认。
 
+### regex
+
+```ms
+import regex
+
+m = regex.search("l+", "hello")   # Match 对象；未匹配返回 nil
+m.group(0)                        # "ll"
+m.start()                         # 2（字符偏移，与 s.index 一致）
+m.end()                           # 4
+m.span()                          # (2, 4)
+
+regex.match("h", "hello")         # 锚定开头（Python re.match）；"e" 开头 → nil
+regex.findall(r"(\d)-(\w)", "1-a 2-b")   # [("1", "a"), ("2", "b")]（多组 → tuple）
+regex.sub(r"(\w+)-(\w+)", "${2}-${1}", "ab-cd")   # "cd-ab"（分组引用）
+regex.sub("\\d", fn(m) { return "<" + m.group(0) + ">" }, "a1b2")  # "a<1>b<2>"
+regex.split(",", "a,b,c")         # ["a", "b", "c"]；未匹配 → [s]
+
+re = regex.compile("l+")           # 对象式（pattern 编译一次复用）
+re.search("hello")                 # 与函数式等价
+re.pattern()                       # "l+"（回读）
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `match` | `(pattern, s) -> Match/nil` | 锚定开头（Python re.match） |
+| `search` | `(pattern, s) -> Match/nil` | 首个匹配 |
+| `findall` | `(pattern, s) -> list` | 0/1 组 → list[string]（未参组 ""）；≥2 组 → list[tuple]（未参组 nil） |
+| `sub` | `(pattern, repl, s, count=0) -> string` | count=0 全替换；repl 为 string（`${N}` 分组引用）或函数（接收 Match 返回 string）；arity MAX（自校验 3-4 参） |
+| `split` | `(pattern, s) -> list` | arity MAX（与 `s.split` 同名，§2.2；自校验恰好 2 参） |
+| `compile` | `(pattern) -> Regex` | 对象式入口；方法 `match(s)` / `search(s)` / `findall(s)` / `sub(repl, s, count?)` / `split(s)` / `pattern()` |
+
+Match 对象方法：
+
+| 方法 | 说明 |
+|---|---|
+| `group(i)` | 第 i 组（0 = 整体）；越界 → IndexError；**负索引 v1 按越界处理 → IndexError**（不支持 Python 的负索引回绕） |
+| `groups()` | tuple；未参与匹配的组为 nil |
+| `start()` / `end()` / `span()` | **字符偏移**（与 `s.index` 语义一致）；span() → tuple(start, end) |
+
+注意事项：
+
+- `match` 为保留字（01-lexical.md §保留字）：保留字经 `.` 属性名位置放行
+  （`regex.match(...)` / `re.match(s)`），绑定位置仍拒绝（`match = 1` → ParseError）。
+- 替换串 `${N}` 仅索引引用（无命名组 v1）：越界（`${99}`）或畸形格式
+  （`${1x` / `${`）→ ValueError，消息附 repl 原文片段（对齐 string.format 风格）；
+  `${0}` 为整体引用；未参组展开为空串。`$` 后非 `{` 字面透传（含 `$` 结尾）。
+- sub 的 count：缺省 0 = 全替换；count < 0 → ValueError（"count must be
+  non-negative"）；count 非 Int → TypeError。
+- 非法 pattern → ValueError（附 regex::Error 详情）。
+- **regex crate 语法为 Rust 方言**（pattern 直接透传）：Unicode 类（`\p{Greek}`
+  等）为超集；Perl 反向引用仅支持子集（如不支持 `(?(1)a|b)` 条件匹配与
+  lookaround `(?=...)`）；`\d`/`\w`/`\s` 默认 Unicode 语义。
+- GC：Regex/Match 为纯数据堆类型（TypeTag::REGEX=23 / MATCH=24，
+  14-gc.md），trace noop，正常参与分代回收。
+
+### hash
+
+```ms
+import hash
+
+hash.md5("abc")      # "900150983cd24fb0d6963f7d28e17f72"（32 位小写 hex）
+hash.sha1("abc")     # 40 位小写 hex
+hash.sha256("abc")   # 64 位小写 hex
+hash.sha512("abc")   # 128 位小写 hex
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `md5` | `(s) -> string` | 32 位小写 hex；**非安全用途**（勿用于密码存储/签名） |
+| `sha1` | `(s) -> string` | 40 位小写 hex；同上警示 |
+| `sha256` | `(s) -> string` | 64 位小写 hex |
+| `sha512` | `(s) -> string` | 128 位小写 hex |
+
+注意事项：
+
+- 仅 string 输入（UTF-8 字节）；文件哈希留白（开放问题 5，后续版本）。
+
 ### 未文档化的标准库模块
 
 以下模块已列入标准库结构但尚未定义完整 API，将在后续版本补充：
 
 | 模块 | 说明 |
 |---|---|
-| `regex` | 正则表达式匹配 |
 | `http` | HTTP 客户端/服务端 |
 | `net` | 网络操作（TCP/UDP） |
