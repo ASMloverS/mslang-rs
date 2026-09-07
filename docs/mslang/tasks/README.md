@@ -164,5 +164,5 @@
 | 83 | [标准库 - time 模块扩充](83-stdlib-time.md) | ✅ |
 | 84 | [标准库 - heapq/collections/itertools/functools/test](84-stdlib-collections-itertools-functools-test.md) | ✅ |
 | 85 | [标准库 - regex/hash 模块](85-stdlib-regex-hash.md) | ✅ |
-| 86 | [标准库 - http 模块与 external completion 架构](86-stdlib-http.md) | ⬜ |
+| 86 | [标准库 - http 模块与 external completion 架构](86-stdlib-http.md) | ✅ |
 

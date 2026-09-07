@@ -1049,11 +1049,60 @@ hash.sha512("abc")   # 128 位小写 hex
 
 - 仅 string 输入（UTF-8 字节）；文件哈希留白（开放问题 5，后续版本）。
 
+### http
+
+```ms
+import http
+
+resp = await http.get("http://127.0.0.1:8080/api")        # Future<dict>
+resp["status"]                                            # 200（int）
+resp["headers"]["content-type"]                           # 键小写；同名头逗号拼接
+resp["body"]                                              # string（lossy UTF-8）
+
+await http.post("http://127.0.0.1:8080/echo", "k=v")      # 默认 Content-Type text/plain; charset=utf-8
+await http.request("DELETE", "http://127.0.0.1:8080/1")   # 自定义 method（大小写不敏感）
+fut = http.get("http://127.0.0.1:8080/fire")              # 不 await = fire-and-forget
+```
+
+#### API
+
+| 函数 | 签名 | 说明 |
+|---|---|---|
+| `get` | `(url, headers?, timeout_ms=30000) -> Future<dict>` | headers 为 dict（string→string） |
+| `post` | `(url, body, headers?, timeout_ms=30000) -> Future<dict>` | body: string；默认 Content-Type `text/plain; charset=utf-8` |
+| `request` | `(method, url, body?, headers?, timeout_ms=30000) -> Future<dict>` | method 大小写不敏感；arity MAX（自校验 get 1-3 / post 2-4 / request 2-5 参） |
+
+响应 dict：`{"status": int, "headers": dict(键小写，同名逗号拼接), "body": string(lossy UTF-8)}`。
+
+注意事项：
+
+- 手写 HTTP/1.1（`std::net::TcpStream`，无 TLS）：仅 `http://`；`https://` → await 抛
+  ValueError（TLS 见 16-stdlib-expansion §7-4）。URL 解析含 scheme/host/port/path/query
+  （IPv4 字面 host；不含 userinfo；端口须在 u16 范围）。
+- 完成机制为 **external completion**：请求在 detached 后台线程执行（纯 Rust 数据），
+  结果经完成队列由事件循环 VM 线程 drain（16-stdlib-expansion §5）；in-flight Future
+  经 `inflight_futures` GC 根集保护，resolve 后移除。
+- 重定向跟随 ≤5：301/302/303 → GET 且丢 body；307/308 保持方法与 body；无 Location
+  的 3xx 视为最终响应；超限 → IOError。Location 支持绝对与相对 URL（Host 头随目标更新）。
+- 超时覆盖连接与单次读（`connect_timeout` / `set_read_timeout`）；timeout_ms 须为
+  Int 且 ≥1（0/负数 → ValueError，防 u64 回绕与 Windows 零超时异常）；超时 → IOError
+  （消息含 timeout）。
+- 参数校验在 VM 线程完成，违例**同步返回 rejected Future**（不启动后台线程）：
+  非法 URL / header 名非 HTTP token / 名或值含 CR/LF/NUL（防请求头注入）/ method 非
+  token / URL path/query 含控制字符 → ValueError；类型不符（url 非 string、headers 非
+  dict、timeout_ms 非 int）→ TypeError。
+- 默认请求头 Host / User-Agent: mslang-http/0.1 / Connection: close（用户同名头覆盖）；
+  Content-Length 与 chunked 传输解码均支持，body 流式追加。
+- **fire-and-forget 退出语义**：不 await 的请求在事件循环退出时放弃（`ready_queue`
+  与 `paused` 皆空即退出，inflight 不参与判定）；并发请求数与响应体大小无上限
+  （v1 已知限制，16-stdlib-expansion §4.18 资源边界）。
+- 后台线程崩溃安全：worker 整体 `catch_unwind`，panic 转换为 IOError reject，事件
+  循环不挂起。
+
 ### 未文档化的标准库模块
 
 以下模块已列入标准库结构但尚未定义完整 API，将在后续版本补充：
 
 | 模块 | 说明 |
 |---|---|
-| `http` | HTTP 客户端/服务端 |
 | `net` | 网络操作（TCP/UDP） |

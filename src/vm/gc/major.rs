@@ -43,6 +43,7 @@ pub fn major_collect_stw(vm: &mut VM) {
         &vm.globals,
         &vm.defer_stack,
         &vm.call_stack,
+        &vm.inflight_futures,
     );
     run_finalizers(&mut vm.heap);
 }
@@ -87,6 +88,12 @@ fn scan_roots_gray(gc: &GcRuntime, vm: &VM, gc_managed: &GcManagedSet) {
         }
     }
     // [task 45/65/53] module_cache / c_roots / 暂停协程随对应 task 落地补扫。
+    // [task 86] inflight_futures：in-flight 外部 Future（external completion）作根
+    // 标记——fire-and-forget 期间不被并发 Major 回收；当前 Box+Immortal 分配下经
+    // gc_managed 过滤跳过，为 GC 接管 Future 分配后的前瞻保障（86-stdlib-http.md）。
+    for &ptr in vm.inflight_futures.iter() {
+        mark(ptr);
+    }
 }
 
 /// 单线程 drain 灰色队列：trace 每个对象的子引用（CAS White→Gray 入队），标 Black。

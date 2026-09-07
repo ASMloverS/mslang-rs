@@ -19,6 +19,7 @@ mod fs;
 mod gc;
 mod hash;
 mod heapq;
+mod http;
 mod io;
 mod json;
 mod list;
@@ -39,6 +40,7 @@ pub use fs::register_fs_module;
 pub use gc::register_gc_module;
 pub use hash::register_hash_module;
 pub use heapq::register_heapq_module;
+pub use http::register_http_module;
 pub use io::{lookup_file_method, native_io_open, register_io_module};
 pub use json::register_json_module;
 pub use list::lookup_list_method;
@@ -53,6 +55,10 @@ pub use string::{lookup_string_method, register_string_module};
 pub use sys::register_sys_module;
 pub use time::register_time_module;
 pub use uuid::register_uuid_module;
+
+// task 86：external completion 的 VM 线程 drain 辅助（供 vm::drain_external_
+// completions 调用；非脚本 API，不随 register 导出）。
+pub(crate) use http::{http_response_dict, split_error_class};
 
 use std::collections::HashMap;
 

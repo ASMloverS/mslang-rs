@@ -168,6 +168,33 @@ pub struct EventLoop {
 /// Arc 共享：side-table 持一份，C 调用线程持一份。
 pub type ThreadSignal = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
 
+// ---------------------------------------------------------------------------
+// task 86：external completion（后台线程 → VM 线程完成队列）
+// ---------------------------------------------------------------------------
+
+/// 后台线程产出的完成结果（纯 Rust 数据，无 GC 堆引用；16-stdlib-expansion.md §5）。
+/// `Error` 消息携带 `类名: ` 前缀（如 `IOError: connect failed`），VM 线程 drain 时
+/// 经 split_error_class 解析为对应异常类（缺省 IOError）。
+pub(crate) enum ExternalResult {
+    HttpResponse {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    Error(String),
+}
+
+/// 外部完成条目。`future` 裸指针仅作完成标记跨线程传递——后台线程**绝不解引用**
+/// （解释器销毁后入队即随 Arc 丢弃，无悬垂风险）；仅 VM 线程 drain 时解引用。
+pub(crate) struct ExternalCompletion {
+    pub(crate) future: *mut MsObjHeader,
+    pub(crate) result: ExternalResult,
+}
+
+// SAFETY: future 裸指针仅作 tag 传递（后台线程不解引用）；result 为纯 Rust 数据
+//（String / Vec），跨线程移动安全。
+unsafe impl Send for ExternalCompletion {}
+
 impl EventLoop {
     pub fn new() -> Self {
         Self {
@@ -356,6 +383,15 @@ pub struct VM {
     /// Library 必须存活以保持 C 函数指针有效。
     #[cfg(feature = "capi")]
     pub loaded_libs: Vec<libloading::Library>,
+    /// task 86：external completion 完成队列。后台线程（http worker 等）push
+    /// 纯数据结果，事件循环每轮（check_timers 之后）由 VM 线程 drain 并
+    /// resolve/reject 对应 Future（16-stdlib-expansion.md §5）。
+    pub(crate) external_completions:
+        std::sync::Arc<std::sync::Mutex<Vec<ExternalCompletion>>>,
+    /// task 86：in-flight 外部 Future 指针集合（GC 根集扩展）。
+    /// **不变量**：resolve/reject 后即移除（fire-and-forget 期间 Future 不被回收
+    /// 靠此根集；不移除则泄漏）。
+    pub(crate) inflight_futures: Vec<*mut MsObjHeader>,
 }
 
 /// task 62：VM 销毁时先完成进行中的并发周期，再 shutdown GC Coordinator（释放可能的
@@ -417,6 +453,9 @@ impl VM {
             capi_vm_ptr: std::ptr::null_mut(),
             #[cfg(feature = "capi")]
             loaded_libs: Vec::new(),
+            // task 86：external completion 基础设施（http 等阻塞任务复用）。
+            external_completions: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            inflight_futures: Vec::new(),
         };
         vm.register_builtins();
         vm.init_object_class();
@@ -701,6 +740,17 @@ impl VM {
         vm.native_arities.insert("sha1".to_string(), 1);
         vm.native_arities.insert("sha256".to_string(), 1);
         vm.native_arities.insert("sha512".to_string(), 1);
+
+        // task 86：注册原生 http 模块 + 模块函数 arity（16-stdlib-expansion.md §4.18）。
+        // get/post/request 均为可选参（各自范围不同）→ 全部 MAX + 各自自校验：
+        // get 1-3 / post 2-4 / request 2-5 参，超范围 → TypeError（rejected Future）。
+        let http_ptr = stdlib::register_http_module();
+        vm.module_resolver
+            .native_modules
+            .insert("http".to_string(), http_ptr);
+        vm.native_arities.insert("get".to_string(), usize::MAX);
+        vm.native_arities.insert("post".to_string(), usize::MAX);
+        vm.native_arities.insert("request".to_string(), usize::MAX);
 
         // task 79：填充嵌入式 .ms 模块注册表（collections/itertools/functools/test
         // 由 task 84 填充实现）。磁盘解析未命中后兜底。
@@ -993,6 +1043,63 @@ impl VM {
             .map(|std::cmp::Reverse(e)| e.deadline)
     }
 
+    /// task 86：drain 后台线程外部完成队列（16-stdlib-expansion.md §5）。
+    ///
+    /// VM 线程执行（后台线程零 GC 交互）：headers/body 在此转 alloc_dict/alloc_string，
+    /// resolve/reject Future + wake waiters + inflight 移除（根集不变量「resolve 后即
+    /// 移除」）。取锁用 `unwrap_or_else(|e| e.into_inner())` 抗毒化。
+    fn drain_external_completions(&mut self) {
+        let completions: Vec<ExternalCompletion> = {
+            let mut guard = self
+                .external_completions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for comp in completions {
+            let fp = comp.future;
+            // 指针失效防护：完成队列中的 future 字段以 inflight_futures 当前值比对
+            // 校验——GC 接管 Future 分配后 Minor 复制移动产生的 stale 指针丢弃
+            //（当前 Immortal 方案下不触发，前瞻保障，见 86-stdlib-http.md）。
+            if !self.inflight_futures.contains(&fp) {
+                continue;
+            }
+            // 根集不变量：resolve/reject 后即移除（否则 fire-and-forget 泄漏）。
+            self.inflight_futures.retain(|&p| p != fp);
+            // 防御：Future 可能已被并发 settle（如超时竞争）——跳过写入。
+            let already_settled = {
+                let f = unsafe { read_future(fp) };
+                !matches!(*f.state.borrow(), FutureState::Pending)
+            };
+            if already_settled {
+                continue;
+            }
+            match comp.result {
+                ExternalResult::HttpResponse {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    let resp = stdlib::http_response_dict(status, &headers, &body);
+                    let f = unsafe { read_future(fp) };
+                    *f.state.borrow_mut() = FutureState::Resolved(resp);
+                }
+                ExternalResult::Error(msg) => {
+                    let (class, text) = stdlib::split_error_class(&msg);
+                    let exc = alloc_exception(
+                        class,
+                        alloc_string(text),
+                        alloc_string(""),
+                        Object::Nil,
+                    );
+                    let f = unsafe { read_future(fp) };
+                    *f.state.borrow_mut() = FutureState::Rejected(exc);
+                }
+            }
+            self.wake_waiters(fp);
+        }
+    }
+
     /// 将指定 JoinHandle 关联的暂停子协程从 paused 移至 ready_queue，
     /// 使其在下次 AWAIT 安全点检测 cancel 并终止。
     fn wake_cancelled_subcoroutine(&mut self, handle_ptr: *mut MsObjHeader) {
@@ -1157,6 +1264,9 @@ impl VM {
         while !self.event_loop.ready_queue.is_empty() || !self.event_loop.paused.is_empty() {
             // task 61：每轮先推进 timer（resolve/reject 到期 Future + wake waiters）
             self.check_timers();
+            // task 86：drain 后台线程外部完成（http 等）——VM 线程 resolve/reject
+            // Future + wake waiters + inflight 移除（16-stdlib-expansion.md §5）。
+            self.drain_external_completions();
 
             let coro = match self.event_loop.ready_queue.pop_front() {
                 Some(c) => c,
@@ -1181,6 +1291,14 @@ impl VM {
                         if deadline > now {
                             std::thread::sleep(deadline - now);
                         }
+                        continue;
+                    }
+                    // task 86：无就绪协程但有暂停协程与 in-flight 外部请求——等待
+                    // 后台线程完成而非判死锁，1ms 短暂 sleep 防忙等（86-stdlib-http.md
+                    // §事件循环集成）。注意退出语义：ready_queue 与 paused 皆空时循环
+                    // 直接退出（inflight 不参与判定，fire-and-forget 退出即弃）。
+                    if !self.inflight_futures.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
                     // 无 select 可唤醒、无 timer、非全空 select → 死锁
@@ -1338,6 +1456,7 @@ impl VM {
             &mut self.globals,
             &mut self.defer_stack,
             &mut self.call_stack,
+            &mut self.inflight_futures,
             &self.gc_runtime.card_table,
             &self.gc_runtime,
         );
@@ -1347,6 +1466,7 @@ impl VM {
             &self.globals,
             &self.defer_stack,
             &self.call_stack,
+            &self.inflight_futures,
         );
         gc::run_finalizers(&mut self.heap);
     }
@@ -1359,6 +1479,7 @@ impl VM {
             &mut self.globals,
             &mut self.defer_stack,
             &mut self.call_stack,
+            &mut self.inflight_futures,
             &self.gc_runtime.card_table,
             &self.gc_runtime,
         );
@@ -1375,6 +1496,7 @@ impl VM {
             &self.globals,
             &self.defer_stack,
             &self.call_stack,
+            &self.inflight_futures,
         );
         gc::run_finalizers(&mut self.heap);
     }
@@ -1402,6 +1524,7 @@ impl VM {
                 &mut self.globals,
                 &mut self.defer_stack,
                 &mut self.call_stack,
+                &mut self.inflight_futures,
                 &self.gc_runtime.card_table,
                 &self.gc_runtime,
             );
@@ -1422,6 +1545,7 @@ impl VM {
                     &self.globals,
                     &self.defer_stack,
                     &self.call_stack,
+                    &self.inflight_futures,
                 );
                 gc::run_finalizers(&mut self.heap);
             }

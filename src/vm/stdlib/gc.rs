@@ -600,6 +600,7 @@ mod tests {
             &v.globals,
             &v.defer_stack,
             &v.call_stack,
+            &v.inflight_futures,
         );
         let expected = if v.heap.bytes_allocated == 0 {
             2 * 1024 * 1024
@@ -624,6 +625,7 @@ mod tests {
             &mut v.globals,
             &mut v.defer_stack,
             &mut v.call_stack,
+            &mut v.inflight_futures,
             &gc_rt.card_table,
             &gc_rt,
         );

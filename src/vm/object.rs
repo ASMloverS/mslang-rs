@@ -795,8 +795,13 @@ pub struct MsFuture {
 
 /// 分配 MsFuture 堆对象（TypeTag::FUTURE），返回 Object::Ref。
 /// MVP：Box 分配（与既有 alloc_* 一致）。
+/// task 86（方案 A，86-stdlib-http.md §指针失效防护）：标记 Immortal 代——
+/// inflight Future 指针经 `inflight_futures` / Completion 跨线程传递，不得被
+/// Minor GC 复制移动。当前 Box 分配非 GC 托管（不移动不回收），标记为 GC 接管
+/// 后的前瞻保障；届时 Immortal = 永不回收，fire-and-forget 循环需切换方案 C
+/// （完成标记改自增 id），见 16-stdlib-expansion.md §5 回写。
 pub fn alloc_future(state: FutureState) -> Object {
-    let obj = Box::new(MsFuture {
+    let mut obj = Box::new(MsFuture {
         header: MsObjHeader {
             gc_meta: 0,
             type_tag: TypeTag::FUTURE as u8,
@@ -806,6 +811,7 @@ pub fn alloc_future(state: FutureState) -> Object {
         },
         state: std::cell::RefCell::new(state),
     });
+    obj.header.set_generation(crate::vm::gc::Generation::Immortal);
     Object::Ref(Box::into_raw(obj) as *mut MsObjHeader)
 }
 

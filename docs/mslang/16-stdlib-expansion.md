@@ -428,6 +428,12 @@ http.get(url)
 - **关机**：线程 detached；capi `msVmDestroy` 时未完成结果随队列 Arc 丢弃
   （风险验证见 §7 开放问题 3）。
 
+> **task 86 回写（实现决策）**：指针失效防护三选一采纳 **方案 A**——`alloc_future`
+> 统一标记 Immortal 代（当前 Box 分配非 GC 托管，标记为前瞻；GC 接管 Future 分配后
+> Immortal = 不移动不回收，届时 fire-and-forget 循环须切换方案 C）。「resolve 后即
+> 移除」不变量已落地（`VM::drain_external_completions`）。minor/major/并发标记根集
+> 均已增补 `inflight_futures` 扫描（前瞻保障）。
+
 ## 6. 实施里程碑与验收
 
 | # | task 文档 | 内容 | 涉及章节 | 规模估计 |
@@ -460,6 +466,10 @@ http.get(url)
    test 章注明）。实现于嵌入式 test 模块（src/vm/stdlib/ms/test.ms）。
 3. **http detached 线程生命周期**：解释器销毁后入队结果被丢弃；若 capi 场景出现
    future 指针悬垂风险，以「销毁前 join in-flight 线程」兜底，M8 内验证。
+   **task 86 验证结论（回写）**：无悬垂风险——后台线程闭包只携带队列 Arc 与纯数据，
+   future 裸指针以 usize tag 传递且**绝不解引用**（仅 VM 线程 drain 时解引用，而
+   drain 发生在 VM 存活期间）；VM 销毁后 push 仅写入随 Arc 存活的队列（纯 Rust
+   数据，零 GC 交互）。msVmDestroy 无需 join 兜底。
 4. **TLS**：https 不支持；未来引入 rustls（新依赖决策，另行确认）。
 5. **后续增强留白**（均不在本次范围）：hash 文件输入、regex 命名组、memoize LRU 上限、
    deque 原生 TypeTag（当前 .ms 实现常数较大）、完整 Python format spec、net 模块。

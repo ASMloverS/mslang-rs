@@ -1436,12 +1436,17 @@ impl<'a> Copier<'a> {
 /// Young 代复制 GC。扫描根集（stack + globals），存活对象克隆转发，不可达者释放。
 /// frames 在 MVP 无 closure（task 28 起），故仅扫 stack+globals。
 /// task 64：新增 `gc: &GcRuntime` 参数（供自适应引擎读并发统计）。
+/// task 86：新增 `inflight` 参数——in-flight 外部 Future（external completion）
+/// 作根转发（GC 接管 Future 分配后防 fire-and-forget 期间回收；当前 Box+Immortal
+/// 分配下为 no-op 前瞻保障，见 86-stdlib-http.md §指针失效防护 方案 A）。
+#[allow(clippy::too_many_arguments)] // 根集参数逐一平铺（与既有调用点风格一致）
 pub fn minor_gc(
     heap: &mut MsHeap,
     stack: &mut [Object],
     globals: &mut HashMap<String, Object>,
     defer_stack: &mut [DeferEntry],
     frames: &mut [CallFrame],
+    inflight: &mut [*mut MsObjHeader],
     card_table: &CardTable,
     gc: &GcRuntime,
 ) {
@@ -1485,6 +1490,15 @@ pub fn minor_gc(
     // [task 45] module_cache
     // [task 65] c_roots
     // [task 53] 暂停协程及其 Future.waiters
+    // [task 86] inflight_futures：in-flight 外部 Future 作根转发并改写槽位
+    //（GC 接管 Future 分配后，Minor 复制移动时 inflight_futures 与后台 Completion
+    // 中的指针须经此更新；当前 Immortal 方案下不进 from-space，为 no-op 前瞻）。
+    for ptr in inflight.iter_mut() {
+        if c.old_young_set.contains(ptr) {
+            let np = c.copy(*ptr);
+            *ptr = np;
+        }
+    }
 
     // task 63：扫描 dirty cards —— Old 对象持有的 Young 引用（14-gc.md § Remembered Set）。
     // forward_slot 仅转发 from-space 内的 Young 对象；Old→Old 引用不动。drain 消费全部
@@ -1545,12 +1559,16 @@ pub fn minor_gc(
 
 /// 从根集标记所有可达对象，清除未标记的 Old/LES 对象。有 finalizer 的对象入队复活。
 /// 注：major_gc 仅读根集（stack+globals），不改写槽。
+/// task 86：新增 `inflight` 参数——in-flight 外部 Future 作根标记（GC 接管
+/// Future 分配后防 fire-and-forget 期间回收；当前非 GC 托管对象经 gc_managed
+/// 过滤跳过，为前瞻保障）。
 pub fn major_gc(
     heap: &mut MsHeap,
     stack: &[Object],
     globals: &HashMap<String, Object>,
     defer_stack: &[DeferEntry],
     frames: &[CallFrame],
+    inflight: &[*mut MsObjHeader],
 ) {
     // task 60：GC 计时。
     let t0 = std::time::Instant::now();
@@ -1604,6 +1622,11 @@ pub fn major_gc(
         if let Some(Object::Ref(r)) = &frame.current_exc {
             mark(*r, &mut gray, &gc_managed);
         }
+    }
+    // [task 86] inflight_futures：in-flight 外部 Future 作根标记
+    //（fire-and-forget 期间不被 Major 回收；当前非 GC 托管对象被过滤跳过）。
+    for &ptr in inflight {
+        mark(ptr, &mut gray, &gc_managed);
     }
 
     while let Some(obj) = gray.pop() {
@@ -1741,11 +1764,12 @@ pub fn maybe_gc(
     }
     let mut ran = false;
     if heap.should_collect_major() {
-        minor_gc(heap, stack, globals, defer_stack, frames, card_table, gc);
-        major_gc(heap, stack, globals, defer_stack, frames);
+        // task 86：legacy 入口无 inflight 视图，传空（VM 主循环走 VM::maybe_gc）。
+        minor_gc(heap, stack, globals, defer_stack, frames, &mut [], card_table, gc);
+        major_gc(heap, stack, globals, defer_stack, frames, &[]);
         ran = true;
     } else if heap.should_collect_minor() {
-        minor_gc(heap, stack, globals, defer_stack, frames, card_table, gc);
+        minor_gc(heap, stack, globals, defer_stack, frames, &mut [], card_table, gc);
     }
     if ran {
         run_finalizers(heap);
@@ -1793,7 +1817,7 @@ mod tests {
         let mut globals = HashMap::new();
         let before = heap_list(&live);
 
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
 
         let after = heap_list(stack.last().unwrap());
         assert_ne!(
@@ -1819,7 +1843,7 @@ mod tests {
         let ptr = heap_list(&dead);
         let mut stack = Vec::new();
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         assert!(heap.young_objects.is_empty());
         let _ = ptr; // 已释放；不可解引用
     }
@@ -1834,8 +1858,8 @@ mod tests {
         let mut stack = vec![live];
         let mut globals = HashMap::new();
         // 连续两次 minor_gc，age 累积达 promotion_age → 晋升 Old。
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         let r = heap_list(stack.last().unwrap());
         unsafe {
             assert_eq!((*r).generation(), Generation::Old);
@@ -1855,11 +1879,11 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "temp");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc); // 晋升到 Old
         assert_eq!(heap.old_objects.len(), 1);
         assert!(heap.bytes_allocated > 0);
         stack.clear(); // 解除根：Old 对象不可达
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         // 不可达 Old 对象被清除，bytes_allocated 回落为 0。
         assert!(heap.old_objects.is_empty());
         assert_eq!(heap.bytes_allocated, 0);
@@ -1874,10 +1898,10 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "kept");
         let mut stack = vec![live.clone()];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc); // 晋升到 Old
         assert_eq!(heap.old_objects.len(), 1);
         // stack 仍指向晋升后的对象（minor 转发了根槽）。
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         assert_eq!(heap.old_objects.len(), 1, "reachable Old must survive");
     }
 
@@ -1901,10 +1925,10 @@ mod tests {
         heap.promotion_age = 1;
         let mut stack = vec![a.clone(), b.clone()];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         // 清除根 → 两者仅彼此引用（循环），major 应回收。
         stack.clear();
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         assert!(
             heap.old_objects.is_empty(),
             "cycle should be collected by major GC"
@@ -1928,7 +1952,7 @@ mod tests {
         // major GC 清扫 LES（不可达 → 释放，bytes 回落）。
         let stack = Vec::new();
         let globals = HashMap::new();
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         assert!(heap.los_objects.is_empty());
         assert!(heap.bytes_allocated < before);
     }
@@ -1941,7 +1965,7 @@ mod tests {
         let ptr = heap.alloc_los(LARGE_OBJ_THRESHOLD + 8, TypeTag::STRING);
         let stack = vec![Object::Ref(ptr)];
         let globals = HashMap::new();
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         assert_eq!(heap.los_objects.len(), 1, "reachable LES must survive");
     }
 
@@ -1955,7 +1979,7 @@ mod tests {
         let outer = gc_alloc_list(&mut heap, &gc, vec![inner]);
         let mut stack = vec![outer];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         let new_outer = heap_list(stack.last().unwrap());
         unsafe {
             let items = gc_read_list(new_outer);
@@ -1976,7 +2000,7 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "x");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         // bytes_allocated 经 saturating_sub 不应下溢（usize 下溢会 panic）。
         assert!(heap.bytes_allocated < usize::MAX);
     }
@@ -1993,7 +2017,7 @@ mod tests {
         let obj = gc_alloc_string(&mut heap, &gc, "fin");
         let mut stack = vec![obj];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc); // 晋升到 Old
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc); // 晋升到 Old
         let old_ptr = *heap.old_objects.last().unwrap();
         unsafe {
             (*old_ptr).set_has_finalizer(true);
@@ -2001,7 +2025,7 @@ mod tests {
         assert_eq!(heap.old_objects.len(), 1);
 
         stack.clear(); // 解除根
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         // has_finalizer → 入队复活，未被释放。
         assert_eq!(heap.finalizer_queue.len(), 1);
         assert_eq!(heap.old_objects.len(), 1);
@@ -2012,7 +2036,7 @@ mod tests {
         assert!(!unsafe { (*old_ptr).has_finalizer() });
 
         // 再次 major：finalizer 已清，对象正常回收（无无限复活）。
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         assert!(heap.old_objects.is_empty());
     }
 
@@ -2260,7 +2284,7 @@ mod tests {
         let _dead = gc_alloc_string(&mut heap, &gc, "unreachable");
         let mut stack = Vec::new();
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         assert_eq!(heap.minor_count, 1);
         assert_eq!(heap.major_count, 0);
         assert!(heap.last_pause_ns < u64::MAX); // 被写入
@@ -2276,9 +2300,9 @@ mod tests {
         let live = gc_alloc_string(&mut heap, &gc, "temp");
         let mut stack = vec![live];
         let mut globals = HashMap::new();
-        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &ct, &gc);
+        minor_gc(&mut heap, &mut stack, &mut globals, &mut [], &mut [], &mut [], &ct, &gc);
         stack.clear();
-        major_gc(&mut heap, &stack, &globals, &[], &[]);
+        major_gc(&mut heap, &stack, &globals, &[], &[], &[]);
         assert_eq!(heap.major_count, 1);
         assert!(heap.bytes_freed > 0);
     }
